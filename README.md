@@ -46,6 +46,12 @@ per request, so a new token is picked up without restarting marimohub.
 
 ## Running it locally
 
+The Armada side comes from
+[armada-operator](https://github.com/armadaproject/armada-operator), which is much
+the easiest way to get one: a single `make kind-all` gives you a kind cluster
+running the operator, Armada itself, and the Pulsar, Postgres and Redis it depends
+on. Nothing below assembles Armada by hand.
+
 ### What you end up with
 
 Three moving parts, all on your machine:
@@ -104,9 +110,9 @@ from `python:3.13-slim`, so kernels are native arm64.
 
 ### 1. Bring up Armada
 
-From a checkout of [armada-operator](https://github.com/armadaproject/armada-operator):
-
 ```bash
+git clone https://github.com/armadaproject/armada-operator
+cd armada-operator
 make kind-all
 ```
 
@@ -114,6 +120,10 @@ That creates the `armada` kind cluster, installs cert-manager, the operator and
 Armada's dependencies, applies the Armada CRs, writes `~/.armadactl.yaml`, and
 downloads `armadactl` to `./bin/app/armadactl`. It pulls several GB the first
 time; `apachepulsar/pulsar-all` alone is ~3 GB.
+
+The quickstart pins nothing: every `gresearch/armada-*` image is `latest`. Today
+those serve the same API as the `v0.22.7` in `.armada-version`, verified, but the
+two can drift apart without warning.
 
 Host ports mapped by `hack/kind-config.yaml`:
 
@@ -144,7 +154,30 @@ docker build -t marimo-sandbox:local path/to/marimohub/examples/sandbox-image
 kind load docker-image marimo-sandbox:local --name armada
 ```
 
-### 3. Start marimohub with this adapter
+### 3. Check that placement works
+
+Before involving marimohub, submit one job the way the adapter does:
+
+```bash
+bun run smoke            # submit, wait for the pod, cancel
+bun run smoke -- --keep  # leave it running to poke at
+```
+
+```
+submitting smoke-mth9i8gg to queue "marimohub" at http://localhost:30001
+  job 01m1bzdp2tz93cyeh8ftzfr7nm, waiting for it to run
+
+running after 11.7s
+  cluster Cluster1
+  pod     default/armada-01m1bzdp2tz93cyeh8ftzfr7nm-0
+  node    armada-worker
+```
+
+That exercises the config, the auth header, the podspec, `/v1/job/submit` and the
+event stream against a real server. Armada also creates the NodePort service the
+kernel will be reached through, which `kubectl get svc` shows as `2718:3xxxx/TCP`.
+
+### 4. Start marimohub with this adapter
 
 ```bash
 ./dev/run-local.sh
@@ -163,25 +196,24 @@ The script does five things:
 Override with environment variables: `ARMADA_URL`, `ARMADA_QUEUE`,
 `ARMADA_NAMESPACE`, `PORT`, `IMAGE`, `CONTAINER`, `ARMADACTL`.
 
-### 4. What you should see
+### 5. What you should see
 
 marimohub comes up at <http://localhost:3000>, already signed in as the dev
 user. Browsing, creating a project and creating a notebook all work — those are
 storage operations and never touch compute.
 
-**Starting a kernel is where it stops**, because every method in
-`src/sandbox.ts` and `src/armada.ts` is still a stub that throws. The notebook
-shows a generic _"Sandbox compute backend is not available"_ with a Retry
-button.
+**Starting a kernel gets a pod and then stops.** `ready()` submits the job and
+waits for it to run, so a real pod appears in the cluster, but the steps after it
+are still stubs that throw. The notebook shows a generic _"Sandbox compute backend
+is not available"_ with a Retry button.
 
 That message is deliberately vague; the real error is nested in the server log's
-`cause` field. `SandboxProvisioner.provision` → `provisionInto` → `reachable` →
-`ensureReachable` calls `ready()` first, so the first wall is:
+`cause` field. marimohub's `SandboxProvisioner` calls `ready()`, then writes the
+notebook files and environment, then starts the kernel process, so the wall is now
+the file and environment step:
 
 ```
-Error: ArmadaSandbox.ready is not implemented
-    at todo (file:///etc/marimohub/compute.mjs:55:9)
-    at ArmadaSandbox.ready (file:///etc/marimohub/compute.mjs:75:12)
+Error: ArmadaSandbox.writeFiles is not implemented
 ```
 
 Dig it out with:
@@ -221,6 +253,7 @@ make kind-delete-cluster    # from armada-operator
 bun install
 bun run build   # bundles src + all dependencies into dist/index.js (bun build --target=node)
 bun run test
+bun run smoke   # submit one job to a running Armada, see where it lands
 ```
 
 CI (`.github/workflows/ci.yml`) runs `check` (oxfmt + oxlint), `typecheck`, `test` and

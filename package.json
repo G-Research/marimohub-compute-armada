@@ -13,6 +13,7 @@
 		"fmt": "oxfmt --write .",
 		"check": "oxfmt --check . && oxlint --type-aware",
 		"check:armada-api": "bun run scripts/check-armada-api.ts",
+		"smoke": "bun run dev/smoke.ts",
 		"lint": "oxlint --type-aware"
 	},
 	"dependencies": {

@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import type { ArmadaAuth } from './auth.js';
+import type { AdapterFactoryContext } from './types.js';
 
 export interface ArmadaConfig {
 	/** Armada REST gateway base URL, http or https. */
@@ -21,6 +22,12 @@ export interface ArmadaConfig {
 	sandboxHostname?: string | undefined;
 	/** Port marimo serves on inside the pod. */
 	port: number;
+	/**
+	 * Hard cap on one session, submitted as `activeDeadlineSeconds`. Armada gives
+	 * any pod without one the server default, 72 hours as shipped, so a kernel must
+	 * always carry its own.
+	 */
+	maxLifetimeSeconds: number;
 	/** How to authenticate to Armada. */
 	auth: ArmadaAuth;
 }
@@ -51,6 +58,20 @@ function optionalPort(
 	const value: number = Number(raw);
 	if (!Number.isInteger(value) || value < 1 || value > 65535) {
 		throw new Error(`${name} must be a port number between 1 and 65535, got: ${raw}`);
+	}
+	return value;
+}
+
+function optionalSeconds(
+	env: Record<string, string | undefined>,
+	name: string,
+	fallback: number,
+): number {
+	const raw: string | undefined = env[name];
+	if (raw === undefined) return fallback;
+	const value: number = Number(raw);
+	if (!Number.isInteger(value) || value < 1) {
+		throw new Error(`${name} must be a whole number of seconds, got: ${raw}`);
 	}
 	return value;
 }
@@ -103,7 +124,13 @@ function readAuth(env: Record<string, string | undefined>): ArmadaAuth {
 	return { kind: 'anonymous' };
 }
 
-export function readConfig(env: Record<string, string | undefined>): ArmadaConfig {
+/** A day, when neither marimohub nor the environment says otherwise. */
+const DEFAULT_MAX_LIFETIME_SECONDS = 24 * 60 * 60;
+
+export function readConfig(
+	env: Record<string, string | undefined>,
+	compute?: AdapterFactoryContext['compute'],
+): ArmadaConfig {
 	// MARIMOHUB_COMPUTE_IMAGE is a comma-separated list; the first is the default.
 	const image: string | undefined = required(env, 'MARIMOHUB_COMPUTE_IMAGE').split(',')[0]?.trim();
 	if (!image) throw new Error('MARIMOHUB_COMPUTE_IMAGE must contain at least one image');
@@ -116,6 +143,9 @@ export function readConfig(env: Record<string, string | undefined>): ArmadaConfi
 		image,
 		sandboxHostname: env.MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME,
 		port: optionalPort(env, 'ARMADA_KERNEL_PORT', 2718),
+		maxLifetimeSeconds:
+			compute?.sessionMaxLifetimeSeconds ??
+			optionalSeconds(env, 'ARMADA_KERNEL_MAX_LIFETIME_SECONDS', DEFAULT_MAX_LIFETIME_SECONDS),
 		auth: readAuth(env),
 	};
 }

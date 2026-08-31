@@ -1,6 +1,7 @@
 import type { ArmadaClient, PodLocation, SubmittedJob } from './armada.js';
 import type { ArmadaConfig } from './config.js';
 import type { PodExec } from './exec.js';
+import { buildPodSpec } from './podspec.js';
 import type {
 	CreateSandboxOptions,
 	ExecResult,
@@ -36,7 +37,7 @@ export class ArmadaSandbox implements SandboxInstance {
 	readonly supportsBucketMount = false;
 
 	private job?: SubmittedJob;
-	private pod?: PodLocation;
+	private pod?: PodLocation | undefined;
 
 	constructor(
 		private readonly id: SandboxId,
@@ -46,9 +47,16 @@ export class ArmadaSandbox implements SandboxInstance {
 		private readonly options?: CreateSandboxOptions,
 	) {}
 
-	/** Submit the job and block until its pod is running. */
+	/**
+	 * Submit the job and block until its pod is running.
+	 *
+	 * Idempotent: marimohub calls this before each use, and the submission dedupes
+	 * on `clientId` anyway, so a second call on a started sandbox does nothing.
+	 */
 	async ready(): Promise<void> {
-		return todo('ready');
+		if (this.pod !== undefined) return;
+		this.job ??= await this.armada.submit(this.id, buildPodSpec(this.config, this.options));
+		this.pod = await this.armada.waitForRunning(this.job);
 	}
 
 	async exec(_cmd: string): Promise<ExecResult> {
@@ -97,7 +105,10 @@ export class ArmadaSandbox implements SandboxInstance {
 		return todo('exposePort');
 	}
 
+	/** Cancelling the job deletes the pod and every object Armada created with it. */
 	async destroy(): Promise<void> {
-		return todo('destroy');
+		if (this.job === undefined) return;
+		await this.armada.cancel(this.job);
+		this.pod = undefined;
 	}
 }
