@@ -5,7 +5,12 @@ export interface ArmadaConfig {
 	queue: string;
 	/** Kubernetes namespace the executor creates pods in. */
 	namespace: string;
-	/** Priority class; pick a non-preemptible one or sessions die mid-use. */
+	/**
+	 * Armada priority class, not a Kubernetes one. Must be in the server's
+	 * `allowedPriorityClassNames`. Leave unset to get the server default, which
+	 * ships as `armada-default` (`preemptible: false`); only override with
+	 * something at least as protected, or sessions die mid-use.
+	 */
 	priorityClassName?: string | undefined;
 	/** Kernel container image. */
 	image: string;

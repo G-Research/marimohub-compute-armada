@@ -29,6 +29,8 @@ export interface JobSubmitRequestItem {
 	clientId: string;
 	namespace: string;
 	podSpec: V1PodSpec;
+	/** Our own identifier for the job. Queryable via `/v1/job/statusUsingExternalJobUri`. */
+	externalJobUri?: string;
 	ingress?: IngressConfig[];
 	services?: ServiceConfig[];
 	labels?: Record<string, string>;
@@ -130,7 +132,14 @@ export interface JobIngressInfoEvent extends JobEventBase {
 export interface JobFailedEvent extends JobEventBase {
 	reason?: string;
 	cause?: string;
-	/** Container name to exit code. */
+	failureCategory?: string;
+	failureSubcategory?: string;
+	/**
+	 * True when the scheduler will retry this run, so the failure is not terminal
+	 * and further events follow for the same job. Absent means terminal.
+	 */
+	retryable?: boolean;
+	/** Deprecated upstream in favour of container statuses; kept for the message. */
 	exitCodes?: Record<string, number>;
 }
 
@@ -147,7 +156,34 @@ export interface CancellationResult {
 	cancelledIds?: string[];
 }
 
-/** `POST /v1/queues/active` */
-export interface ActiveQueues {
-	queues?: string[];
+/**
+ * `POST /v1/job/statusUsingExternalJobUri`
+ *
+ * How we find our own jobs again after a restart. Armada has no "list the jobs I
+ * own" call: `/v1/job/details` and `/v1/job/status` both take explicit job ids,
+ * and `/v1/queues/active` returns queue names. This is the only lookup keyed by
+ * something we choose, so `externalJobUri` is set at submit time.
+ */
+export interface JobStatusUsingExternalJobUriRequest {
+	queue: string;
+	jobset: string;
+	externalJobUri: string;
 }
+
+export interface JobStatusResponse {
+	/** Job id to state. */
+	jobStates?: Record<string, JobState>;
+}
+
+export type JobState =
+	| 'QUEUED'
+	| 'PENDING'
+	| 'RUNNING'
+	| 'SUCCEEDED'
+	| 'FAILED'
+	| 'UNKNOWN'
+	| 'SUBMITTED'
+	| 'LEASED'
+	| 'PREEMPTED'
+	| 'CANCELLED'
+	| 'REJECTED';

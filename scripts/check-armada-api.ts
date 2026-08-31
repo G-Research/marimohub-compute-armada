@@ -34,7 +34,7 @@ const ENDPOINTS: Record<string, string> = {
 	'/v1/job/submit': 'post',
 	'/v1/job-set/{queue}/{id}': 'post',
 	'/v1/job/cancel': 'post',
-	'/v1/queues/active': 'post',
+	'/v1/job/statusUsingExternalJobUri': 'post',
 };
 
 /** Every field `src/armada-types.ts` names, and the type we read it as. */
@@ -44,6 +44,7 @@ const CONTRACT: Record<string, Record<string, FieldType>> = {
 		clientId: 'string',
 		namespace: 'string',
 		podSpec: 'ref',
+		externalJobUri: 'string',
 		ingress: 'array',
 		services: 'array',
 		labels: 'object',
@@ -94,7 +95,15 @@ const CONTRACT: Record<string, Record<string, FieldType>> = {
 		podNamespace: 'string',
 		ingressAddresses: 'object',
 	},
-	apiJobFailedEvent: { jobId: 'string', reason: 'string', cause: 'ref', exitCodes: 'object' },
+	apiJobFailedEvent: {
+		jobId: 'string',
+		reason: 'string',
+		cause: 'ref',
+		failureCategory: 'string',
+		failureSubcategory: 'string',
+		retryable: 'boolean',
+		exitCodes: 'object',
+	},
 	apiJobCancelRequest: {
 		queue: 'string',
 		jobSetId: 'string',
@@ -103,7 +112,12 @@ const CONTRACT: Record<string, Record<string, FieldType>> = {
 		reason: 'string',
 	},
 	apiCancellationResult: { cancelledIds: 'array' },
-	apiActiveQueues: { queues: 'array' },
+	apiJobStatusUsingExternalJobUriRequest: {
+		queue: 'string',
+		jobset: 'string',
+		externalJobUri: 'string',
+	},
+	apiJobStatusResponse: { jobStates: 'object' },
 	runtimeStreamError: {
 		message: 'string',
 		grpcCode: 'integer',
@@ -116,6 +130,19 @@ const CONTRACT: Record<string, Record<string, FieldType>> = {
 const ENUMS: Record<string, readonly string[]> = {
 	apiIngressType: ['Ingress'],
 	apiServiceType: ['NodePort', 'Headless'],
+	apiJobState: [
+		'QUEUED',
+		'PENDING',
+		'RUNNING',
+		'SUCCEEDED',
+		'FAILED',
+		'UNKNOWN',
+		'SUBMITTED',
+		'LEASED',
+		'PREEMPTED',
+		'CANCELLED',
+		'REJECTED',
+	],
 };
 
 function actualType(schema: SwaggerSchema): string {
