@@ -12,6 +12,7 @@
 		"typecheck": "tsc --noEmit && tsc -p tsconfig.src.json",
 		"fmt": "oxfmt --write .",
 		"check": "oxfmt --check . && oxlint --type-aware",
+		"check:armada-api": "bun run scripts/check-armada-api.ts",
 		"lint": "oxlint --type-aware"
 	},
 	"dependencies": {

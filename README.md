@@ -217,6 +217,27 @@ bun run test
 CI (`.github/workflows/ci.yml`) runs `check` (oxfmt + oxlint), `typecheck`, `test` and
 `build` on every push to `main` and every pull request.
 
+### Armada API surface
+
+`src/armada-types.ts` is hand-written rather than generated from Armada's swagger. The
+four endpoints we call reach 202 of the spec's 249 definitions, but 165 of those are
+embedded Kubernetes types already available from `@kubernetes/client-node`, and only a
+dozen of the rest are ones we read. Generating would mean re-reviewing six thousand lines
+on every Armada release for endpoints we never touch.
+
+What keeps that honest is `bun run check:armada-api`. It fetches `api.swagger.json` at the
+release pinned in `.armada-version` and asserts that every field we depend on still exists
+with the type we read it as, so a drifting API fails in CI rather than at runtime:
+
+```bash
+bun run check:armada-api                          # against the pinned version
+ARMADA_VERSION=v0.23.0 bun run check:armada-api   # try a candidate
+```
+
+CI runs it in the `armada-api` job, which reports on every PR but only fetches the spec
+when an Armada-related file changed. There is no scheduled run: the spec is fetched at a
+git tag, and a tag is immutable, so the result can only change when this repo does.
+
 `dist/index.js` is fully self-contained: marimohub imports it from wherever it is
 mounted, with no `node_modules` beside it. Once the adapter really imports
 `@kubernetes/client-node` the bundle is ~2 MB — over the 1 MiB ConfigMap limit,
