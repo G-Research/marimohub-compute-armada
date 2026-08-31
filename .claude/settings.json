@@ -1,0 +1,16 @@
+{
+	"hooks": {
+		"PostToolUse": [
+			{
+				"matcher": "Edit|Write",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *.ts|*.tsx|*.mts|*.cts|*.js|*.jsx|*.mjs|*.cjs|*.json|*.jsonc|*.md) \"$CLAUDE_PROJECT_DIR/node_modules/.bin/oxfmt\" --write \"$f\" >/dev/null 2>&1 ;; esac; exit 0",
+						"statusMessage": "Formatting with oxfmt"
+					}
+				]
+			}
+		]
+	}
+}

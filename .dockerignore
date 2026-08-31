@@ -1,0 +1,5 @@
+# The image needs dist/index.js and nothing else (see Dockerfile).
+*
+!dist
+dist/*
+!dist/index.js
