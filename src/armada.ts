@@ -6,6 +6,7 @@
  * only), so this talks to the grpc-gateway REST endpoints. The protos carry
  * `google.api.http` annotations, so every RPC has an HTTP form.
  */
+import { authorizationHeader } from './auth.js';
 import type { ArmadaConfig } from './config.js';
 
 /** Where a running job's pod lives, from `JobRunningEvent`. */
@@ -23,6 +24,20 @@ export interface SubmittedJob {
 
 export class ArmadaClient {
 	constructor(private readonly config: ArmadaConfig) {}
+
+	/**
+	 * Headers for every call to the gateway.
+	 *
+	 * Authorization is resolved per request rather than at construction, so a
+	 * token file that is rotated under us is picked up without a restart.
+	 */
+	async requestHeaders(): Promise<Record<string, string>> {
+		const authorization: string | undefined = await authorizationHeader(this.config.auth);
+		return {
+			'content-type': 'application/json',
+			...(authorization === undefined ? {} : { authorization }),
+		};
+	}
 
 	/**
 	 * Submit one job: podspec + ingress config, keyed by `clientId` so a resubmit

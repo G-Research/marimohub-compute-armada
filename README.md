@@ -34,6 +34,15 @@ Everything in `src/sandbox.ts` above `exec` is ordinary shell commands.
 | `ARMADA_KERNEL_PORT`                 | no       | Port marimo serves on (default `2718`)               |
 | `MARIMOHUB_COMPUTE_IMAGE`            | yes      | Kernel image (first entry of the list)               |
 | `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` | no       | Public kernel hostname                               |
+| `ARMADA_AUTH_USERNAME`               | no       | Basic auth, set with the password                    |
+| `ARMADA_AUTH_PASSWORD`               | no       | Basic auth, set with the username                    |
+| `ARMADA_AUTH_TOKEN`                  | no       | Bearer token, for example from OIDC                  |
+| `ARMADA_AUTH_TOKEN_FILE`             | no       | Bearer token file, re-read on every request          |
+
+Configure at most one auth mechanism. With none, no `Authorization` header is sent, which
+is what a server running `anonymousAuth: true` expects. Prefer `ARMADA_AUTH_TOKEN_FILE`
+for anything that rotates, such as a projected Kubernetes service account token: it is read
+per request, so a new token is picked up without restarting marimohub.
 
 ## Running it locally
 

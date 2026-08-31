@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import type { ArmadaAuth } from './auth.js';
+
 export interface ArmadaConfig {
 	/** Armada REST gateway base URL, http or https. */
 	url: string;
@@ -18,6 +21,8 @@ export interface ArmadaConfig {
 	sandboxHostname?: string | undefined;
 	/** Port marimo serves on inside the pod. */
 	port: number;
+	/** How to authenticate to Armada. */
+	auth: ArmadaAuth;
 }
 
 function required(env: Record<string, string | undefined>, name: string): string {
@@ -50,6 +55,54 @@ function optionalPort(
 	return value;
 }
 
+/**
+ * At most one mechanism may be configured. Anonymous is a real choice, not a
+ * fallback: the quickstart server runs with `anonymousAuth: true`.
+ */
+function readAuth(env: Record<string, string | undefined>): ArmadaAuth {
+	const username: string | undefined = env.ARMADA_AUTH_USERNAME;
+	const password: string | undefined = env.ARMADA_AUTH_PASSWORD;
+	const token: string | undefined = env.ARMADA_AUTH_TOKEN;
+	const tokenFile: string | undefined = env.ARMADA_AUTH_TOKEN_FILE;
+
+	const configured: string[] = [
+		username !== undefined || password !== undefined ? 'ARMADA_AUTH_USERNAME/PASSWORD' : undefined,
+		token !== undefined ? 'ARMADA_AUTH_TOKEN' : undefined,
+		tokenFile !== undefined ? 'ARMADA_AUTH_TOKEN_FILE' : undefined,
+	].filter((name: string | undefined) => name !== undefined);
+
+	if (configured.length > 1) {
+		throw new Error(`Configure one Armada auth mechanism, found: ${configured.join(', ')}`);
+	}
+
+	if (username !== undefined || password !== undefined) {
+		if (!username || !password) {
+			throw new Error('ARMADA_AUTH_USERNAME and ARMADA_AUTH_PASSWORD must be set together');
+		}
+		return { kind: 'basic', username, password };
+	}
+
+	if (token !== undefined) {
+		if (!token.trim()) throw new Error('ARMADA_AUTH_TOKEN is empty');
+		return { kind: 'bearer', token: token.trim() };
+	}
+
+	if (tokenFile !== undefined) {
+		// Read once here so a bad path fails marimohub's startup rather than the
+		// first session. The value is re-read per request, not cached.
+		let contents: string;
+		try {
+			contents = readFileSync(tokenFile, 'utf8');
+		} catch {
+			throw new Error(`ARMADA_AUTH_TOKEN_FILE cannot be read: ${tokenFile}`);
+		}
+		if (!contents.trim()) throw new Error(`ARMADA_AUTH_TOKEN_FILE is empty: ${tokenFile}`);
+		return { kind: 'bearerFile', path: tokenFile };
+	}
+
+	return { kind: 'anonymous' };
+}
+
 export function readConfig(env: Record<string, string | undefined>): ArmadaConfig {
 	// MARIMOHUB_COMPUTE_IMAGE is a comma-separated list; the first is the default.
 	const image: string | undefined = required(env, 'MARIMOHUB_COMPUTE_IMAGE').split(',')[0]?.trim();
@@ -63,5 +116,6 @@ export function readConfig(env: Record<string, string | undefined>): ArmadaConfi
 		image,
 		sandboxHostname: env.MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME,
 		port: optionalPort(env, 'ARMADA_KERNEL_PORT', 2718),
+		auth: readAuth(env),
 	};
 }

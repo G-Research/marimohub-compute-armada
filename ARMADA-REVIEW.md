@@ -206,18 +206,30 @@ and `Headless` values belong to `ServiceType`. The example in
 `supportsBucketMount = false` and `mountBucket` throws, which is marimohub's documented way
 to fall back to copying files in.
 
-### 15. Configuration is validated at startup, and auth is a known gap
+### 15. Configuration is validated at startup, including credentials
 
 Library-mode adapters are constructed during marimohub's boot, so a bad `ARMADA_URL` stops
-the server rather than failing at first session. We reject non-http(s) URLs and non-port
-values with messages naming the variable.
+the server rather than failing at first session. We reject non-http(s) URLs, non-port values,
+two auth mechanisms at once, half a basic credential, and an unreadable or empty token file,
+each with a message naming the variable.
 
-**We send no `Authorization` header at all**, so today this works only against a server with
-`anonymousAuth: true`, which is what the local quickstart uses. Armada supports basic, OIDC
-in several flows, Kubernetes-native and exec-based credentials
-(`pkg/client/connection.go:39`), and they all reduce to one header: basic is
-`authorization: basic <base64(user:pass)>` (`pkg/client/auth/basic/credentials.go:13`), OIDC
-is a bearer token. Closing this is small and must happen before any non-local deployment.
+Armada offers basic, OIDC in several flows, Kubernetes-native and exec-based credentials
+(`pkg/client/connection.go:39`), but on the wire they are one header. We implement two:
+
+- Basic, `Authorization: Basic <base64(user:pass)>`, matching what Armada's own client sends
+  (`pkg/client/auth/basic/credentials.go:13`). The server compares the scheme with
+  `strings.EqualFold` (`internal/common/auth/basic.go:24`), as does the bearer path
+  (`internal/common/auth/oidc.go:43`), so canonical casing is safe.
+- Bearer, either a static token or a file re-read on every request. The file covers OIDC and
+  any other rotating credential without this adapter implementing a refresh flow, and a
+  rotated token is picked up without restarting marimohub.
+
+Kubernetes-native auth is deliberately not implemented: it uses a bespoke
+`KubernetesAuth <base64>` scheme carrying a CA with the token, matched case-sensitively
+(`internal/common/auth/kubernetes.go:77`), and it exists for executors authenticating to the
+server rather than for API clients.
+
+Sending nothing is still a supported choice, since the quickstart runs `anonymousAuth: true`.
 
 ### 16. Ship as a bundle baked into the marimohub image
 
