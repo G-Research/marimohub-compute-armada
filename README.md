@@ -223,18 +223,20 @@ marimohub comes up at <http://localhost:3000>, already signed in as the dev
 user. Browsing, creating a project and creating a notebook all work — those are
 storage operations and never touch compute.
 
-**Starting a kernel gets a pod and then stops.** `ready()` submits the job and
-waits for it to run, so a real pod appears in the cluster, but the steps after it
-are still stubs that throw. The notebook shows a generic _"Sandbox compute backend
-is not available"_ with a Retry button.
+**Starting a kernel gets a pod with the notebook files in it, then stops.**
+`ready()` submits the job and waits for it to run, and the file and environment
+step now goes in over exec (`writeFiles` streams each file through the pod's
+stdin; `setEnvVars` accumulates an export prefix for later commands), but the
+steps after it are still stubs that throw. The notebook shows a generic
+_"Sandbox compute backend is not available"_ with a Retry button.
 
 That message is deliberately vague; the real error is nested in the server log's
 `cause` field. marimohub's `SandboxProvisioner` calls `ready()`, then writes the
 notebook files and environment, then starts the kernel process, so the wall is now
-the file and environment step:
+launching the kernel:
 
 ```
-Error: ArmadaSandbox.writeFiles is not implemented
+Error: ArmadaSandbox.startProcess is not implemented
 ```
 
 Dig it out with:

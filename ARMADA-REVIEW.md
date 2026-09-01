@@ -4,8 +4,11 @@ This document records every design decision behind `marimohub-compute-armada`, t
 for it, and what is still a judgement call. It is meant to be read by someone who knows
 Armada and does not know this repo.
 
-The adapter does not work yet. Every method that touches Armada is a stub that throws. What
-exists is the shape, the wire types, and a local environment to test against.
+The adapter partially works. Placement (submit, wait for running, cancel), exec into the
+placed pod, file writes and env vars are implemented and verified against a real local
+Armada. Still stubs that throw: `startProcess`, `exposePort` (and the `ingressAddress`
+lookup it needs), `execStream`, `readFile`, `listFiles` and `gitCheckout`. The wall a
+kernel start hits today is `startProcess`.
 
 Every claim below is cited against the Armada source at `v0.22.7`, which is the release
 pinned in `.armada-version`, in the form `path:line`. Where we had open questions earlier,
@@ -249,6 +252,32 @@ environment does not honour it: the armada-operator quickstart runs `gresearch/a
 for everything. Those images currently serve a spec byte-identical to `v0.22.7`, verified, but
 that will drift silently.
 
+### 18. File writes and env vars mirror marimohub's kubernetes adapter
+
+marimohub ships its own pod-exec backend (`packages/compute-kubernetes`), which is the same
+control channel we use, so its semantics are the reference rather than something to invent.
+A local marimohub checkout is assumed at `~/Projects/marimohub`; `src/shell.ts` transcribes
+the helpers from `@marimo-hub/compute-commons` the way `src/types.ts` transcribes the ports.
+
+- `writeFiles` is one exec per file, `mkdir -p` for the parent plus `cat > path`, with the
+  content streamed over stdin. Bytes never enter a command line, so `Uint8Array` content
+  arrives verbatim and only the path needs quoting. Writes run 8 at a time (upstream's
+  `WRITE_CONCURRENCY`), each exec being one websocket through the API server.
+- `setEnvVars` stores vars in memory and replays them as an `export K='v'; ` prefix on every
+  later command, because a running pod's environment cannot be changed. `onlyIfUnset` vars
+  are exported behind a `[ -n "${K:-}" ]` guard placed after the forced exports, which gives
+  the precedence marimohub's conformance suite requires: forced beats default, and a value
+  the image already defines beats `onlyIfUnset`.
+
+Two deliberate divergences from upstream: a path with no parent directory skips `mkdir`
+entirely (upstream's `slice`/`lastIndexOf` fallback creates a spurious directory for a bare
+relative filename), and an env var name `sh` could not export is rejected at `setEnvVars`
+time with a clear error rather than surfacing as shell noise at the next exec.
+
+In-memory env means vars set before a marimohub restart are not replayed to a reattached
+pod. Upstream has the same property, and the provisioner sets env immediately before
+starting the kernel, so nothing observes the gap today.
+
 ## Constraints on the first submit
 
 Collected from `internal/server/submit/validation/submit_request.go` so the first real submit
@@ -315,11 +344,18 @@ Verified:
   jobs submittable with `armadactl`.
 - marimohub 0.3.12 loads this adapter in library mode, and a missing environment variable
   fails startup with our own error message.
+- Exec into an executor-created pod works in practice: exit codes, stderr, piped stdin,
+  270 KB of output and a timeout all behave (the smoke script, run from the host).
+- `writeFiles` and `setEnvVars` round-trip against a real pod: a filename containing a
+  quote and spaces, binary bytes read back exactly, a relative path landing in the
+  container's working directory without a stray directory, forced-beats-default precedence,
+  and a pre-existing `HOME` surviving an `onlyIfUnset` attempt.
 - Build, type checks, tests and image build pass in CI.
 
 Assumed, not verified:
 
-- That exec into an executor-created pod works in practice. Nothing has been run.
+- That exec works from inside the marimohub container rather than from the host; the kind
+  API server certificate makes that route non-obvious (see README).
 - That an interactive session survives normal scheduling behaviour once decisions 7 to 9 are
   applied.
 - That the generated Ingress carries WebSocket traffic with a real ingress controller.
@@ -330,8 +366,9 @@ Assumed, not verified:
 | Path                          | What it is                                                              |
 | ----------------------------- | ----------------------------------------------------------------------- |
 | `src/types.ts`                | marimohub's adapter interface, transcribed by hand. Not ours to change. |
-| `src/armada.ts`               | Placement: submit, watch, ingress address, cancel. All stubs.           |
-| `src/exec.ts`                 | Control channel: exec into a located pod. Stub.                         |
+| `src/armada.ts`               | Placement: submit, watch, cancel. Only the ingress address is a stub.   |
+| `src/exec.ts`                 | Control channel: exec into a located pod.                               |
+| `src/shell.ts`                | Quoting and the env prefix, transcribed from `compute-commons`.         |
 | `src/sandbox.ts`              | One kernel session. Everything below `exec` is ordinary shell commands. |
 | `src/armada-types.ts`         | Hand-written Armada wire types, with the reasoning in the header.       |
 | `scripts/check-armada-api.ts` | The contract check that keeps those types honest.                       |
