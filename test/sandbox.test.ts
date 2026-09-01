@@ -4,6 +4,8 @@ import { readConfig } from '../src/config.js';
 import type { ArmadaConfig } from '../src/config.js';
 import type { PodExec, PodExecOptions, PodExecResult } from '../src/exec.js';
 import { ArmadaSandbox } from '../src/sandbox.js';
+import { shellQuote } from '../src/shell.js';
+import type { SandboxProcess } from '../src/types.js';
 
 const config: ArmadaConfig = readConfig({
 	ARMADA_URL: 'http://armada.example.com/',
@@ -32,8 +34,10 @@ interface ExecCall {
 	stdin: string | Uint8Array | undefined;
 }
 
+const ok: PodExecResult = { stdout: '', stderr: '', exitCode: 0 };
+
 /** A sandbox whose job is "already placed" and whose execs are recorded. */
-function stubSandbox(result: PodExecResult = { stdout: '', stderr: '', exitCode: 0 }): {
+function stubSandbox(respond: PodExecResult | ((call: ExecCall) => PodExecResult) = ok): {
 	sandbox: ArmadaSandbox;
 	calls: ExecCall[];
 } {
@@ -44,8 +48,9 @@ function stubSandbox(result: PodExecResult = { stdout: '', stderr: '', exitCode:
 	} as unknown as ArmadaClient;
 	const podExec: PodExec = {
 		run: async (_pod: PodLocation, command: readonly string[], options?: PodExecOptions) => {
-			calls.push({ command, stdin: options?.stdin });
-			return result;
+			const call: ExecCall = { command, stdin: options?.stdin };
+			calls.push(call);
+			return typeof respond === 'function' ? respond(call) : respond;
 		},
 	} as unknown as PodExec;
 	return { sandbox: new ArmadaSandbox('sandbox-1', config, armada, podExec), calls };
@@ -128,5 +133,101 @@ describe('setEnvVars', () => {
 
 		await sandbox.exec('echo hi');
 		expect(calls[0]?.command[2]).toBe('echo hi');
+	});
+});
+
+/** Result whose stdout is the echoed PID of the detached process. */
+const pidEcho: PodExecResult = { stdout: '4242\n', stderr: '', exitCode: 0 };
+
+describe('startProcess', () => {
+	it('launches detached with cwd and layered env, and parses the pid', async () => {
+		const { sandbox, calls } = stubSandbox(pidEcho);
+		await sandbox.setEnvVars({ SANDBOX_VAR: 'a' });
+		const started: SandboxProcess = await sandbox.startProcess('marimo run', {
+			cwd: '/work',
+			env: { PROC_VAR: 'b', DROPPED: undefined },
+		});
+
+		const launch: readonly string[] = calls[0]?.command ?? [];
+		expect(launch[0]).toBe('sh');
+		expect(launch[1]).toBe('-c');
+		const logFile: string = /\/tmp\/mh-proc-\d+\.log/.exec(launch[2] ?? '')?.[0] ?? '';
+		// Sandbox-wide vars first, per-process vars after, so the process wins.
+		const inner = "export SANDBOX_VAR='a'; export PROC_VAR='b'; marimo run";
+		expect(launch[2]).toBe(
+			`cd '/work'; setsid sh -lc ${shellQuote(inner)} >${logFile} 2>&1 </dev/null & echo $!`,
+		);
+		expect(started.id).toBe('armada-proc-4242');
+		expect(started.command).toBe('marimo run');
+
+		const named: SandboxProcess = await sandbox.startProcess('marimo run', {
+			processId: 'kernel',
+		});
+		expect(named.id).toBe('kernel');
+	});
+
+	it('kills the pid it parsed, defaulting to TERM', async () => {
+		const { sandbox, calls } = stubSandbox(pidEcho);
+		const started: SandboxProcess = await sandbox.startProcess('sleep 1000');
+		await started.kill();
+		await started.kill('KILL');
+
+		expect(calls[1]?.command[2]).toBe('kill -TERM 4242 2>/dev/null || true');
+		expect(calls[2]?.command[2]).toBe('kill -KILL 4242 2>/dev/null || true');
+	});
+
+	it('reads the process log back', async () => {
+		const { sandbox, calls } = stubSandbox((call: ExecCall) =>
+			(call.command[2] ?? '').startsWith('cat ')
+				? { stdout: 'kernel output', stderr: '', exitCode: 0 }
+				: pidEcho,
+		);
+		const started: SandboxProcess = await sandbox.startProcess('marimo run');
+
+		expect(await started.getLogs()).toEqual({ stdout: 'kernel output', stderr: '' });
+		expect(calls[1]?.command[2]).toMatch(/^cat \/tmp\/mh-proc-\d+\.log 2>\/dev\/null \|\| true$/);
+	});
+
+	it('waits for the port with an in-pod waiter in a login shell', async () => {
+		const { sandbox, calls } = stubSandbox((call: ExecCall) =>
+			(call.command[2] ?? '').startsWith('python3 -c') ? ok : pidEcho,
+		);
+		const started: SandboxProcess = await sandbox.startProcess('marimo run');
+		await started.waitForPort(2718);
+
+		const wait: ExecCall | undefined = calls.at(-1);
+		expect(wait?.command[1]).toBe('-lc');
+		expect(wait?.command[2]).toContain('("127.0.0.1",2718)');
+	});
+
+	it('reports a dead process as a crash carrying its log, not a timeout', async () => {
+		const { sandbox } = stubSandbox((call: ExecCall) => {
+			const cmd: string = call.command[2] ?? '';
+			// The waiter fails its chunk and the /proc liveness check reports dead.
+			if (cmd.startsWith('python3 -c') || cmd.includes('/proc/4242/stat')) {
+				return { stdout: '', stderr: '', exitCode: 1 };
+			}
+			if (cmd.startsWith('cat ')) return { stdout: 'Traceback: boom', stderr: '', exitCode: 0 };
+			return pidEcho;
+		});
+		const started: SandboxProcess = await sandbox.startProcess('marimo run');
+
+		const message: string = await rejection(started.waitForPort(2718, { timeout: 100 }));
+		expect(message).toContain('process exited before port 2718 opened');
+		expect(message).toContain('Traceback: boom');
+	});
+
+	it('times out with the log when the process lives but the port never opens', async () => {
+		const { sandbox } = stubSandbox((call: ExecCall) => {
+			const cmd: string = call.command[2] ?? '';
+			if (cmd.startsWith('python3 -c')) return { stdout: '', stderr: '', exitCode: 1 };
+			if (cmd.startsWith('cat ')) return { stdout: 'still starting', stderr: '', exitCode: 0 };
+			return pidEcho;
+		});
+		const started: SandboxProcess = await sandbox.startProcess('marimo run');
+
+		const message: string = await rejection(started.waitForPort(2718, { timeout: 50 }));
+		expect(message).toContain('timed out waiting for port 2718');
+		expect(message).toContain('still starting');
 	});
 });

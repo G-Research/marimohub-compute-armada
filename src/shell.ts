@@ -41,6 +41,38 @@ export function withEnvPrefix(
 }
 
 /**
+ * An in-pod TCP wait: connect to `127.0.0.1:port` until it answers or `seconds`
+ * elapse, exit 0 on open and 1 on deadline. It runs inside the pod because
+ * every exec is a fresh websocket through the API server, so polling from
+ * outside would quantize the wait to that round trip. The connect timeout is
+ * clamped to the remaining budget: against a blackholed port (packets dropped,
+ * not refused) a fixed timeout could let the final connect run past the
+ * deadline.
+ *
+ * Inline Python looks odd, but it is the only probe a kernel image guarantees.
+ * `python3` is definitionally present (the kernel is Python), while `nc`,
+ * `curl` and `wget` are all absent from `python:*-slim`, and `/dev/tcp` is a
+ * bashism the pod's `sh` does not have. POSIX sh also cannot express what the
+ * wait needs: a monotonic ms-precision deadline (so chunks sum to the exact
+ * timeout) or a per-connect timeout. And it is inline rather than a file so
+ * `waitForPort` does not depend on `writeFiles` having run first.
+ */
+export function portWaitCommand(port: number, seconds: number): string {
+	const script: string =
+		'import socket,sys,time\n' +
+		`end=time.monotonic()+${String(seconds)}\n` +
+		'while True:\n' +
+		'    left=end-time.monotonic()\n' +
+		'    s=socket.socket(); s.settimeout(max(0.01,min(1,left)))\n' +
+		`    ok=s.connect_ex(("127.0.0.1",${String(port)}))==0\n` +
+		'    s.close()\n' +
+		'    if ok: sys.exit(0)\n' +
+		'    if time.monotonic()>=end: sys.exit(1)\n' +
+		'    time.sleep(0.05)\n';
+	return `python3 -c ${shellQuote(script)}`;
+}
+
+/**
  * Names are interpolated unquoted, so anything `sh` would not accept as a
  * variable name must fail here, as a clear error instead of in-pod shell noise.
  */

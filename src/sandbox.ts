@@ -2,7 +2,7 @@ import type { ArmadaClient, PodLocation, SubmittedJob } from './armada.js';
 import type { ArmadaConfig } from './config.js';
 import type { PodExec, PodExecOptions, PodExecResult } from './exec.js';
 import { buildPodSpec } from './podspec.js';
-import { assertEnvName, shellQuote, withEnvPrefix } from './shell.js';
+import { assertEnvName, portWaitCommand, shellQuote, withEnvPrefix } from './shell.js';
 import type {
 	CreateSandboxOptions,
 	ExecOptions,
@@ -21,6 +21,7 @@ import type {
 	SandboxProcess,
 	SetEnvVarsOptions,
 	StartProcessOptions,
+	WaitForPortOptions,
 } from './types.js';
 
 const todo: (method: string) => never = (method: string) => {
@@ -29,6 +30,14 @@ const todo: (method: string) => never = (method: string) => {
 
 /** Each write is one exec, so one websocket; cap how many are in flight. */
 const WRITE_CONCURRENCY = 8;
+
+/** Port waits run in-pod in chunks; each boundary is where a dead kernel gets noticed. */
+const PORT_WAIT_CHUNK_MS = 30_000;
+/** First chunk, kept short so a launch that fails outright reports fast. */
+const PORT_WAIT_FIRST_CHUNK_MS = 2_000;
+
+/** Distinguishes the log files of processes started in the same pod. */
+let processSequence = 0;
 
 /** A non-zero exit is the command's business; marimohub wants it as a result. */
 export function toExecResult(result: PodExecResult): ExecResult {
@@ -188,8 +197,45 @@ export class ArmadaSandbox implements SandboxInstance {
 		// Nothing was ever mounted.
 	}
 
-	async startProcess(_cmd: string, _options?: StartProcessOptions): Promise<SandboxProcess> {
-		return todo('startProcess');
+	/**
+	 * Launch a long-lived process (the kernel) detached, so it outlives the exec
+	 * session that started it: setsid, output to a log file, stdin closed, PID
+	 * echoed back. The outer shell is non-login because its stdout is the PID we
+	 * parse; the detached inner shell is a login shell so profile-provided env
+	 * (a PATH with uv and python on it) reaches the kernel, its output going to
+	 * the log file where profile noise is harmless.
+	 */
+	async startProcess(cmd: string, options?: StartProcessOptions): Promise<SandboxProcess> {
+		const pod: PodLocation = await this.location();
+		const logFile = `/tmp/mh-proc-${String(++processSequence)}.log`;
+		const cd: string = options?.cwd === undefined ? '' : `cd ${shellQuote(options.cwd)}; `;
+
+		const processEnv: Record<string, string> = {};
+		for (const [name, value] of Object.entries(options?.env ?? {})) {
+			if (value !== undefined) processEnv[name] = value;
+		}
+		// Per-process env is exported after the sandbox-wide vars, so it wins.
+		const command: string = withEnvPrefix(
+			withEnvPrefix(cmd, processEnv),
+			this.env,
+			this.envDefaults,
+		);
+
+		const launch = `${cd}setsid sh -lc ${shellQuote(command)} >${logFile} 2>&1 </dev/null & echo $!`;
+		const started: PodExecResult = await this.podExec.run(pod, ['sh', '-c', launch]);
+		if (started.exitCode !== 0) {
+			throw new Error(`Starting "${cmd}" failed: ${started.stderr}`);
+		}
+
+		const pid: string = started.stdout.trim();
+		return new ArmadaProcess(
+			options?.processId ?? `armada-proc-${pid === '' ? String(processSequence) : pid}`,
+			cmd,
+			this.podExec,
+			pod,
+			pid,
+			logFile,
+		);
 	}
 
 	/** Returns the ingress address Armada assigned, not a templated hostname. */
@@ -202,5 +248,94 @@ export class ArmadaSandbox implements SandboxInstance {
 		if (this.job === undefined) return;
 		await this.armada.cancel(this.job);
 		this.pod = undefined;
+	}
+}
+
+/** A detached process in the pod, addressed by the PID its launch echoed back. */
+class ArmadaProcess implements SandboxProcess {
+	constructor(
+		readonly id: string,
+		readonly command: string,
+		private readonly podExec: PodExec,
+		private readonly pod: PodLocation,
+		private readonly pid: string,
+		private readonly logFile: string,
+	) {}
+
+	private async run(cmd: string): Promise<PodExecResult> {
+		return this.podExec.run(this.pod, ['sh', '-c', cmd]);
+	}
+
+	private async log(): Promise<string> {
+		return (await this.run(`cat ${this.logFile} 2>/dev/null || true`)).stdout;
+	}
+
+	/**
+	 * Exit 0 if the process is alive. Not `kill -0`: this pod's PID 1 is
+	 * `sleep infinity`, which never reaps orphans, so a crashed process stays a
+	 * zombie that `kill -0` still counts as alive and every crash would read as
+	 * a timeout. The state field sits after the last `)` because the comm field
+	 * before it may itself contain spaces.
+	 */
+	private aliveCommand(): string {
+		return `state=$(sed 's/^.*) //' /proc/${this.pid}/stat 2>/dev/null | cut -d' ' -f1); [ -n "$state" ] && [ "$state" != Z ]`;
+	}
+
+	async kill(signal?: string): Promise<void> {
+		if (this.pid === '') return;
+		try {
+			await this.run(`kill -${signal ?? 'TERM'} ${this.pid} 2>/dev/null || true`);
+		} catch {
+			// Already gone; killing is best effort.
+		}
+	}
+
+	/**
+	 * `mode`/`path` are accepted but a TCP accept is all that is checked, the
+	 * same as marimohub's kubernetes adapter.
+	 */
+	async waitForPort(port: number, options?: WaitForPortOptions): Promise<void> {
+		const timeout: number = options?.timeout ?? 30_000;
+		// The waiter loops in-pod rather than being probed from here: every exec
+		// is a fresh websocket through the API server, so an external poll would
+		// quantize the wait to that round-trip grid. Chunked so each boundary is
+		// where a dead kernel gets noticed, with the first chunk short so a launch
+		// that fails outright reports fast. `attempts` bounds the loop if the
+		// in-pod waiter itself returns instantly (say, python3 missing).
+		const deadline: number = Date.now() + timeout;
+		const attempts: number = 1 + Math.ceil(timeout / PORT_WAIT_CHUNK_MS);
+		let chunkMs: number = PORT_WAIT_FIRST_CHUNK_MS;
+		// oxlint-disable no-await-in-loop -- each chunk must finish before the next is sized
+		for (let attempt = 0; attempt < attempts; attempt++) {
+			const remainingMs: number = deadline - Date.now();
+			if (remainingMs <= 0) break;
+			// Fractional seconds: the waiter runs a monotonic ms-precision deadline,
+			// so the chunks sum to the full timeout without whole-second rounding.
+			const seconds: number = Number((Math.min(chunkMs, remainingMs) / 1000).toFixed(2));
+			chunkMs = PORT_WAIT_CHUNK_MS;
+			// A login shell, so a python3 that a profile script put on PATH is found.
+			const waited: PodExecResult = await this.podExec.run(this.pod, [
+				'sh',
+				'-lc',
+				portWaitCommand(port, seconds),
+			]);
+			if (waited.exitCode === 0) return;
+			// The chunk elapsed with the port closed. A dead kernel never opens it,
+			// so check liveness before spending another chunk, and word the error so
+			// the provisioner classifies it as a crash, not a timeout.
+			if (this.pid !== '' && (await this.run(this.aliveCommand())).exitCode !== 0) {
+				throw new Error(
+					`process exited before port ${String(port)} opened.\n${await this.log()}`.trim(),
+				);
+			}
+		}
+		// oxlint-enable no-await-in-loop
+		throw new Error(
+			`timed out waiting for port ${String(port)} in ${this.pod.podNamespace}/${this.pod.podName} after ${String(timeout)}ms.\n${await this.log()}`,
+		);
+	}
+
+	async getLogs(): Promise<{ stdout: string; stderr: string }> {
+		return { stdout: await this.log(), stderr: '' };
 	}
 }

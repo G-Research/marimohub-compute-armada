@@ -223,20 +223,21 @@ marimohub comes up at <http://localhost:3000>, already signed in as the dev
 user. Browsing, creating a project and creating a notebook all work — those are
 storage operations and never touch compute.
 
-**Starting a kernel gets a pod with the notebook files in it, then stops.**
-`ready()` submits the job and waits for it to run, and the file and environment
-step now goes in over exec (`writeFiles` streams each file through the pod's
-stdin; `setEnvVars` accumulates an export prefix for later commands), but the
-steps after it are still stubs that throw. The notebook shows a generic
-_"Sandbox compute backend is not available"_ with a Retry button.
+**Starting a kernel gets a pod running marimo, then stops.** `ready()` submits
+the job and waits for it to run, the file and environment step goes in over exec
+(`writeFiles` streams each file through the pod's stdin; `setEnvVars` accumulates
+an export prefix for later commands), and `startProcess` launches the kernel
+detached with `setsid` and waits for its port in-pod. What remains is reaching it
+from outside: the notebook shows a generic _"Sandbox compute backend is not
+available"_ with a Retry button.
 
 That message is deliberately vague; the real error is nested in the server log's
-`cause` field. marimohub's `SandboxProvisioner` calls `ready()`, then writes the
-notebook files and environment, then starts the kernel process, so the wall is now
-launching the kernel:
+`cause` field. marimohub's `SandboxProvisioner` calls `ready()`, writes the
+notebook files and environment, starts the kernel process, then asks for its
+public URL, so the wall is now exposing the port:
 
 ```
-Error: ArmadaSandbox.startProcess is not implemented
+Error: ArmadaSandbox.exposePort is not implemented
 ```
 
 Dig it out with:

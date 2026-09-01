@@ -5,10 +5,10 @@ for it, and what is still a judgement call. It is meant to be read by someone wh
 Armada and does not know this repo.
 
 The adapter partially works. Placement (submit, wait for running, cancel), exec into the
-placed pod, file writes and env vars are implemented and verified against a real local
-Armada. Still stubs that throw: `startProcess`, `exposePort` (and the `ingressAddress`
-lookup it needs), `execStream`, `readFile`, `listFiles` and `gitCheckout`. The wall a
-kernel start hits today is `startProcess`.
+placed pod, file writes, env vars and detached process launch are implemented and verified
+against a real local Armada. Still stubs that throw: `exposePort` (and the
+`ingressAddress` lookup it needs), `execStream`, `readFile`, `listFiles` and
+`gitCheckout`. The wall a kernel start hits today is `exposePort`.
 
 Every claim below is cited against the Armada source at `v0.22.7`, which is the release
 pinned in `.armada-version`, in the form `path:line`. Where we had open questions earlier,
@@ -278,6 +278,34 @@ In-memory env means vars set before a marimohub restart are not replayed to a re
 pod. Upstream has the same property, and the provisioner sets env immediately before
 starting the kernel, so nothing observes the gap today.
 
+### 19. Launch the kernel detached, wait for its port in-pod
+
+`startProcess`, like decision 18, transcribes marimohub's kubernetes adapter. The launch is
+`setsid sh -lc '<cmd>' >/tmp/mh-proc-N.log 2>&1 </dev/null & echo $!`: setsid detaches the
+kernel from the exec session so it survives `startProcess` returning, the log file is what
+`getLogs` and every failure message read, and the echoed PID is how `kill` and the liveness
+check address the process later. The outer shell is non-login because its stdout is the PID
+we parse; the inner shell is a login shell so profile-provided env (a PATH with uv and
+python on it) reaches the kernel, its output going to the log where profile noise is
+harmless.
+
+`waitForPort` loops **inside** the pod: a `python3` one-liner retries a TCP connect against
+`127.0.0.1` under a monotonic deadline. Polling from outside would pay a fresh websocket
+through the API server per probe, quantizing the wait to that round trip. The wait is
+chunked (30s slices, a short 2s first slice) so a kernel that dies gets noticed at a chunk
+boundary: after each failed chunk, a liveness probe distinguishes "still starting" from
+"crashed", and a crash throws `process exited before port N opened` with the log appended,
+which the provisioner classifies as a crash rather than a timeout.
+
+The liveness probe diverges from upstream, which uses `kill -0 $PID`. Our pod's PID 1 is
+`sleep infinity`, which never reaps orphans, so a crashed kernel stays a zombie that
+`kill -0` counts as alive, and the live check showed exactly that: every crash reported as
+a timeout. The probe reads the state field of `/proc/$PID/stat` instead and treats `Z` or
+absent as dead.
+
+Assumptions this leans on, both satisfied by any image marimo itself runs on: `setsid`
+(util-linux, present in Debian slim) and `python3` on the login-shell PATH.
+
 ## Constraints on the first submit
 
 Collected from `internal/server/submit/validation/submit_request.go` so the first real submit
@@ -350,6 +378,11 @@ Verified:
   quote and spaces, binary bytes read back exactly, a relative path landing in the
   container's working directory without a stray directory, forced-beats-default precedence,
   and a pre-existing `HOME` surviving an `onlyIfUnset` attempt.
+- `startProcess` against a real pod: a detached `http.server` stays up after the launch exec
+  ends, `waitForPort` sees its port, sandbox and per-process env reach it, `getLogs` reads
+  its output, `kill` really terminates it, and a command that exits at once is reported as
+  a crash carrying its log, not as a timeout (which is what the `kill -0` probe produced
+  before the `/proc` liveness check replaced it).
 - Build, type checks, tests and image build pass in CI.
 
 Assumed, not verified:
@@ -368,7 +401,7 @@ Assumed, not verified:
 | `src/types.ts`                | marimohub's adapter interface, transcribed by hand. Not ours to change. |
 | `src/armada.ts`               | Placement: submit, watch, cancel. Only the ingress address is a stub.   |
 | `src/exec.ts`                 | Control channel: exec into a located pod.                               |
-| `src/shell.ts`                | Quoting and the env prefix, transcribed from `compute-commons`.         |
+| `src/shell.ts`                | Quoting, env prefix, port waiter, transcribed from `compute-commons`.   |
 | `src/sandbox.ts`              | One kernel session. Everything below `exec` is ordinary shell commands. |
 | `src/armada-types.ts`         | Hand-written Armada wire types, with the reasoning in the header.       |
 | `scripts/check-armada-api.ts` | The contract check that keeps those types honest.                       |

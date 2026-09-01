@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { assertEnvName, shellQuote, withEnvPrefix } from '../src/shell.js';
+import { assertEnvName, portWaitCommand, shellQuote, withEnvPrefix } from '../src/shell.js';
 
 describe('shell quoting', () => {
 	it('wraps a value in single quotes', () => {
@@ -40,6 +40,15 @@ describe('env prefix', () => {
 
 	it('quotes values, not names', () => {
 		expect(withEnvPrefix('run', { GREETING: "it's" })).toBe("export GREETING='it'\\''s'; run");
+	});
+});
+
+describe('port waiter', () => {
+	it('embeds the port and the fractional deadline', () => {
+		const command: string = portWaitCommand(2718, 1.5);
+		expect(command.startsWith("python3 -c '")).toBe(true);
+		expect(command).toContain('("127.0.0.1",2718)');
+		expect(command).toContain('end=time.monotonic()+1.5');
 	});
 });
 
