@@ -1,4 +1,5 @@
 import { ArmadaClient } from './armada.js';
+import { ClusterAccess } from './clusters.js';
 import type { ArmadaConfig } from './config.js';
 import { PodExec } from './exec.js';
 import { ArmadaSandbox } from './sandbox.js';
@@ -15,7 +16,7 @@ export class ArmadaCompute implements SandboxProvider {
 
 	constructor(private readonly config: ArmadaConfig) {
 		this.armada = new ArmadaClient(config);
-		this.podExec = new PodExec();
+		this.podExec = new PodExec(new ClusterAccess(config.kubeconfigPattern));
 	}
 
 	create(id: SandboxId, options?: CreateSandboxOptions): ArmadaSandbox {

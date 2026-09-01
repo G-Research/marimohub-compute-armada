@@ -38,6 +38,13 @@ Everything in `src/sandbox.ts` above `exec` is ordinary shell commands.
 | `ARMADA_AUTH_PASSWORD`               | no       | Basic auth, set with the username                    |
 | `ARMADA_AUTH_TOKEN`                  | no       | Bearer token, for example from OIDC                  |
 | `ARMADA_AUTH_TOKEN_FILE`             | no       | Bearer token file, re-read on every request          |
+| `ARMADA_KUBECONFIG_PATTERN`          | no       | Kubeconfig path, `{CLUSTER_ID}` substituted          |
+
+`ARMADA_KUBECONFIG_PATTERN` is how the adapter reaches the cluster a job landed on,
+which Armada names only as a `clusterId`. It mirrors Lookout's `binocularsBaseUrlPattern`:
+`/etc/marimohub/clusters/{CLUSTER_ID}.yaml` in a multi-cluster deployment, a plain path
+when there is one cluster, and unset to use the ambient credentials (the in-cluster
+service account, or `~/.kube/config` on a laptop).
 
 Configure at most one auth mechanism. With none, no `Authorization` header is sent, which
 is what a server running `anonymousAuth: true` expects. Prefer `ARMADA_AUTH_TOKEN_FILE`
@@ -173,9 +180,23 @@ running after 11.7s
   node    armada-worker
 ```
 
-That exercises the config, the auth header, the podspec, `/v1/job/submit` and the
-event stream against a real server. Armada also creates the NodePort service the
-kernel will be reached through, which `kubectl get svc` shows as `2718:3xxxx/TCP`.
+```
+running a command in it
+  hello from armada-01m1bzdp2tz93cyeh8ftzfr7nm-0
+  Python 3.13.15
+  exit 0
+```
+
+That exercises the config, the auth header, the podspec, `/v1/job/submit`, the event
+stream and a Kubernetes exec against a real server and a real pod. Armada also creates
+the NodePort service the kernel will be reached through, which `kubectl get svc` shows
+as `2718:3xxxx/TCP`.
+
+The script runs on your machine, so it uses `~/.kube/config`. marimohub in a container
+needs its own route to the API server: join the `kind` network and point a kubeconfig at
+`https://armada-control-plane:6443`. The kind API server certificate lists
+`armada-control-plane`, `localhost`, `127.0.0.1` and the node IP as subject alternative
+names, so reaching it as `host.docker.internal` fails TLS verification.
 
 ### 4. Start marimohub with this adapter
 
@@ -281,10 +302,16 @@ when an Armada-related file changed. There is no scheduled run: the spec is fetc
 git tag, and a tag is immutable, so the result can only change when this repo does.
 
 `dist/index.js` is fully self-contained: marimohub imports it from wherever it is
-mounted, with no `node_modules` beside it. Once the adapter really imports
-`@kubernetes/client-node` the bundle is ~2 MB — over the 1 MiB ConfigMap limit,
-so ship it via a volume or a one-line derived image (`COPY dist/index.js …`),
-not a ConfigMap.
+mounted, with no `node_modules` beside it. Now that the adapter really loads
+`@kubernetes/client-node`, the bundle is about 8 MB: that client depends on
+`undici`, `openid-client`, `tar-fs` and `socks`, and bundling reaches all of them
+even though the import is lazy. That is far past the 1 MiB ConfigMap limit, so
+ship it via a volume or a one-line derived image (`COPY dist/index.js …`), which
+is what the Dockerfile here does. Size is not otherwise interesting: it is one
+layer in an image that already carries a Node runtime.
+
+The bundle is deliberately not minified. When a kernel fails to start, the useful
+error is a stack trace in marimohub's log, and the Dockerfile ships no source map.
 
 Point a local marimohub dev server at the build output:
 

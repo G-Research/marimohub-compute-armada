@@ -1,9 +1,10 @@
 import type { ArmadaClient, PodLocation, SubmittedJob } from './armada.js';
 import type { ArmadaConfig } from './config.js';
-import type { PodExec } from './exec.js';
+import type { PodExec, PodExecOptions, PodExecResult } from './exec.js';
 import { buildPodSpec } from './podspec.js';
 import type {
 	CreateSandboxOptions,
+	ExecOptions,
 	ExecResult,
 	ExecStreamOptions,
 	ExposePortOptions,
@@ -24,6 +25,19 @@ import type {
 const todo: (method: string) => never = (method: string) => {
 	throw new Error(`ArmadaSandbox.${method} is not implemented`);
 };
+
+/** A non-zero exit is the command's business; marimohub wants it as a result. */
+export function toExecResult(result: PodExecResult): ExecResult {
+	if (result.exitCode === 0) {
+		return { success: true, stdout: result.stdout, stderr: result.stderr };
+	}
+	return {
+		success: false,
+		stdout: result.stdout,
+		stderr: result.stderr,
+		error: { code: 'COMMAND_FAILED' },
+	};
+}
 
 /**
  * One kernel session, backed by one Armada job.
@@ -59,8 +73,34 @@ export class ArmadaSandbox implements SandboxInstance {
 		this.pod = await this.armada.waitForRunning(this.job);
 	}
 
-	async exec(_cmd: string): Promise<ExecResult> {
-		return todo('exec');
+	/**
+	 * Everything above this method is built out of `exec`, so this is the one that
+	 * has to be right. A command that fails is a normal result, not an exception;
+	 * only the channel itself failing is a `BACKEND_ERROR`.
+	 */
+	async exec(cmd: string, options?: ExecOptions): Promise<ExecResult> {
+		const execOptions: PodExecOptions =
+			options?.timeout === undefined ? {} : { timeoutMs: options.timeout };
+
+		let result: PodExecResult;
+		try {
+			result = await this.podExec.run(await this.location(), ['sh', '-c', cmd], execOptions);
+		} catch (error) {
+			return {
+				success: false,
+				stdout: '',
+				stderr: error instanceof Error ? error.message : String(error),
+				error: { code: 'BACKEND_ERROR' },
+			};
+		}
+		return toExecResult(result);
+	}
+
+	/** The pod, submitting and waiting for it first if nobody has yet. */
+	private async location(): Promise<PodLocation> {
+		if (this.pod === undefined) await this.ready();
+		if (this.pod === undefined) throw new Error(`Sandbox ${this.id} has no pod after ready()`);
+		return this.pod;
 	}
 
 	async execStream(_cmd: string, _options?: ExecStreamOptions): Promise<ReadableStream> {

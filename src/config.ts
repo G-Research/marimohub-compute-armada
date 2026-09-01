@@ -23,6 +23,12 @@ export interface ArmadaConfig {
 	/** Port marimo serves on inside the pod. */
 	port: number;
 	/**
+	 * Where to find Kubernetes credentials for the cluster a job landed on, with
+	 * `{CLUSTER_ID}` replaced by the id Armada reports. Unset means the ambient
+	 * config: the in-cluster service account, or `~/.kube/config` outside one.
+	 */
+	kubeconfigPattern?: string | undefined;
+	/**
 	 * Hard cap on one session, submitted as `activeDeadlineSeconds`. Armada gives
 	 * any pod without one the server default, 72 hours as shipped, so a kernel must
 	 * always carry its own.
@@ -143,6 +149,7 @@ export function readConfig(
 		image,
 		sandboxHostname: env.MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME,
 		port: optionalPort(env, 'ARMADA_KERNEL_PORT', 2718),
+		kubeconfigPattern: env.ARMADA_KUBECONFIG_PATTERN,
 		maxLifetimeSeconds:
 			compute?.sessionMaxLifetimeSeconds ??
 			optionalSeconds(env, 'ARMADA_KERNEL_MAX_LIFETIME_SECONDS', DEFAULT_MAX_LIFETIME_SECONDS),

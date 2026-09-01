@@ -102,6 +102,10 @@ export interface SandboxProcess {
 	getLogs(): Promise<{ stdout: string; stderr: string }>;
 }
 
+export interface ExecOptions {
+	timeout?: number;
+}
+
 export interface ExecStreamOptions {
 	timeout?: number;
 }
@@ -125,7 +129,7 @@ export interface SandboxFileWrite {
 export interface SandboxInstance {
 	readonly supportsBucketMount?: boolean;
 	ready?(): Promise<void>;
-	exec(cmd: string): Promise<ExecResult>;
+	exec(cmd: string, options?: ExecOptions): Promise<ExecResult>;
 	execStream(cmd: string, options?: ExecStreamOptions): Promise<ReadableStream>;
 	readFile(path: string): Promise<ReadFileResult>;
 	listFiles(path: string, options?: ListFilesOptions): Promise<ListFilesResult>;

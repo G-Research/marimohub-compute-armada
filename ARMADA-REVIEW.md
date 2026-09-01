@@ -157,9 +157,14 @@ operator-configured URL pattern with `{CLUSTER_ID}` substituted in
 `config/lookout/config.yaml:35`). So the mapping is operator configuration, by design, in
 Armada's own components.
 
-We mirror that: a configured pattern or map from `clusterId` to cluster access, with a single
-entry in a single-cluster deployment. This is the shape of the thing Armada itself does, not
-an invention.
+We mirror that: `ARMADA_KUBECONFIG_PATTERN` takes the same `{CLUSTER_ID}` substitution, and
+falls back to ambient credentials when unset, which covers both a single-cluster deployment
+and a laptop. This is the shape of the thing Armada itself does, not an invention.
+
+Exec through the Pod subresource is now implemented and verified against a real
+Armada-created pod: exit codes, stderr, piped stdin, 270 KB of output and a timeout all
+behave. What is not yet proven is doing it from inside the marimohub container rather than
+from the host.
 
 Also worth knowing: binoculars holds its own service account and impersonates the calling
 user to read logs (`deployment/binoculars/templates/clusterrole.yaml`). If exec-from-outside
