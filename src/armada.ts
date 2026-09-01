@@ -11,6 +11,7 @@ import type {
 	EventMessage,
 	EventStreamLine,
 	JobFailedEvent,
+	JobIngressInfoEvent,
 	JobRunningEvent,
 	JobCancelRequest,
 	JobSetRequest,
@@ -51,6 +52,9 @@ function asObject(value: unknown, what: string): object {
 
 /** Long enough for an image pull on a cold node, short enough to fail a wedged queue. */
 const DEFAULT_RUNNING_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** The ingress event lands around Running, so by expose time it usually replays. */
+const DEFAULT_INGRESS_TIMEOUT_MS = 60 * 1000;
 
 export class ArmadaClient {
 	constructor(private readonly config: ArmadaConfig) {}
@@ -160,11 +164,62 @@ export class ArmadaClient {
 	}
 
 	/**
-	 * Ingress address Armada assigned for a port, from `JobIngressInfoEvent`
-	 * (`ingress_addresses` maps port to address).
+	 * The address Armada assigned for a container port, from
+	 * `JobIngressInfoEvent`: `hostIP:nodePort` for a NodePort service, the rule
+	 * host for an Ingress. The stream replays existing messages before watching,
+	 * so an address reported before this call resolves without waiting.
+	 *
+	 * The event carries every exposed port at once, so an event for our job that
+	 * lacks the asked-for port is a configuration error, not something to wait
+	 * out.
 	 */
-	async ingressAddress(_job: SubmittedJob, _port: number): Promise<string> {
-		throw new Error('ArmadaClient.ingressAddress is not implemented');
+	async ingressAddress(
+		job: SubmittedJob,
+		port: number,
+		timeoutMs: number = DEFAULT_INGRESS_TIMEOUT_MS,
+	): Promise<string> {
+		const request: JobSetRequest = {
+			queue: this.config.queue,
+			id: job.jobSetId,
+			watch: true,
+			errorIfMissing: false,
+		};
+		const path: string = `/v1/job-set/${encodeURIComponent(this.config.queue)}/${encodeURIComponent(job.jobSetId)}`;
+		const response: Response = await this.post(path, request, AbortSignal.timeout(timeoutMs));
+		if (response.body === null) throw new Error(`Armada returned no event stream for ${path}`);
+
+		for await (const value of readNdjson(response.body)) {
+			const line: EventStreamLine = asObject(value, 'an event stream line');
+			if (line.error !== undefined) {
+				throw new Error(`Armada event stream failed: ${line.error.message ?? 'unknown error'}`);
+			}
+
+			const message: EventMessage | undefined = line.result?.message;
+			if (message === undefined) continue;
+
+			const info: JobIngressInfoEvent | undefined = message.ingressInfo;
+			if (info !== undefined && info.jobId === job.jobId) {
+				const address: string | undefined = info.ingressAddresses?.[String(port)];
+				if (address !== undefined && address !== '') return address;
+				const known: string = Object.keys(info.ingressAddresses ?? {}).join(', ');
+				throw new Error(
+					`Armada reported no address for port ${String(port)} of job ${job.jobId}; it exposes: ${known === '' ? 'nothing' : known}`,
+				);
+			}
+
+			const failed: JobFailedEvent | undefined = message.failed;
+			if (failed !== undefined && failed.jobId === job.jobId && failed.retryable !== true) {
+				throw new Error(`Armada job ${job.jobId} failed: ${failed.reason ?? 'no reason given'}`);
+			}
+
+			if (message.cancelled !== undefined && message.cancelled.jobId === job.jobId) {
+				throw new Error(`Armada job ${job.jobId} was cancelled`);
+			}
+		}
+
+		throw new Error(
+			`Armada event stream ended before job ${job.jobId} reported an ingress address`,
+		);
 	}
 
 	async cancel(job: SubmittedJob): Promise<void> {

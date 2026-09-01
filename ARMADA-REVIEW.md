@@ -4,11 +4,12 @@ This document records every design decision behind `marimohub-compute-armada`, t
 for it, and what is still a judgement call. It is meant to be read by someone who knows
 Armada and does not know this repo.
 
-The adapter partially works. Placement (submit, wait for running, cancel), exec into the
-placed pod, file writes, env vars and detached process launch are implemented and verified
-against a real local Armada. Still stubs that throw: `exposePort` (and the
-`ingressAddress` lookup it needs), `execStream`, `readFile`, `listFiles` and
-`gitCheckout`. The wall a kernel start hits today is `exposePort`.
+The adapter partially works. The whole provision sequence is implemented and verified
+against a real local Armada: placement (submit, wait for running, cancel), exec into the
+placed pod, file writes, env vars, detached process launch, and the exposed-port URL from
+Armada's ingress event. Still stubs that throw: `execStream`, `readFile`, `listFiles` and
+`gitCheckout`, which session capture hits at snapshot or teardown, plus `listActive` on
+the client.
 
 Every claim below is cited against the Armada source at `v0.22.7`, which is the release
 pinned in `.armada-version`, in the form `path:line`. Where we had open questions earlier,
@@ -306,6 +307,24 @@ absent as dead.
 Assumptions this leans on, both satisfied by any image marimo itself runs on: `setsid`
 (util-linux, present in Debian slim) and `python3` on the login-shell PATH.
 
+### 20. `exposePort` returns the address Armada assigned, verbatim
+
+`ingressAddress` reads `JobIngressInfoEvent` from the same job-set stream `waitForRunning`
+uses. The executor fills `ingressAddresses` with one entry per exposed container port:
+`hostIP:nodePort` for a NodePort service, the rule host for an Ingress
+(`internal/executor/reporter/event.go:138`). The stream replays existing messages before
+watching, and the event lands around Running, so by expose time it usually resolves without
+waiting. An event for our job that lacks the asked-for port fails immediately: the event
+carries every port at once, so a missing one is a configuration error, not something to
+wait out.
+
+`options.hostname` is deliberately ignored, per decision 13: Armada names the host, we
+read it. The URL is plain `http://` because what the submit creates today is a NodePort
+service; the scheme choice revisits when an Ingress config with TLS lands. That NodePort
+address is only reachable from the cluster's network, which is fine for marimohub running
+next to it and a visible gap for a browser on a laptop; the Ingress config is the answer
+there too.
+
 ## Constraints on the first submit
 
 Collected from `internal/server/submit/validation/submit_request.go` so the first real submit
@@ -383,6 +402,9 @@ Verified:
   its output, `kill` really terminates it, and a command that exits at once is reported as
   a crash carrying its log, not as a timeout (which is what the `kill -0` probe produced
   before the `/proc` liveness check replaced it).
+- `exposePort` against a real pod: the URL comes back as `http://<node-ip>:<nodePort>` in
+  single-digit milliseconds (the ingress event replays from the stream), and an HTTP
+  request through that NodePort reaches a server listening on the kernel port.
 - Build, type checks, tests and image build pass in CI.
 
 Assumed, not verified:
@@ -396,13 +418,13 @@ Assumed, not verified:
 
 ## Where to look in the code
 
-| Path                          | What it is                                                              |
-| ----------------------------- | ----------------------------------------------------------------------- |
-| `src/types.ts`                | marimohub's adapter interface, transcribed by hand. Not ours to change. |
-| `src/armada.ts`               | Placement: submit, watch, cancel. Only the ingress address is a stub.   |
-| `src/exec.ts`                 | Control channel: exec into a located pod.                               |
-| `src/shell.ts`                | Quoting, env prefix, port waiter, transcribed from `compute-commons`.   |
-| `src/sandbox.ts`              | One kernel session. Everything below `exec` is ordinary shell commands. |
-| `src/armada-types.ts`         | Hand-written Armada wire types, with the reasoning in the header.       |
-| `scripts/check-armada-api.ts` | The contract check that keeps those types honest.                       |
-| `README.md`                   | How to run the whole thing locally, and what failure looks like today.  |
+| Path                          | What it is                                                               |
+| ----------------------------- | ------------------------------------------------------------------------ |
+| `src/types.ts`                | marimohub's adapter interface, transcribed by hand. Not ours to change.  |
+| `src/armada.ts`               | Placement: submit, watch, ingress address, cancel. `listActive` stubbed. |
+| `src/exec.ts`                 | Control channel: exec into a located pod.                                |
+| `src/shell.ts`                | Quoting, env prefix, port waiter, transcribed from `compute-commons`.    |
+| `src/sandbox.ts`              | One kernel session. Everything below `exec` is ordinary shell commands.  |
+| `src/armada-types.ts`         | Hand-written Armada wire types, with the reasoning in the header.        |
+| `scripts/check-armada-api.ts` | The contract check that keeps those types honest.                        |
+| `README.md`                   | How to run the whole thing locally, and what failure looks like today.   |

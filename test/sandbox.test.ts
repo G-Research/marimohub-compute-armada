@@ -45,6 +45,7 @@ function stubSandbox(respond: PodExecResult | ((call: ExecCall) => PodExecResult
 	const armada: ArmadaClient = {
 		submit: async () => ({ jobId: 'job-1', jobSetId: 'set-1' }),
 		waitForRunning: async () => pod,
+		ingressAddress: async (_job: unknown, port: number) => `172.18.0.3:${String(30000 + port)}`,
 	} as unknown as ArmadaClient;
 	const podExec: PodExec = {
 		run: async (_pod: PodLocation, command: readonly string[], options?: PodExecOptions) => {
@@ -133,6 +134,18 @@ describe('setEnvVars', () => {
 
 		await sandbox.exec('echo hi');
 		expect(calls[0]?.command[2]).toBe('echo hi');
+	});
+});
+
+describe('exposePort', () => {
+	it('wraps the address Armada assigned in a URL, ignoring the hostname option', async () => {
+		const { sandbox } = stubSandbox();
+		const exposed: { url: string } = await sandbox.exposePort(2718, {
+			hostname: 'ignored.example.com',
+		});
+
+		// 32718 proves the asked-for port reached ingressAddress.
+		expect(exposed).toEqual({ url: 'http://172.18.0.3:32718' });
 	});
 });
 

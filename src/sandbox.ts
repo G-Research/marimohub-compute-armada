@@ -238,9 +238,18 @@ export class ArmadaSandbox implements SandboxInstance {
 		);
 	}
 
-	/** Returns the ingress address Armada assigned, not a templated hostname. */
-	async exposePort(_port: number, _options: ExposePortOptions): Promise<ExposePortResult> {
-		return todo('exposePort');
+	/**
+	 * The URL is the address Armada assigned, never a hostname we template, so
+	 * `options.hostname` is deliberately ignored (decision 13: Armada names the
+	 * host, we read it from the event stream). Today the submit creates a
+	 * NodePort service, so the address is `hostIP:nodePort` and plain http; the
+	 * scheme choice revisits when an Ingress config with TLS lands.
+	 */
+	async exposePort(port: number, _options: ExposePortOptions): Promise<ExposePortResult> {
+		await this.ready();
+		if (this.job === undefined) throw new Error(`Sandbox ${this.id} has no job after ready()`);
+		const address: string = await this.armada.ingressAddress(this.job, port);
+		return { url: address.includes('://') ? address : `http://${address}` };
 	}
 
 	/** Cancelling the job deletes the pod and every object Armada created with it. */

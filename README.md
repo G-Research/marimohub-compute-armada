@@ -223,24 +223,20 @@ marimohub comes up at <http://localhost:3000>, already signed in as the dev
 user. Browsing, creating a project and creating a notebook all work — those are
 storage operations and never touch compute.
 
-**Starting a kernel gets a pod running marimo, then stops.** `ready()` submits
+**Starting a kernel now runs the whole provision sequence.** `ready()` submits
 the job and waits for it to run, the file and environment step goes in over exec
 (`writeFiles` streams each file through the pod's stdin; `setEnvVars` accumulates
-an export prefix for later commands), and `startProcess` launches the kernel
-detached with `setsid` and waits for its port in-pod. What remains is reaching it
-from outside: the notebook shows a generic _"Sandbox compute backend is not
-available"_ with a Retry button.
+an export prefix for later commands), `startProcess` launches the kernel detached
+with `setsid` and waits for its port in-pod, and `exposePort` returns the address
+Armada assigned to the NodePort service, read from `JobIngressInfoEvent`.
 
-That message is deliberately vague; the real error is nested in the server log's
-`cause` field. marimohub's `SandboxProvisioner` calls `ready()`, writes the
-notebook files and environment, starts the kernel process, then asks for its
-public URL, so the wall is now exposing the port:
-
-```
-Error: ArmadaSandbox.exposePort is not implemented
-```
-
-Dig it out with:
+Two gaps remain before a notebook is usable locally. The returned URL is
+`<node-ip>:<nodePort>` on the docker network, which a browser on the host cannot
+reach, so connecting to the kernel needs a route (or a real Ingress, which the
+adapter does not submit yet). And session capture at snapshot or teardown still
+hits stubs (`readFile`, `listFiles`). When a start does fail, the notebook shows
+a generic _"Sandbox compute backend is not available"_ with a Retry button; the
+real error is nested in the server log's `cause` field. Dig it out with:
 
 ```bash
 docker logs marimohub-armada 2>&1 | grep request_error | tail -1 | jq -r '.error.cause.message'

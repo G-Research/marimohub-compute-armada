@@ -210,6 +210,72 @@ describe('waitForRunning', () => {
 	});
 });
 
+describe('ingressAddress', () => {
+	const job: SubmittedJob = { jobId: 'job-1', jobSetId: 'sandbox-7' };
+
+	it('returns the address Armada assigned for the port', async () => {
+		stubFetch(
+			eventStream(
+				{ result: { id: '1', message: { running: { jobId: 'job-1' } } } },
+				{
+					result: {
+						id: '2',
+						message: {
+							ingressInfo: {
+								jobId: 'job-1',
+								ingressAddresses: { '2718': '172.18.0.3:31234', '8080': 'other' },
+							},
+						},
+					},
+				},
+			),
+		);
+
+		const address: string = await new ArmadaClient(config).ingressAddress(job, 2718);
+
+		expect(address).toBe('172.18.0.3:31234');
+		expect(calls[0]?.url).toBe('http://armada.example.com/v1/job-set/marimohub/sandbox-7');
+	});
+
+	it('names the ports the job does expose when ours is not among them', async () => {
+		stubFetch(
+			eventStream({
+				result: {
+					id: '1',
+					message: { ingressInfo: { jobId: 'job-1', ingressAddresses: { '8080': 'other' } } },
+				},
+			}),
+		);
+
+		const message: string = await rejection(new ArmadaClient(config).ingressAddress(job, 2718));
+		expect(message).toContain('no address for port 2718');
+		expect(message).toContain('8080');
+	});
+
+	it('ignores another job and reports a stream that ends without an answer', async () => {
+		stubFetch(
+			eventStream({
+				result: {
+					id: '1',
+					message: { ingressInfo: { jobId: 'other', ingressAddresses: { '2718': 'x' } } },
+				},
+			}),
+		);
+
+		expect(await rejection(new ArmadaClient(config).ingressAddress(job, 2718))).toContain(
+			'ended before job job-1 reported an ingress address',
+		);
+	});
+
+	it('fails fast when the job is cancelled instead of waiting out the timeout', async () => {
+		stubFetch(eventStream({ result: { id: '1', message: { cancelled: { jobId: 'job-1' } } } }));
+
+		expect(await rejection(new ArmadaClient(config).ingressAddress(job, 2718))).toContain(
+			'was cancelled',
+		);
+	});
+});
+
 describe('cancel', () => {
 	it('cancels the job by queue, job set and id', async () => {
 		stubFetch(Response.json({ cancelledIds: ['job-1'] }));
