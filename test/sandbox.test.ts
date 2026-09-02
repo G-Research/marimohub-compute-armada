@@ -66,11 +66,13 @@ function stubSandbox(
 					...env,
 				});
 	const calls: ExecCall[] = [];
+	// oxlint-disable-next-line no-unsafe-type-assertion -- a stub of a class with private fields; structural typing cannot satisfy it
 	const armada: ArmadaClient = {
 		submit: async () => ({ jobId: 'job-1', jobSetId: 'set-1' }),
 		waitForRunning: async () => pod,
 		ingressAddress: async (_job: unknown, port: number) => `172.18.0.3:${String(30000 + port)}`,
 	} as unknown as ArmadaClient;
+	// oxlint-disable-next-line no-unsafe-type-assertion -- a stub of a class with private fields; structural typing cannot satisfy it
 	const podExec: PodExec = {
 		run: async (_pod: PodLocation, command: readonly string[], options?: PodExecOptions) => {
 			const call: ExecCall = { command, stdin: options?.stdin, timeoutMs: options?.timeoutMs };
