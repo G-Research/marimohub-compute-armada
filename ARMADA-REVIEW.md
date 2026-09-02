@@ -167,8 +167,11 @@ and a laptop. This is the shape of the thing Armada itself does, not an inventio
 
 Exec through the Pod subresource is now implemented and verified against a real
 Armada-created pod: exit codes, stderr, piped stdin, 270 KB of output and a timeout all
-behave. What is not yet proven is doing it from inside the marimohub container rather than
-from the host.
+behave, and it works from inside the marimohub container, not only from the host. The
+in-container route is the pattern applied literally: `dev/run-local.sh` gives the container
+kind's internal kubeconfig (`https://armada-control-plane:6443`, which is in the API server
+certificate's SANs; `host.docker.internal` is not) and joins it to the `kind` docker
+network, and `ARMADA_KUBECONFIG_PATTERN` points at the mounted file.
 
 Also worth knowing: binoculars holds its own service account and impersonates the calling
 user to read logs (`deployment/binoculars/templates/clusterrole.yaml`). If exec-from-outside
@@ -702,6 +705,10 @@ Verified:
   fails startup with our own error message.
 - Exec into an executor-created pod works in practice: exit codes, stderr, piped stdin,
   270 KB of output and a timeout all behave (the smoke script, run from the host).
+- Exec works from inside the marimohub container, which was the one assumption that could
+  have changed the architecture: the adapter bundle baked into the image, driven in the
+  running container with the container's own env, submitted a job, execed into its pod and
+  round-tripped a file, through the mounted internal kubeconfig on the `kind` network.
 - `writeFiles` and `setEnvVars` round-trip against a real pod: a filename containing a
   quote and spaces, binary bytes read back exactly, a relative path landing in the
   container's working directory without a stray directory, forced-beats-default precedence,
@@ -744,8 +751,6 @@ Verified:
 
 Assumed, not verified:
 
-- That exec works from inside the marimohub container rather than from the host; the kind
-  API server certificate makes that route non-obvious (see README).
 - That the kernel image provides `/bin/sh`, GNU `find`, `git` and `setsid` with `--wait`. Verified
   only against the local `marimo-sandbox:local` image, which is Debian-family; see decision 22.
 - That an interactive session survives normal scheduling behaviour once decisions 7 to 9 are

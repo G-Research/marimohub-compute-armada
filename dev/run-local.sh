@@ -6,13 +6,24 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 ARMADACTL=${ARMADACTL:-$HOME/Projects/armada-operator/bin/app/armadactl}
+KIND=${KIND:-$HOME/Projects/armada-operator/bin/tooling/kind}
 QUEUE=${ARMADA_QUEUE:-marimohub}
 IMAGE=${IMAGE:-marimohub-armada:dev}
 CONTAINER=${CONTAINER:-marimohub-armada}
 PORT=${PORT:-3000}
+KUBECONFIG_FILE=dev/kubeconfig-internal.yaml
 
 echo "==> building adapter bundle"
 bun run build
+
+# The control channel execs into pods through the cluster's API server, and the
+# container cannot use ~/.kube/config: that config says https://127.0.0.1:<port>,
+# which inside a container is the container. The internal variant says
+# https://armada-control-plane:6443, reachable once the container joins the kind
+# docker network, and that name is in the API server certificate's SANs
+# (host.docker.internal is not, so rewriting the server URL would fail TLS).
+echo "==> writing internal kubeconfig for the control channel"
+"$KIND" get kubeconfig --internal --name armada >"$KUBECONFIG_FILE"
 
 echo "==> baking into marimohub image"
 docker build --platform linux/amd64 -t "$IMAGE" .
@@ -32,8 +43,10 @@ fi
 echo "==> restarting marimohub"
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker run -d --name "$CONTAINER" --platform linux/amd64 \
+	--network kind \
 	-p "$PORT:3000" \
 	-v marimohub-armada-data:/data \
+	-v "$PWD/$KUBECONFIG_FILE":/etc/marimohub/kubeconfig:ro \
 	-e MARIMOHUB_STORAGE_BACKEND=fs \
 	-e MARIMOHUB_STORAGE_FS_ROOT=/data \
 	-e MARIMOHUB_AUTH_BACKEND=dev \
@@ -41,6 +54,7 @@ docker run -d --name "$CONTAINER" --platform linux/amd64 \
 	-e ARMADA_URL="${ARMADA_URL:-http://host.docker.internal:30001}" \
 	-e ARMADA_QUEUE="$QUEUE" \
 	-e ARMADA_NAMESPACE="${ARMADA_NAMESPACE:-default}" \
+	-e ARMADA_KUBECONFIG_PATTERN=/etc/marimohub/kubeconfig \
 	"$IMAGE" >/dev/null
 
 echo "==> waiting for marimohub"

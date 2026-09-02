@@ -207,6 +207,11 @@ needs its own route to the API server: join the `kind` network and point a kubec
 `https://armada-control-plane:6443`. The kind API server certificate lists
 `armada-control-plane`, `localhost`, `127.0.0.1` and the node IP as subject alternative
 names, so reaching it as `host.docker.internal` fails TLS verification.
+`dev/run-local.sh` wires exactly that: it writes the internal kubeconfig
+(`kind get kubeconfig --internal`) to `dev/kubeconfig-internal.yaml`, mounts it,
+joins the container to the `kind` network, and points
+`ARMADA_KUBECONFIG_PATTERN` at the mount. Verified: the whole
+submit-exec-read sequence works from inside the container.
 
 ### 4. Start marimohub with this adapter
 
@@ -214,18 +219,21 @@ names, so reaching it as `host.docker.internal` fails TLS verification.
 ./dev/run-local.sh
 ```
 
-The script does five things:
+The script does six things:
 
 1. `bun run build` — bundles `src/` into `dist/index.js`.
-2. `docker build` — bakes that bundle into `marimohub-armada:dev`, a stock
+2. `kind get kubeconfig --internal` — writes the control-channel credentials to
+   `dev/kubeconfig-internal.yaml` (gitignored).
+3. `docker build` — bakes the bundle into `marimohub-armada:dev`, a stock
    marimohub image plus one `COPY`.
-3. `armadactl create queue marimohub` — idempotent.
-4. `docker run` — starts the container on port 3000 with `fs` storage (a named
-   volume), `dev` auth, and the `ARMADA_*` variables.
-5. Polls `/api/health` until it answers, then prints the URL.
+4. `armadactl create queue marimohub` — idempotent.
+5. `docker run` — starts the container on port 3000, joined to the `kind`
+   network, with `fs` storage (a named volume), `dev` auth, the `ARMADA_*`
+   variables, and the kubeconfig mounted read-only.
+6. Polls `/api/health` until it answers, then prints the URL.
 
 Override with environment variables: `ARMADA_URL`, `ARMADA_QUEUE`,
-`ARMADA_NAMESPACE`, `PORT`, `IMAGE`, `CONTAINER`, `ARMADACTL`.
+`ARMADA_NAMESPACE`, `PORT`, `IMAGE`, `CONTAINER`, `ARMADACTL`, `KIND`.
 
 ### 5. What you should see
 
