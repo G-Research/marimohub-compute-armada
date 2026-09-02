@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun run typecheck
+      - run: bun test
+      - run: bun run build
+
+  armada-api:
+    # The hand-written types in src/armada-types.ts are only as good as their last
+    # check against the real spec, so verify them whenever anything Armada-related
+    # changes, including .armada-version itself.
+    #
+    # This job always runs and decides internally whether to do the work: a top
+    # level `paths:` filter would skip the job entirely, and a skipped job never
+    # reports a status, which blocks any PR that requires this check.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - name: Verify the Armada API contract
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # An unknown base (new branch, force push) means check anyway: running
+          # it needlessly costs a second, skipping it wrongly costs a runtime bug.
+          if [ -n "$BASE" ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            changed=$(git diff --name-only "$BASE" HEAD)
+            if ! printf '%s\n' "$changed" | grep -qE '^(\.armada-version|src/armada\.ts|src/armada-types\.ts|scripts/check-armada-api\.ts|\.github/workflows/ci\.yml)$'; then
+              echo "nothing Armada-related changed; skipping the spec fetch"
+              exit 0
+            fi
+          fi
+          bun run check:armada-api

@@ -1,0 +1,34 @@
+{
+	"name": "marimohub-compute-armada",
+	"version": "0.0.0",
+	"private": true,
+	"description": "marimohub compute adapter running notebook kernels as Armada jobs",
+	"license": "Apache-2.0",
+	"type": "module",
+	"scripts": {
+		"build": "bun build src/index.ts --target=node --format=esm --sourcemap=linked --outdir=dist",
+		"dev": "bun build src/index.ts --target=node --format=esm --sourcemap=linked --outdir=dist --watch",
+		"test": "bun test",
+		"typecheck": "tsc --noEmit && tsc -p tsconfig.src.json",
+		"fmt": "oxfmt --write .",
+		"check": "oxfmt --check . && oxlint --type-aware",
+		"check:armada-api": "bun run scripts/check-armada-api.ts",
+		"smoke": "bun run dev/smoke.ts",
+		"lint": "oxlint --type-aware"
+	},
+	"dependencies": {
+		"@kubernetes/client-node": "^2.0.0"
+	},
+	"devDependencies": {
+		"@nojaf/oxlint-plugin-annotate-non-primitives": "^0.1.1",
+		"@types/bun": "^1.4.0",
+		"@types/node": "^24",
+		"oxfmt": "^0.66.0",
+		"oxlint": "^1.81.0",
+		"oxlint-tsgolint": "^7.0.2001",
+		"typescript": "^7.0.2"
+	},
+	"engines": {
+		"node": ">=24.0.0"
+	}
+}
