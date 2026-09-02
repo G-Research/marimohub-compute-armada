@@ -1,13 +1,20 @@
 import { describe, expect, it } from 'bun:test';
 import {
 	assertEnvName,
+	killGroupCommand,
 	listFilesCommand,
 	parseListFilesOutput,
+	parseStrayProcesses,
+	parseSweptGroups,
+	processGroupCommand,
 	portWaitCommand,
 	readFileCommand,
 	shellQuote,
+	strayProcessCommand,
+	sweepGroupsCommand,
 	withEnvPrefix,
 } from '../src/shell.js';
+import type { StrayProcess } from '../src/shell.js';
 import type { FileInfo } from '../src/types.js';
 
 describe('shell quoting', () => {
@@ -149,5 +156,95 @@ describe('list parsing', () => {
 
 	it('reads an empty listing as no files', () => {
 		expect(parseListFilesOutput('', '/work')).toEqual([]);
+	});
+});
+
+describe('process groups', () => {
+	it("records the group id before the command and keeps the command's status", () => {
+		expect(processGroupCommand('/tmp/g.pgid', 'make build')).toEqual([
+			'setsid',
+			'--wait',
+			'sh',
+			'-lc',
+			"trap 'rm -f /tmp/g.pgid' EXIT; echo $$ > /tmp/g.pgid; make build",
+		]);
+	});
+
+	it('kills the whole group, not just the shell, and says nothing when it is gone', () => {
+		const command: string = killGroupCommand('/tmp/g.pgid');
+		// The negated id is what reaches the `sleep` a shell loop is waiting on.
+		expect(command).toContain('kill -TERM -"$group"');
+		expect(command).toContain("cat '/tmp/g.pgid' 2>/dev/null");
+		expect(command).toContain("rm -f '/tmp/g.pgid'");
+		// A teardown has nobody to report to, so it always succeeds.
+		expect(command.endsWith('exit 0')).toBe(true);
+	});
+});
+
+describe('stray processes', () => {
+	it('reads /proc rather than running ps, which the kernel image does not have', () => {
+		const command: string = strayProcessCommand();
+		expect(command).toContain('/proc/[0-9]*');
+		expect(command).not.toContain('ps ');
+	});
+
+	it('skips PID 1 and the asking shell', () => {
+		const command: string = strayProcessCommand();
+		expect(command).toContain('[ "$pid" = 1 ] && continue');
+		expect(command).toContain('[ "$pid" = "$self" ] && continue');
+		expect(command).toContain('[ "$2" = "$self" ] && continue');
+	});
+
+	it('parses pid, state and command line', () => {
+		// The trailing space is what `tr '\\0' ' '` leaves on a command line.
+		const found: StrayProcess[] = parseStrayProcesses('42\tS\tsleep 30 \x0091\tZ\t\x00');
+		expect(found).toEqual([
+			{ pid: '42', state: 'S', command: 'sleep 30' },
+			// A zombie has no command line left, which is how it reads as one.
+			{ pid: '91', state: 'Z', command: '' },
+		]);
+	});
+
+	it('reads a clean pod as no strays', () => {
+		expect(parseStrayProcesses('')).toEqual([]);
+	});
+});
+
+describe('group sweep', () => {
+	it('only ever looks at files this adapter wrote', () => {
+		const command: string = sweepGroupsCommand([]);
+		// A process without one of our group files is never a candidate, which is
+		// what makes an automatic kill safe next to a user's own subprocesses.
+		expect(command).toContain('for file in /tmp/mh-*.pgid');
+	});
+
+	it('skips the commands still running', () => {
+		const command: string = sweepGroupsCommand(['/tmp/mh-exec-1.pgid', '/tmp/mh-stream-2.pgid']);
+		expect(command).toContain(
+			`case "$file" in '/tmp/mh-exec-1.pgid'|'/tmp/mh-stream-2.pgid') continue;; esac`,
+		);
+	});
+
+	it('removes the file even for a group that is already gone', () => {
+		// The file outliving its process is the ordinary case; removing it is the
+		// whole repair, and it is reported as `gone` rather than as a kill.
+		const command: string = sweepGroupsCommand([]);
+		expect(command).toContain('rm -f "$file"');
+		expect(command).toContain('else outcome=gone; fi');
+	});
+
+	it('says which files it dealt with and which of them were still running', () => {
+		expect(
+			parseSweptGroups('/tmp/mh-exec-1.pgid\t412\tkilled\n/tmp/mh-stream-2.pgid\t907\tgone\n'),
+		).toEqual([
+			{ groupFile: '/tmp/mh-exec-1.pgid', group: '412', outcome: 'killed' },
+			// Only the file was left, so there was nothing to kill and nothing to
+			// report as a leak; the caller still stops tracking it.
+			{ groupFile: '/tmp/mh-stream-2.pgid', group: '907', outcome: 'gone' },
+		]);
+	});
+
+	it('reads a clean pod as nothing swept', () => {
+		expect(parseSweptGroups('')).toEqual([]);
 	});
 });

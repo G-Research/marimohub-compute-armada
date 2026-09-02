@@ -183,3 +183,155 @@ const FILE_TYPES: Record<string, FileInfo['type']> = {
 	d: 'directory',
 	l: 'symlink',
 };
+
+/**
+ * Argv that runs `script` in a login shell in its own process group, recording
+ * that group's id in `groupFile`.
+ *
+ * This exists because **closing an exec websocket does not stop the command it
+ * started**, measured against a real pod: a loop kept ticking after the socket
+ * closed, whether or not it was still writing to stdout. So anything we might
+ * have to abandon (a stream the consumer cancels, an `exec` that outruns its
+ * timeout) has to be killable, and a process group is what makes a shell die
+ * along with the `sleep` it was waiting on.
+ *
+ * The pieces are separate argv entries, so nothing here needs quoting, and the
+ * prologue redirects to the file rather than to stdout, which belongs to the
+ * caller. Cleanup is an `EXIT` trap rather than a trailing `rm`, because a
+ * command ending in an explicit `exit` never reaches a trailing anything: that
+ * left a file behind per `exec` in the live run. A trap also keeps the command's
+ * exit status, which `exec` reports and a trailing `rm` would overwrite with its
+ * own. A killed shell runs no trap, so {@link killGroupCommand} removes the file
+ * on that path.
+ */
+export function processGroupCommand(groupFile: string, script: string): string[] {
+	return [
+		'setsid',
+		'--wait',
+		'sh',
+		'-lc',
+		`trap 'rm -f ${groupFile}' EXIT; echo $$ > ${groupFile}; ${script}`,
+	];
+}
+
+/**
+ * Kill the process group whose id `groupFile` holds, and clean the file up.
+ *
+ * `execStream` needs this because closing an exec websocket does not stop the
+ * command it started. The negative argument is what makes `kill` address the
+ * whole group, so a shell loop dies along with the `sleep` it was waiting on.
+ * Silent when the file is missing or the group is already gone: this runs while
+ * a stream is being torn down and has nobody to report to.
+ */
+export function killGroupCommand(groupFile: string): string {
+	const quoted: string = shellQuote(groupFile);
+	return `group=$(cat ${quoted} 2>/dev/null); [ -n "$group" ] && kill -TERM -"$group" 2>/dev/null; rm -f ${quoted}; exit 0`;
+}
+
+/**
+ * Report every process in the pod except PID 1 and the shell doing the asking.
+ *
+ * A ghost check, for `dev/smoke.ts`. It reads `/proc` rather than running `ps`
+ * because the kernel image has no `procps`: `ps` prints nothing at all there,
+ * which would make an empty result look like a clean pod. Records are
+ * NUL-separated `pid<TAB>state<TAB>command`, and the state comes from the same
+ * field the liveness probe reads (decision 19), so a zombie left behind by a
+ * PID 1 that never reaps is visible rather than indistinguishable from a live
+ * process.
+ *
+ * The asking shell skips itself and its own children, since `$(...)` in the
+ * loop forks and those forks are not news.
+ */
+export function strayProcessCommand(): string {
+	return (
+		'self=$$; for dir in /proc/[0-9]*; do pid=${dir#/proc/}; ' +
+		'[ "$pid" = 1 ] && continue; [ "$pid" = "$self" ] && continue; ' +
+		"rest=$(sed 's/^.*) //' $dir/stat 2>/dev/null) || continue; " +
+		'set -- $rest; [ "$2" = "$self" ] && continue; ' +
+		"cmd=$(tr '\\0' ' ' < $dir/cmdline 2>/dev/null); " +
+		'printf \'%s\\t%s\\t%s\\0\' "$pid" "$1" "$cmd"; done'
+	);
+}
+
+/** One process {@link strayProcessCommand} found. */
+export interface StrayProcess {
+	pid: string;
+	/** The `/proc/<pid>/stat` state field; `Z` is a zombie nobody reaped. */
+	state: string;
+	/** The command line, empty for a zombie, which no longer has one. */
+	command: string;
+}
+
+/** Parse the NUL-separated records {@link strayProcessCommand} printed. */
+export function parseStrayProcesses(stdout: string): StrayProcess[] {
+	const found: StrayProcess[] = [];
+	for (const record of stdout.split('\0')) {
+		// The command terminates each record with a NUL, so the split leaves a
+		// trailing empty string, and a clean pod produces nothing else.
+		if (record === '') continue;
+		const [pid, state, ...rest] = record.split('\t');
+		// Without a pid there is nothing to report and nothing to kill.
+		if (pid === undefined || pid === '') continue;
+		found.push({ pid, state: state ?? '', command: rest.join('\t').trim() });
+	}
+	return found;
+}
+
+/**
+ * Kill every process group this adapter started and is no longer waiting on.
+ *
+ * The self-healing half of decisions 23 and 24. Each abandonable command records
+ * its group id in a `/tmp/mh-*.pgid` file and removes it on the way out, so a
+ * file that still exists for a command nobody is waiting on is a ghost, by
+ * construction rather than by guesswork. `live` names the files whose commands
+ * are still running, which the sweep must leave alone.
+ *
+ * This is deliberately not a process sweep. A kernel pod holds the kernel and
+ * whatever the user's notebook spawned, and nothing distinguishes those from a
+ * leak by looking at them. Only the files we wrote identify our own work, so
+ * only they are swept, and a process without one is never touched.
+ *
+ * Prints one `file<TAB>group<TAB>outcome` record per file it dealt with, so the
+ * caller can name what it killed and forget what it no longer needs to track,
+ * and says nothing when the pod is clean.
+ */
+export function sweepGroupsCommand(live: readonly string[]): string {
+	const keep: string =
+		live.length === 0
+			? ''
+			: `case "$file" in ${live.map((file: string) => shellQuote(file)).join('|')}) continue;; esac; `;
+	return (
+		'for file in /tmp/mh-*.pgid; do [ -e "$file" ] || continue; ' +
+		keep +
+		'group=$(cat "$file" 2>/dev/null); rm -f "$file"; [ -n "$group" ] || continue; ' +
+		// A group whose leader is already gone is reported as `gone` rather than
+		// killed: the file simply outlived it, and removing it was the whole
+		// repair. The caller needs to hear about it either way, to stop tracking it.
+		'if kill -0 -"$group" 2>/dev/null && kill -TERM -"$group" 2>/dev/null; ' +
+		'then outcome=killed; else outcome=gone; fi; ' +
+		'printf \'%s\\t%s\\t%s\\n\' "$file" "$group" "$outcome"; done; exit 0'
+	);
+}
+
+/** One file {@link sweepGroupsCommand} dealt with. */
+export interface SweptGroup {
+	groupFile: string;
+	group: string;
+	/** `killed` if something was still running, `gone` if only the file was left. */
+	outcome: 'killed' | 'gone';
+}
+
+/** Parse what {@link sweepGroupsCommand} reported. */
+export function parseSweptGroups(stdout: string): SweptGroup[] {
+	const swept: SweptGroup[] = [];
+	for (const line of stdout.split('\n')) {
+		// A clean pod prints nothing, and the last line is empty either way.
+		if (line.trim() === '') continue;
+		const [groupFile, group, outcome] = line.split('\t');
+		// Without a file there is nothing to stop tracking, and without a group
+		// there was nothing to kill.
+		if (groupFile === undefined || group === undefined) continue;
+		swept.push({ groupFile, group, outcome: outcome?.trim() === 'killed' ? 'killed' : 'gone' });
+	}
+	return swept;
+}

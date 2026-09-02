@@ -1,7 +1,18 @@
 import { describe, expect, it } from 'bun:test';
 import { ClusterAccess } from '../src/clusters.js';
-import { describeFailure, exitCodeOf } from '../src/exec.js';
+import { describeFailure, exitCodeOf, podOutputStream } from '../src/exec.js';
+import type { PodOutputStream } from '../src/exec.js';
 import { toExecResult } from '../src/sandbox.js';
+
+/** The rejection reason as a string, so failures assert on the message plainly. */
+async function rejection(promise: Promise<unknown>): Promise<string> {
+	try {
+		await promise;
+	} catch (error) {
+		return String(error);
+	}
+	throw new Error('expected the call to reject, it resolved');
+}
 
 describe('exit codes', () => {
 	it('reads the code Kubernetes hides in the failure causes', () => {
@@ -86,5 +97,91 @@ describe('cluster access', () => {
 		}
 		expect(message).toContain('Cluster1');
 		expect(message).toContain('/nope/Cluster1.yaml');
+	});
+});
+
+const bytes: (text: string) => Uint8Array = (text: string) => new TextEncoder().encode(text);
+
+describe('output stream', () => {
+	it('hands each chunk to the reader as it is written', async () => {
+		const output: PodOutputStream = podOutputStream(() => {});
+		const reader: ReadableStreamDefaultReader<Uint8Array> = output.stream.getReader();
+
+		output.write(bytes('first'), () => {});
+		expect(new TextDecoder().decode((await reader.read()).value)).toBe('first');
+
+		output.write(bytes('second'), () => {});
+		expect(new TextDecoder().decode((await reader.read()).value)).toBe('second');
+
+		output.end();
+		expect((await reader.read()).done).toBe(true);
+	});
+
+	it('holds the producer until the consumer reads', async () => {
+		const output: PodOutputStream = podOutputStream(() => {});
+		let acked: number = 0;
+		const ack: () => void = () => {
+			acked++;
+		};
+
+		// The default queuing strategy counts one chunk, so a single enqueue takes
+		// `desiredSize` to zero and the producer waits from the first chunk on.
+		// That is the point: a command nobody is reading cannot fill memory.
+		output.write(bytes('one'), ack);
+		expect(acked).toBe(0);
+
+		const reader: ReadableStreamDefaultReader<Uint8Array> = output.stream.getReader();
+		expect(new TextDecoder().decode((await reader.read()).value)).toBe('one');
+		expect(acked).toBe(1);
+	});
+
+	it('closes the socket when the consumer cancels, and frees a held producer', async () => {
+		let cancelled: number = 0;
+		const output: PodOutputStream = podOutputStream(() => {
+			cancelled++;
+		});
+		let acked: number = 0;
+		output.write(bytes('one'), () => {
+			acked++;
+		});
+		expect(acked).toBe(0);
+
+		await output.stream.cancel();
+		expect(cancelled).toBe(1);
+		// Otherwise the write callback is stranded and the socket never unwinds.
+		expect(acked).toBe(1);
+	});
+
+	it('drops writes that arrive after the stream is finished', async () => {
+		const output: PodOutputStream = podOutputStream(() => {});
+		output.end();
+
+		let acked: boolean = false;
+		// Enqueueing on a closed controller would throw; the producer still needs
+		// its callback.
+		expect(() => {
+			output.write(bytes('late'), () => {
+				acked = true;
+			});
+		}).not.toThrow();
+		expect(acked).toBe(true);
+	});
+
+	it('fails the stream with the websocket error, once', async () => {
+		const output: PodOutputStream = podOutputStream(() => {});
+		output.fail(new Error('connection reset'));
+		output.end();
+
+		const message: string = await rejection(output.stream.getReader().read());
+		expect(message).toContain('connection reset');
+	});
+
+	it('ignores an end after a cancel, rather than closing a dead controller', async () => {
+		const output: PodOutputStream = podOutputStream(() => {});
+		await output.stream.cancel();
+
+		expect(() => {
+			output.end();
+		}).not.toThrow();
 	});
 });

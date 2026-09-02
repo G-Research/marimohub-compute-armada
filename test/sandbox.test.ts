@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test';
+import { beforeAll, describe, expect, it } from 'bun:test';
 import type { ArmadaClient, PodLocation } from '../src/armada.js';
 import { readConfig } from '../src/config.js';
 import type { ArmadaConfig } from '../src/config.js';
@@ -32,15 +32,39 @@ async function rejection(promise: Promise<unknown>): Promise<string> {
 interface ExecCall {
 	command: readonly string[];
 	stdin: string | Uint8Array | undefined;
+	timeoutMs?: number | undefined;
 }
 
 const ok: PodExecResult = { stdout: '', stderr: '', exitCode: 0 };
 
+/**
+ * The command inside the process-group wrapper, as the pod's shell runs it.
+ * Every exec is wrapped now, so the prologue is noise for most assertions.
+ */
+function scriptOf(call: ExecCall | undefined): string {
+	return (call?.command.at(-1) ?? '').replace(/^trap 'rm -f \S+' EXIT; echo \$\$ > \S+; /, '');
+}
+
 /** A sandbox whose job is "already placed" and whose execs are recorded. */
-function stubSandbox(respond: PodExecResult | ((call: ExecCall) => PodExecResult) = ok): {
+function stubSandbox(
+	respond:
+		| PodExecResult
+		| ((call: ExecCall) => PodExecResult)
+		| ((call: ExecCall) => Promise<PodExecResult>) = ok,
+	env: Record<string, string> = {},
+): {
 	sandbox: ArmadaSandbox;
 	calls: ExecCall[];
 } {
+	const settings: ArmadaConfig =
+		Object.keys(env).length === 0
+			? config
+			: readConfig({
+					ARMADA_URL: 'http://armada.example.com/',
+					ARMADA_QUEUE: 'marimohub',
+					MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
+					...env,
+				});
 	const calls: ExecCall[] = [];
 	const armada: ArmadaClient = {
 		submit: async () => ({ jobId: 'job-1', jobSetId: 'set-1' }),
@@ -49,12 +73,33 @@ function stubSandbox(respond: PodExecResult | ((call: ExecCall) => PodExecResult
 	} as unknown as ArmadaClient;
 	const podExec: PodExec = {
 		run: async (_pod: PodLocation, command: readonly string[], options?: PodExecOptions) => {
-			const call: ExecCall = { command, stdin: options?.stdin };
+			const call: ExecCall = { command, stdin: options?.stdin, timeoutMs: options?.timeoutMs };
 			calls.push(call);
+			// What PodExec.run does when the deadline passes.
+			if (options?.timeoutMs !== undefined && options.onStop !== undefined) {
+				await options.onStop();
+			}
 			return typeof respond === 'function' ? respond(call) : respond;
 		},
+		stream: async (
+			_pod: PodLocation,
+			command: readonly string[],
+			options?: { timeoutMs?: number; onStop?: () => Promise<void> },
+		) => {
+			calls.push({ command, stdin: undefined, timeoutMs: options?.timeoutMs });
+			return new ReadableStream<Uint8Array>({
+				start(controller: ReadableStreamDefaultController<Uint8Array>) {
+					controller.enqueue(new TextEncoder().encode('streamed'));
+					controller.close();
+				},
+				// What PodExec.stream does with a cancel.
+				async cancel() {
+					await options?.onStop?.();
+				},
+			});
+		},
 	} as unknown as PodExec;
-	return { sandbox: new ArmadaSandbox('sandbox-1', config, armada, podExec), calls };
+	return { sandbox: new ArmadaSandbox('sandbox-1', settings, armada, podExec), calls };
 }
 
 describe('writeFiles', () => {
@@ -108,11 +153,10 @@ describe('setEnvVars', () => {
 		await sandbox.setEnvVars({ HOME_DIR: '/work' }, { onlyIfUnset: true });
 		await sandbox.exec('echo hi');
 
-		expect(calls[0]?.command).toEqual([
-			'sh',
-			'-c',
+		expect(calls[0]?.command.slice(0, 4)).toEqual(['setsid', '--wait', 'sh', '-lc']);
+		expect(scriptOf(calls[0])).toBe(
 			"export API_KEY='secret'; [ -n \"${HOME_DIR:-}\" ] || export HOME_DIR='/work'; echo hi",
-		]);
+		);
 	});
 
 	it('lets a forced value beat a later onlyIfUnset default for the same key', async () => {
@@ -121,7 +165,7 @@ describe('setEnvVars', () => {
 		await sandbox.setEnvVars({ K: 'default' }, { onlyIfUnset: true });
 		await sandbox.exec('run');
 
-		expect(calls[0]?.command[2]).toBe(
+		expect(scriptOf(calls[0])).toBe(
 			"export K='forced'; [ -n \"${K:-}\" ] || export K='default'; run",
 		);
 	});
@@ -133,7 +177,7 @@ describe('setEnvVars', () => {
 		);
 
 		await sandbox.exec('echo hi');
-		expect(calls[0]?.command[2]).toBe('echo hi');
+		expect(scriptOf(calls[0])).toBe('echo hi');
 	});
 });
 
@@ -408,5 +452,223 @@ describe('listFiles', () => {
 	it('reads an empty directory as a success with no files', async () => {
 		const { sandbox } = stubSandbox();
 		expect(await sandbox.listFiles('/work')).toEqual({ success: true, files: [] });
+	});
+});
+
+describe('exec', () => {
+	it('runs in a login shell, so a profile-provided PATH reaches user code', async () => {
+		const { sandbox, calls } = stubSandbox();
+		await sandbox.exec('uv run marimo --version');
+
+		expect(calls[0]?.command.slice(2, 4)).toEqual(['sh', '-lc']);
+		expect(scriptOf(calls[0])).toBe('uv run marimo --version');
+	});
+});
+
+/** Everything a stream yields, decoded. */
+async function collect(stream: ReadableStream): Promise<string> {
+	return new Response(stream).text();
+}
+
+describe('execStream', () => {
+	it('streams the command through a login shell with the env prefix', async () => {
+		const { sandbox, calls } = stubSandbox();
+		await sandbox.setEnvVars({ API_KEY: 'secret' });
+		const stream: ReadableStream = await sandbox.execStream('tail -f /tmp/log');
+
+		const command: readonly string[] = calls[0]?.command ?? [];
+		// setsid puts the command in its own process group, so a cancel can kill it.
+		expect(command.slice(0, 4)).toEqual(['setsid', '--wait', 'sh', '-lc']);
+		expect(command[4]).toMatch(
+			/^trap 'rm -f (\/tmp\/mh-stream-\d+\.pgid)' EXIT; echo \$\$ > \1; export API_KEY='secret'; tail -f \/tmp\/log$/,
+		);
+		expect(await collect(stream)).toBe('streamed');
+	});
+
+	it('kills the process group when the consumer cancels', async () => {
+		const { sandbox, calls } = stubSandbox();
+		const stream: ReadableStream = await sandbox.execStream('tail -f /tmp/log');
+		await stream.cancel();
+
+		const groupFile: string =
+			/(\/tmp\/mh-stream-\d+\.pgid)/.exec(calls[0]?.command[4] ?? '')?.[1] ?? '';
+		expect(groupFile).not.toBe('');
+		// The kill goes to the negated group id, so the shell's children go too.
+		expect(calls[1]?.command[2]).toContain(`kill -TERM -"$group"`);
+		expect(calls[1]?.command[2]).toContain(groupFile);
+	});
+
+	it('passes a timeout down as the listening bound', async () => {
+		const { sandbox, calls } = stubSandbox();
+		await sandbox.execStream('tail -f /tmp/log', { timeout: 5_000 });
+
+		expect(calls[0]?.timeoutMs).toBe(5_000);
+	});
+
+	it('sends no timeout when none was asked for', async () => {
+		const { sandbox, calls } = stubSandbox();
+		await sandbox.execStream('cat /tmp/log');
+
+		expect(calls[0]?.timeoutMs).toBeUndefined();
+	});
+});
+
+describe('exec timeouts', () => {
+	it("tracks a command with no deadline too, since most of marimohub's have none", async () => {
+		const { sandbox, calls } = stubSandbox();
+		await sandbox.exec('echo hi');
+
+		expect(calls).toHaveLength(1);
+		// Wrapped, so a dropped socket still leaves something the sweep can kill,
+		// but with no timeout there is nothing to kill it early.
+		expect(calls[0]?.command.slice(0, 4)).toEqual(['setsid', '--wait', 'sh', '-lc']);
+		expect(calls[0]?.timeoutMs).toBeUndefined();
+	});
+
+	it('makes a command with a deadline killable, and kills it when the deadline passes', async () => {
+		const { sandbox, calls } = stubSandbox();
+		await sandbox.exec('sleep 60', { timeout: 1_000 });
+
+		const command: readonly string[] = calls[0]?.command ?? [];
+		expect(command.slice(0, 4)).toEqual(['setsid', '--wait', 'sh', '-lc']);
+		// The cleanup is a trap, so a command ending in `exit` still removes the
+		// file, and the command's own status is what `exec` reports.
+		expect(command[4]).toMatch(
+			/^trap 'rm -f (\/tmp\/mh-exec-\d+\.pgid)' EXIT; echo \$\$ > \1; sleep 60$/,
+		);
+		expect(calls[0]?.timeoutMs).toBe(1_000);
+
+		// The stub fires onStop, as the real timeout does: a kill must follow.
+		const groupFile: string = /(\/tmp\/mh-exec-\d+\.pgid)/.exec(command[4] ?? '')?.[1] ?? '';
+		expect(calls[1]?.command[2]).toContain('kill -TERM -"$group"');
+		expect(calls[1]?.command[2]).toContain(groupFile);
+	});
+
+	it('gives each command its own group file', async () => {
+		const { sandbox, calls } = stubSandbox();
+		await sandbox.exec('one', { timeout: 10 });
+		await sandbox.exec('two', { timeout: 10 });
+
+		expect(calls[0]?.command[4]).not.toBe(calls[2]?.command[4]);
+	});
+});
+
+describe('ghost sweep', () => {
+	it('spares the commands it is still waiting on', async () => {
+		const { sandbox, calls } = stubSandbox();
+		const stream: ReadableStream = await sandbox.execStream('tail -f /tmp/log');
+		const groupFile: string =
+			/(\/tmp\/mh-stream-\d+\.pgid)/.exec(calls[0]?.command[4] ?? '')?.[1] ?? '';
+
+		await sandbox.sweep();
+		expect(calls.at(-1)?.command[2]).toContain(`case "$file" in '${groupFile}') continue;; esac`);
+		await stream.cancel();
+	});
+
+	it('stops sparing a command once it has finished', async () => {
+		const { sandbox, calls } = stubSandbox();
+		await sandbox.exec('echo hi', { timeout: 1_000 });
+
+		await sandbox.sweep();
+		// The exec is over, so nothing is exempt and its file is fair game.
+		expect(calls.at(-1)?.command[2]).not.toContain('continue;; esac');
+	});
+
+	it('counts what it killed and reports it once', async () => {
+		const { sandbox } = stubSandbox((call: ExecCall) =>
+			(call.command[2] ?? '').startsWith('for file in')
+				? {
+						stdout:
+							'/tmp/mh-exec-1.pgid\t412\tkilled\n' +
+							'/tmp/mh-exec-2.pgid\t907\tkilled\n' +
+							// Only the file was left behind, so it is not a ghost.
+							'/tmp/mh-exec-3.pgid\t44\tgone\n',
+						stderr: '',
+						exitCode: 0,
+					}
+				: ok,
+		);
+		await sandbox.ready();
+
+		expect(await sandbox.sweep()).toBe(2);
+		expect(sandbox.drainCounters()).toEqual({ ghosts_killed: 2 });
+		// Drained, so marimohub does not see the same ghosts twice.
+		expect(sandbox.drainCounters()).toEqual({ ghosts_killed: 0 });
+	});
+
+	it('is quiet when a sweep cannot reach the pod', async () => {
+		const { sandbox } = stubSandbox(() => {
+			throw new Error('websocket closed');
+		});
+		await sandbox.ready();
+
+		expect(await sandbox.sweep()).toBe(0);
+	});
+
+	it('has nothing to sweep before the job has a pod', async () => {
+		const { sandbox, calls } = stubSandbox();
+		expect(await sandbox.sweep()).toBe(0);
+		expect(calls).toHaveLength(0);
+	});
+});
+
+/** The group file of the command a sandbox started first. */
+const groupFileOf: (calls: ExecCall[]) => string = (calls: ExecCall[]) =>
+	/(\/tmp\/mh-\w+-\d+\.pgid)/.exec(calls[0]?.command.at(-1) ?? '')?.[1] ?? '';
+
+/** Whether the last sweep spared the command that file belongs to. */
+const spared: (calls: ExecCall[], groupFile: string) => boolean = (
+	calls: ExecCall[],
+	groupFile: string,
+) => (calls.at(-1)?.command[2] ?? '').includes(`case "$file" in '${groupFile}') continue;; esac`);
+
+describe('long-running commands', () => {
+	/** A command the pod never answers, which is the case the backstop is for. */
+	const never: (call: ExecCall) => Promise<PodExecResult> = (call: ExecCall) =>
+		(call.command[2] ?? '').startsWith('for file in')
+			? Promise.resolve(ok)
+			: new Promise<PodExecResult>(() => {});
+
+	const capped: { sandbox: ArmadaSandbox; calls: ExecCall[] } = stubSandbox(never, {
+		ARMADA_COMMAND_MAX_SECONDS: '1',
+	});
+	const streaming: { sandbox: ArmadaSandbox; calls: ExecCall[] } = stubSandbox(never, {
+		ARMADA_COMMAND_MAX_SECONDS: '1',
+	});
+	const uncapped: { sandbox: ArmadaSandbox; calls: ExecCall[] } = stubSandbox(never, {
+		ARMADA_COMMAND_MAX_SECONDS: '0',
+	});
+
+	beforeAll(async () => {
+		await capped.sandbox.ready();
+		void capped.sandbox.exec('uv sync');
+		await streaming.sandbox.execStream('tail -f /tmp/log');
+		await uncapped.sandbox.ready();
+		void uncapped.sandbox.exec('uv sync');
+		// One wait for all three, since the shortest backstop the config accepts is
+		// a whole second.
+		await new Promise((resolve: (value: unknown) => void) => setTimeout(resolve, 1_100));
+	});
+
+	it('gives up on an exec that outlives the backstop, so its caller stops waiting', async () => {
+		await capped.sandbox.sweep();
+
+		// No longer spared, so this sweep kills it and `exec` sees it die rather
+		// than waiting on it forever.
+		expect(spared(capped.calls, groupFileOf(capped.calls))).toBe(false);
+	});
+
+	it('leaves a stream alone however long it stays open', async () => {
+		await streaming.sandbox.sweep();
+
+		// A reader keeping a stream open for hours is a decision, not a stuck
+		// command.
+		expect(spared(streaming.calls, groupFileOf(streaming.calls))).toBe(true);
+	});
+
+	it('expires nothing when the backstop is off', async () => {
+		await uncapped.sandbox.sweep();
+
+		expect(spared(uncapped.calls, groupFileOf(uncapped.calls))).toBe(true);
 	});
 });

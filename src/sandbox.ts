@@ -1,18 +1,24 @@
 import type { ArmadaClient, PodLocation, SubmittedJob } from './armada.js';
 import type { ArmadaConfig } from './config.js';
-import type { PodExec, PodExecOptions, PodExecResult } from './exec.js';
+import type { PodExec, PodExecResult } from './exec.js';
 import { buildPodSpec } from './podspec.js';
+import type { GhostSweeper } from './sweeper.js';
 import {
 	assertEnvName,
+	killGroupCommand,
 	listFilesCommand,
+	parseSweptGroups,
+	processGroupCommand,
 	NOT_A_DIRECTORY_EXIT,
 	parseListFilesOutput,
 	portWaitCommand,
 	READ_FILE_NOT_FOUND_EXIT,
 	readFileCommand,
 	shellQuote,
+	sweepGroupsCommand,
 	withEnvPrefix,
 } from './shell.js';
+import type { SweptGroup } from './shell.js';
 import type {
 	CreateSandboxOptions,
 	ExecOptions,
@@ -63,6 +69,18 @@ const PORT_WAIT_FIRST_CHUNK_MS = 2_000;
 /** Distinguishes the log files of processes started in the same pod. */
 let processSequence = 0;
 
+/** Distinguishes the process-group files of execs and streams in the same pod. */
+let groupSequence = 0;
+
+/** A command started in its own process group, and whether anyone still wants it. */
+interface TrackedCommand {
+	/** Only an `exec` is subject to the backstop; a stream's life is its reader's. */
+	kind: 'exec' | 'stream';
+	command: string;
+	startedAt: number;
+	awaiting: boolean;
+}
+
 /** A non-zero exit is the command's business; marimohub wants it as a result. */
 export function toExecResult(result: PodExecResult): ExecResult {
 	if (result.exitCode === 0) {
@@ -99,12 +117,27 @@ export class ArmadaSandbox implements SandboxInstance {
 	private env: Record<string, string> = {};
 	private envDefaults: Record<string, string> = {};
 
+	/**
+	 * Every command this sandbox started in a process group, by group file.
+	 *
+	 * Registered before the command is sent, so the record is never missing
+	 * something the pod has already started, and `awaiting` says whether anyone is
+	 * still waiting for it. {@link sweep} leaves the awaited ones alone and kills
+	 * the rest; a command that finished normally is dropped outright, since its
+	 * own trap removed the file.
+	 */
+	private readonly groups: Map<string, TrackedCommand> = new Map();
+
+	private sweeping = false;
+	private ghostsKilled = 0;
+
 	constructor(
 		private readonly id: SandboxId,
 		private readonly config: ArmadaConfig,
 		private readonly armada: ArmadaClient,
 		private readonly podExec: PodExec,
 		private readonly options?: CreateSandboxOptions,
+		private readonly sweeper?: GhostSweeper,
 	) {}
 
 	/**
@@ -117,22 +150,127 @@ export class ArmadaSandbox implements SandboxInstance {
 		if (this.pod !== undefined) return;
 		this.job ??= await this.armada.submit(this.id, buildPodSpec(this.config, this.options));
 		this.pod = await this.armada.waitForRunning(this.job);
+		// Swept from here until `destroy`, by the provider's one sweeper rather
+		// than a timer of our own: see `src/sweeper.ts` for why that matters.
+		this.sweeper?.add(this);
+	}
+
+	/**
+	 * Kill the process groups this sandbox started and is no longer waiting on.
+	 *
+	 * Every abandonable command records its group id in a file and removes it on
+	 * the way out, so a file that survives a command nobody is waiting on is a
+	 * ghost by construction. That is what makes an automatic kill safe here: the
+	 * kernel and whatever the user's notebook spawned have no such file, so they
+	 * are never candidates. A sweep that guessed from process state could not
+	 * tell them apart.
+	 *
+	 * The kill in `onStop` is what normally stops an abandoned command; this
+	 * repairs the cases where it could not. A cancel can beat the command to
+	 * recording its group, the `onStop` exec can fail on a channel having a bad
+	 * minute, and a marimohub restart abandons every stream it had open without
+	 * running one at all.
+	 *
+	 * Best effort throughout: a sweep that cannot reach the pod is a sweep that
+	 * happens a minute later instead.
+	 */
+	async sweep(): Promise<number> {
+		// Nothing to sweep before there is a pod, and never two at once: the second
+		// would see the first's work as unowned.
+		if (this.pod === undefined || this.sweeping) return 0;
+		this.sweeping = true;
+		try {
+			this.expireLongRunning();
+			const awaited: string[] = [...this.groups]
+				.filter(([, tracked]: [string, TrackedCommand]) => tracked.awaiting)
+				.map(([groupFile]: [string, TrackedCommand]) => groupFile);
+			const result: PodExecResult = await this.podExec.run(this.pod, [
+				'sh',
+				'-c',
+				sweepGroupsCommand(awaited),
+			]);
+
+			const swept: SweptGroup[] = parseSweptGroups(result.stdout);
+			const killed: SweptGroup[] = swept.filter((group: SweptGroup) => group.outcome === 'killed');
+			for (const group of killed) {
+				// Naming the command is the difference between a report you can act on
+				// and a bare process id. A file we have no record of is a leftover from
+				// a previous marimohub, which is exactly the case nothing else repairs.
+				const tracked: TrackedCommand | undefined = this.groups.get(group.groupFile);
+				const what: string =
+					tracked === undefined
+						? 'from a previous marimohub process'
+						: `${JSON.stringify(tracked.command)}, started ${String(Math.round((Date.now() - tracked.startedAt) / 1000))}s ago`;
+				// The one place this is visible while a session runs, and it means a
+				// kill that should have happened earlier did not.
+				console.warn(
+					`[armada] sandbox ${this.id}: killed abandoned process group ${group.group} in ${this.pod.podName} (${what})`,
+				);
+			}
+			this.ghostsKilled += killed.length;
+			// Every file it reported is gone from the pod, and the rest were never
+			// there, so nothing not still awaited is worth remembering.
+			for (const [groupFile, tracked] of this.groups) {
+				if (!tracked.awaiting) this.groups.delete(groupFile);
+			}
+			return killed.length;
+		} catch {
+			return 0;
+		} finally {
+			this.sweeping = false;
+		}
+	}
+
+	/** Ghosts found since marimohub last asked, which it logs per session. */
+	drainCounters(): Record<string, number> {
+		const counters: Record<string, number> = { ghosts_killed: this.ghostsKilled };
+		this.ghostsKilled = 0;
+		return counters;
 	}
 
 	/**
 	 * Everything above this method is built out of `exec`, so this is the one that
 	 * has to be right. A command that fails is a normal result, not an exception;
 	 * only the channel itself failing is a `BACKEND_ERROR`.
+	 *
+	 * A login shell, matching marimohub's kubernetes adapter: what arrives here is
+	 * user and provisioner code, and an image that puts `uv` or `python3` on the
+	 * PATH through a profile script has to keep working. Our own protocol commands
+	 * never come through here; they run non-login so nothing a profile prints can
+	 * reach output we parse.
 	 */
 	async exec(cmd: string, options?: ExecOptions): Promise<ExecResult> {
-		const execOptions: PodExecOptions =
-			options?.timeout === undefined ? {} : { timeoutMs: options.timeout };
-
 		const command: string = withEnvPrefix(cmd, this.env, this.envDefaults);
 
 		let result: PodExecResult;
 		try {
-			result = await this.podExec.run(await this.location(), ['sh', '-c', command], execOptions);
+			const pod: PodLocation = await this.location();
+			// A command with no deadline runs plainly. One with a deadline has to be
+			// killable, because a timeout closes the websocket and the command in the
+			// pod does not notice: it would keep running, and the caller would have
+			// been told it failed.
+			// Every exec runs in its own process group, not only the ones with a
+			// deadline. Most of marimohub's exec calls carry no timeout, and without
+			// a group file a command whose socket drops (or whose caller restarts)
+			// keeps running with nothing left that can name it, let alone kill it.
+			const timeout: number | undefined = options?.timeout;
+			const groupFile: string = this.track('exec', cmd);
+			try {
+				result = await this.podExec.run(
+					pod,
+					processGroupCommand(groupFile, command),
+					timeout === undefined
+						? {}
+						: { timeoutMs: timeout, onStop: async () => this.killGroup(pod, groupFile) },
+				);
+				// It returned, so its trap has run and there is no file to sweep.
+				this.groups.delete(groupFile);
+			} catch (failure) {
+				// It did not return, so the command may well still be running: keep the
+				// record, and let the sweep deal with what the timeout kill could not.
+				this.abandon(groupFile);
+				throw failure;
+			}
 		} catch (error) {
 			return {
 				success: false,
@@ -144,6 +282,58 @@ export class ArmadaSandbox implements SandboxInstance {
 		return toExecResult(result);
 	}
 
+	/**
+	 * Start tracking a command, returning the group file it should record itself
+	 * in. The record exists before the command does, so a sweep can never mistake
+	 * a command being started for one nobody wants.
+	 */
+	private track(kind: TrackedCommand['kind'], command: string): string {
+		const groupFile = `/tmp/mh-${kind}-${String(++groupSequence)}.pgid`;
+		this.groups.set(groupFile, { kind, command, startedAt: Date.now(), awaiting: true });
+		return groupFile;
+	}
+
+	/**
+	 * Give up on an `exec` that has run past `ARMADA_COMMAND_MAX_SECONDS`.
+	 *
+	 * This is the backstop, not a timeout: the caller's `ExecOptions.timeout` is
+	 * the timeout, and most of marimohub's exec calls carry none because the work
+	 * legitimately takes minutes. Hours is the point at which nobody expected it
+	 * to still be running, and the alternative is a websocket and a process held
+	 * for the rest of the session while its caller waits forever.
+	 *
+	 * It only marks the command as no longer awaited; the sweep it runs inside
+	 * then kills it like any other abandoned group, and the caller's `exec` sees
+	 * the command die rather than hanging on.
+	 *
+	 * Streams are exempt. A `tail -f` open for hours is a consumer's decision, not
+	 * a stuck command.
+	 */
+	private expireLongRunning(): void {
+		const cap: number = this.config.commandMaxSeconds;
+		if (cap === 0) return;
+		for (const tracked of this.groups.values()) {
+			if (!tracked.awaiting || tracked.kind !== 'exec') continue;
+			const seconds: number = Math.round((Date.now() - tracked.startedAt) / 1000);
+			if (seconds < cap) continue;
+			tracked.awaiting = false;
+			console.warn(
+				`[armada] sandbox ${this.id}: ${JSON.stringify(tracked.command)} has run for ${String(seconds)}s, past ARMADA_COMMAND_MAX_SECONDS (${String(cap)}s); killing it`,
+			);
+		}
+	}
+
+	/** Stop waiting for a command, without forgetting that we started it. */
+	private abandon(groupFile: string): void {
+		const tracked: TrackedCommand | undefined = this.groups.get(groupFile);
+		if (tracked !== undefined) tracked.awaiting = false;
+	}
+
+	/** Kill the process group `groupFile` names, for a command we abandoned. */
+	private async killGroup(pod: PodLocation, groupFile: string): Promise<void> {
+		await this.podExec.run(pod, ['sh', '-c', killGroupCommand(groupFile)]);
+	}
+
 	/** The pod, submitting and waiting for it first if nobody has yet. */
 	private async location(): Promise<PodLocation> {
 		if (this.pod === undefined) await this.ready();
@@ -151,8 +341,40 @@ export class ArmadaSandbox implements SandboxInstance {
 		return this.pod;
 	}
 
-	async execStream(_cmd: string, _options?: ExecStreamOptions): Promise<ReadableStream> {
-		return todo('execStream');
+	/**
+	 * The same command as `exec`, with its stdout arriving as it is produced.
+	 *
+	 * A login shell, like `exec`: this runs whatever the caller asked for, not a
+	 * protocol command whose output we parse. Unlike `exec` there is no typed
+	 * failure to return, so a control channel that cannot be reached throws here
+	 * rather than resolving to a `BACKEND_ERROR` stream.
+	 *
+	 * The command runs under `setsid` in its own process group, and the shell
+	 * writes that group's id to a file before starting it. That is what makes
+	 * cancelling work: closing the websocket leaves the command running (verified
+	 * against a real pod), so stopping it means killing the group, which one more
+	 * exec does. Without it every abandoned stream would leave a process spinning
+	 * in the kernel's pod for the rest of the session.
+	 */
+	async execStream(cmd: string, options?: ExecStreamOptions): Promise<ReadableStream> {
+		const pod: PodLocation = await this.location();
+		const command: string = withEnvPrefix(cmd, this.env, this.envDefaults);
+		const groupFile: string = this.track('stream', cmd);
+
+		return this.podExec.stream(pod, processGroupCommand(groupFile, command), {
+			...(options?.timeout === undefined ? {} : { timeoutMs: options.timeout }),
+			// Best effort: a cancel in the instant before the prologue wrote the file
+			// finds nothing to kill. The sweep is what repairs that.
+			onStop: async () => {
+				this.abandon(groupFile);
+				await this.killGroup(pod, groupFile);
+			},
+			// Reached however the command ended, so an abandoned one keeps its record
+			// and one that ended on its own drops it.
+			onFinished: () => {
+				if (this.groups.get(groupFile)?.awaiting === true) this.groups.delete(groupFile);
+			},
+		});
 	}
 
 	/**
@@ -339,6 +561,7 @@ export class ArmadaSandbox implements SandboxInstance {
 
 	/** Cancelling the job deletes the pod and every object Armada created with it. */
 	async destroy(): Promise<void> {
+		this.sweeper?.remove(this);
 		if (this.job === undefined) return;
 		await this.armada.cancel(this.job);
 		this.pod = undefined;

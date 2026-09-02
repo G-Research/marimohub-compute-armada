@@ -34,6 +34,28 @@ export interface ArmadaConfig {
 	 * always carry its own.
 	 */
 	maxLifetimeSeconds: number;
+	/**
+	 * How often to sweep a pod for process groups this adapter started and is no
+	 * longer waiting on, in seconds. `0` turns the sweep off.
+	 *
+	 * Closing an exec websocket does not stop the command it started, so an
+	 * abandoned command is killed explicitly (decisions 23 and 24), and this is
+	 * what repairs the cases where that kill did not happen: it raced the command
+	 * recording its group, its own exec failed, or marimohub restarted and left a
+	 * pod's streams behind.
+	 */
+	ghostSweepSeconds: number;
+	/**
+	 * Backstop for a single `exec`, in seconds. `0` turns it off.
+	 *
+	 * Not a timeout: the caller's own `ExecOptions.timeout` is the timeout, and
+	 * most of marimohub's exec calls deliberately carry none because unpacking a
+	 * workspace or running a data preview legitimately takes minutes. This is the
+	 * hours-later answer to "nobody expected this to still be running", which
+	 * otherwise holds a websocket and a process for the rest of the session.
+	 * Streams are exempt: how long one stays open is the consumer's choice.
+	 */
+	commandMaxSeconds: number;
 	/** How to authenticate to Armada. */
 	auth: ArmadaAuth;
 }
@@ -72,11 +94,12 @@ function optionalSeconds(
 	env: Record<string, string | undefined>,
 	name: string,
 	fallback: number,
+	least: number = 1,
 ): number {
 	const raw: string | undefined = env[name];
 	if (raw === undefined) return fallback;
 	const value: number = Number(raw);
-	if (!Number.isInteger(value) || value < 1) {
+	if (!Number.isInteger(value) || value < least) {
 		throw new Error(`${name} must be a whole number of seconds, got: ${raw}`);
 	}
 	return value;
@@ -133,6 +156,19 @@ function readAuth(env: Record<string, string | undefined>): ArmadaAuth {
 /** A day, when neither marimohub nor the environment says otherwise. */
 const DEFAULT_MAX_LIFETIME_SECONDS = 24 * 60 * 60;
 
+/**
+ * Often enough that an abandoned command wastes at most a minute of the kernel's
+ * CPU, rare enough that an idle session costs one exec a minute.
+ */
+const DEFAULT_GHOST_SWEEP_SECONDS = 60;
+
+/**
+ * Far past anything marimohub's own commands do, since a backstop that competes
+ * with legitimate work is worse than none. The pod's own `activeDeadlineSeconds`
+ * (decision 7) is the outer bound; this catches a wedged command long before it.
+ */
+const DEFAULT_COMMAND_MAX_SECONDS = 6 * 60 * 60;
+
 export function readConfig(
 	env: Record<string, string | undefined>,
 	compute?: AdapterFactoryContext['compute'],
@@ -153,6 +189,18 @@ export function readConfig(
 		maxLifetimeSeconds:
 			compute?.sessionMaxLifetimeSeconds ??
 			optionalSeconds(env, 'ARMADA_KERNEL_MAX_LIFETIME_SECONDS', DEFAULT_MAX_LIFETIME_SECONDS),
+		ghostSweepSeconds: optionalSeconds(
+			env,
+			'ARMADA_GHOST_SWEEP_SECONDS',
+			DEFAULT_GHOST_SWEEP_SECONDS,
+			0,
+		),
+		commandMaxSeconds: optionalSeconds(
+			env,
+			'ARMADA_COMMAND_MAX_SECONDS',
+			DEFAULT_COMMAND_MAX_SECONDS,
+			0,
+		),
 		auth: readAuth(env),
 	};
 }

@@ -7,8 +7,8 @@ Armada and does not know this repo.
 The adapter partially works. The whole provision sequence is implemented and verified
 against a real local Armada: placement (submit, wait for running, cancel), exec into the
 placed pod, file writes, env vars, detached process launch, the exposed-port URL from
-Armada's ingress event, and reading files and directories back out. Still stubs that
-throw: `execStream` and `gitCheckout`, plus `listActive` on the client.
+Armada's ingress event, reading files and directories back out, and streaming a command's
+output. Still stubs that throw: `gitCheckout`, plus `listActive` on the client.
 
 Every claim below is cited against the Armada source at `v0.22.7`, which is the release
 pinned in `.armada-version`, in the form `path:line`. Where we had open questions earlier,
@@ -399,7 +399,8 @@ not found in $PATH", wrapped with the pod, cluster and command by `execFailure`
 (`src/exec.ts`), so the diagnosis is immediate rather than mysterious.
 
 The narrower assumptions are the ones to watch, and they are all GNU or util-linux specifics
-that busybox lacks: `find -printf` (decision 21), `setsid` (decision 19). `base64` (decision 21) exists in both coreutils and busybox, and `python3` (decision 19) is definitional for a
+that busybox lacks: `find -printf` (decision 21), `setsid` and its `--wait` flag
+(decisions 19 and 23). `base64` (decision 21) exists in both coreutils and busybox, and `python3` (decision 19) is definitional for a
 Python kernel image.
 
 Note what this rules out: the adapter probes for no capability anywhere. It never asks
@@ -419,6 +420,195 @@ may be running different images (`options.image` overrides the configured one).
 The directory test in `listFiles` is not such a probe and must not be memoized: it answers
 what a path is right now, and a path becomes a directory or stops being one while the kernel
 runs.
+
+### 23. `execStream` really streams, and `exec` gets a login shell
+
+marimohub's kubernetes adapter implements `execStream` by running the command through its
+ordinary `exec` and emitting the buffered stdout as a single chunk, because its internal exec
+seam is request/response. Ours is not: `src/exec.ts` owns the websocket, and
+`@kubernetes/client-node` hands stdout to a `Writable` as the data arrives. So `PodExec.stream`
+forwards each chunk as the command produces it, and a `tail -f` behaves like one instead of
+delivering everything at the end of a timeout.
+
+The awkward part is backpressure, and it is why `podOutputStream` is a separate, testable
+function rather than a closure inside `stream`. A `ReadableStream` will queue whatever it is
+given, so a command that outruns its reader would be buffered in memory, which is exactly the
+behaviour real streaming is supposed to avoid. Instead each write holds the producer's
+callback until the consumer pulls. With the default queuing strategy that means the producer
+is held from the first chunk, so nothing accumulates on our side; the pressure lands on the
+websocket, where it belongs.
+
+The other semantics are transcribed from marimohub's local backend
+(`packages/compute-local/src/index.ts:381`), which is the one adapter that streams a real
+process:
+
+- **stdout only.** The stream carries no framing, so interleaving stderr would corrupt output
+  the caller parses. stderr is still drained rather than left unread, because a full pipe
+  eventually blocks the command writing to it. Upstream drains it with `child.stderr.resume()`
+  for the same reason.
+- **Cancelling stops the work**, but not for free. Upstream kills the process group when the
+  stream is aborted, and we have to do the same explicitly, because **closing the exec
+  websocket does not stop the command**. That was measured rather than assumed: against a
+  real pod, a loop kept ticking after the socket closed, whether or not it was still writing
+  to stdout, so not even the closed pipe reaches it. Left alone, every abandoned stream would
+  leave a process spinning in the kernel's pod for the rest of the session.
+
+  So the streamed command runs as `setsid --wait sh -lc 'echo $$ > <file>; <command>'`: its
+  own process group, whose id the prologue records before the command starts. Cancelling, or
+  the timeout expiring, closes the socket and then spends one more exec on
+  `kill -TERM -"$group"`, the negated id that addresses the whole group, so a shell loop dies
+  along with the `sleep` it was waiting on. The prologue redirects to the file and never to
+  stdout, which belongs to the caller, and the argv is passed as separate entries so none of
+  it needs quoting. A cancel in the instant before the prologue runs finds nothing to kill;
+  that is the one gap, and it is bounded by how long a shell takes to run one `echo`.
+
+  A cancel also releases a held write callback before closing, or the producer stays parked
+  and the socket never unwinds.
+
+- **The exit code is unreachable.** A `ReadableStream` has nowhere to put it, so a command
+  that fails is a stream that ends, as it is upstream.
+
+One deliberate difference from `exec`: `ExecStreamOptions.timeout` ends the stream rather than
+failing it. `run`'s timeout rejects, because nothing has been handed to the caller yet, but a
+stream has already delivered bytes and erroring would throw them away. Bounding an endless
+command is what the option is for, so it truncates.
+
+Worth knowing: **nothing in marimohub calls `execStream` today.** It is in the required method
+surface (`packages/core/src/ports/adapterShape.ts:19`) and the compute contract asserts it
+returns a cancellable `ReadableStream`, but no service uses it. We implemented the streaming
+version anyway because the buffered one is a trap for whoever adds the first consumer: a log
+view or a terminal is precisely the case where buffering looks like a hang.
+
+**`exec` now runs `sh -lc`.** It ran `sh -c` before, which was an oversight rather than a
+decision: upstream gives `exec` a login shell so an image that exposes `uv` or `python3`
+through a profile script keeps working, and `exec` is where user and provisioner code arrives.
+`startProcess` already used `-lc` for the kernel itself (decision 19), so the two disagreed
+about the same image. The rule is now uniform and is the one upstream states: commands that
+run someone else's code get a login shell, and our own protocol commands, whose stdout we
+parse, get a plain `sh -c` (decisions 18, 21). The cost of a login shell is that profile
+output lands in `ExecResult.stdout`; upstream accepts that for `exec`, and the protocol
+commands that cannot tolerate it are exempt by construction.
+
+### 24. A timeout kills what it abandoned, and the smoke run looks for ghosts
+
+Decision 23 found that closing an exec websocket does not stop the command. That finding is
+not specific to streaming, and following it through turned up a live bug: `PodExec.run`'s
+timeout closed the socket and rejected, so **a timed-out `exec` told marimohub the command
+failed while the command kept running in the pod**. Measured, not reasoned: a loop given a
+1.5s timeout was at 8 ticks when the timeout fired and 23 three seconds later.
+
+That path has callers today, which the streaming one does not: marimohub passes
+`ExecOptions.timeout`. Every timed-out command was a process spinning next to the kernel for
+the rest of the session, competing with it for the CPU the pod requested.
+
+So a command with a deadline now goes through `processGroupCommand`, the same wrapper
+`execStream` uses, and `PodExecOptions.onStop` kills the group when the deadline passes.
+A command without a deadline is left exactly as it was, plain `sh -lc`, so the common path
+gains no dependency and no wrapper.
+
+Two details that matter more than they look:
+
+- The wrapper cleans up with an `EXIT` trap rather than a trailing `rm`. The live run caught
+  why: a command ending in an explicit `exit` never reaches a trailing anything, and two
+  group files were left behind. A trap also keeps the command's exit status, which `exec`
+  reports and a trailing `rm` would overwrite with its own, and `setsid --wait` propagates
+  that status in turn, which is the reason for `--wait` rather than a bare `setsid`. A
+  killed shell runs no trap, so the kill path removes the file itself.
+- The kill is best effort and unawaited. The caller is already being told the command timed
+  out, and a failing kill has nobody to report to.
+
+Gaps this leaves, each one a kill that never runs: a cancel or timeout in the instant before
+the prologue records the group id finds nothing to kill, an `onStop` exec that itself fails is
+swallowed, and a marimohub restart abandons every stream it had open without running `onStop`
+at all. Decision 25 is what repairs those. We also send `TERM` without escalating to `KILL`,
+so a process that ignores it survives, which nothing currently repairs.
+
+### 25. Sweep the marks, never the processes
+
+The kills in decision 24 are the normal path, and they all have the same weakness: they are
+code that has to run at the moment something goes wrong. A sweep on a timer covers what that
+code misses, and every sandbox runs one every `ARMADA_GHOST_SWEEP_SECONDS` (default 60, `0`
+disables it).
+
+**What it sweeps is the important part.** The obvious design, looking at the pod's processes
+and killing what seems abandoned, cannot work here: a kernel pod legitimately holds the
+kernel and whatever the user's notebook spawned, a `subprocess.Popen` from a cell, a training
+run, a dev server, and none of those is distinguishable from a leak by looking at it. Any
+heuristic, by age or CPU or parent, eventually kills a user's work, which is worse than the
+leak it was meant to prevent.
+
+So the sweep never looks at processes. Every abandonable command already records its process
+group in `/tmp/mh-*.pgid` and removes it on the way out, and the sandbox knows which of those
+files belong to commands it is still waiting on. A file that exists for a command nobody is
+waiting on is a ghost **by construction**, not by guesswork, and a process without such a
+file is never a candidate. The bookkeeping registers a file before its command is sent and
+releases it in a `finally`, so the live set never lags what the pod is running.
+
+That makes the sweep repair exactly the gaps decision 24 leaves. A cancel that beat the
+prologue leaves a file with a group we never killed. A failed `onStop` leaves the same. A
+marimohub restart leaves a pod full of them and no memory of any, which is the case a
+per-command fix cannot reach at all and where a sweep earns its keep.
+
+**What is tracked, and the backstop.** Every `exec` runs in a process group, not only the ones
+with a deadline, and the sandbox keeps the command text, the start time and whether anyone is
+still waiting for it. That matters because **only one of marimohub's ten `exec` call sites
+passes a timeout** (`SandboxProvisioner.ts:389`); `packedWorkspaceRestore`, `sandboxFiles`,
+`sessionLifecycle`, `proposalCapture` and `SandboxDataPreview` all call it unbounded. Without
+a group file, one of those losing its socket leaves a command running that nothing can even
+name, let alone kill. With one, the sweep collects it the moment the wait ends.
+
+Knowing the command also makes the report useful: the sweep says which command it killed and
+how long ago it started, and a file it has no record of is named as a leftover from a previous
+marimohub process, which is the one case nothing else can repair.
+
+On top of that, `ARMADA_COMMAND_MAX_SECONDS` (default 6 hours, `0` disables) gives up on an
+`exec` that is still being awaited long past anything expected. It is deliberately not a
+timeout: the caller's own `ExecOptions.timeout` is the timeout, and the unbounded call sites
+above are the ones that legitimately take minutes, so a short invented deadline would kill
+real work exactly the way a heuristic reaper would. Hours is the scale at which nobody expects
+the command to still be running, and the alternative is a websocket and a process held for the
+rest of the session while the caller waits forever. The backstop only marks the command as no
+longer awaited; the sweep then kills it like any other abandoned group, so `exec` sees the
+command die instead of hanging on. Streams are exempt, because how long a stream stays open is
+its reader's decision.
+
+Mechanics worth knowing:
+
+- A file whose group is already gone is not news: the sweep removes it and reports nothing,
+  because a group file outliving its process is the ordinary case for a killed shell (a
+  killed shell never runs its `EXIT` trap).
+- **One sweeper for the whole provider**, not a timer per sandbox (`src/sweeper.ts`). The
+  per-sandbox timer was the obvious shape and the wrong one: sandboxes created together sweep
+  together, so twenty kernels started at nine o'clock fire twenty exec websockets at the same
+  API server in the same instant, every interval, for the life of those sessions. The work is
+  inherently per-pod and cannot be batched, so the fix is not fewer round trips but fewer at
+  once. `ArmadaCompute` holds the sweeper, sandboxes join it when they have a pod and leave on
+  `destroy()`, and the timer exists only while something is registered.
+- A concurrency cap (four in flight) is what staggers a pass: a hundred sandboxes are swept as
+  a rolling queue rather than a burst, so no jitter is needed. A pass that outlives its
+  interval is skipped rather than stacked, since two sweeps against one pod would have the
+  second read the first's kills as unowned groups. The timer is `unref`'d, so it never holds
+  marimohub's process open.
+- Reaching the pod is best effort. A sweep that fails is a sweep that happens a minute later.
+- When it kills something it says so through `console.warn`, because finding a ghost means a
+  kill that should have happened earlier did not, and it counts them into `drainCounters()`,
+  which marimohub folds into its `session_provision` line
+  (`packages/core/src/services/runtime/SandboxProvisioner.ts:649`). Counters are drained
+  once, at the end of provisioning, so the log line is the signal during a session and the
+  counter is the one at its start.
+
+`dev/smoke.ts` proves the whole thing against a real cluster rather than asserting it: it
+times out a command, cancels a stream, plants a group nothing is waiting on, sweeps, and then
+lists every process that is not PID 1 and not the shell doing the asking. The planting is
+what makes the check meaningful. Without it the sweep finds nothing, since `onStop` already
+killed both abandoned commands, and a check that never provokes the failure it looks for
+reports a clean pod whether or not the code still works.
+
+The stray listing reads `/proc` rather than running `ps`: the kernel image has no `procps`,
+so `ps` prints nothing there and an empty result would read as a clean pod. It reports the
+process state too, so a zombie left by a PID 1 that never reaps (decision 19) is
+distinguishable from something still running. A healthy run kills the planted group and finds
+no live strays.
 
 ## Constraints on the first submit
 
@@ -508,14 +698,28 @@ Verified:
   `__marimo__/session/notebook.py.json` and shows `.env`, a file listed as
   `NOT_A_DIRECTORY`, an absent directory as `LIST_FAILED`, and a read that is unchanged
   after `setEnvVars`.
+- `execStream` against a real pod: three chunks a second apart arrive at 40ms, 1042ms and
+  2044ms rather than together at the end, sandbox env and a login shell reach the command,
+  stderr stays out of the stream, a timeout truncates an endless command instead of failing
+  it, and cancelling stops the command in the pod (measured by a loop that keeps ticking
+  into a file: it stops on cancel and on timeout, and it did _not_ before the process-group
+  kill was added).
+- The timeout kill (decision 24) against a real pod: a command with a deadline keeps its
+  stdout, stderr and exit status through the `setsid` wrapper, a timed-out loop is dead
+  three seconds later rather than still ticking, no group files are left behind, and the
+  ghost check reports an empty pod.
+- The sweep (decision 25) against a real pod, through `bun run smoke`: a timed-out command
+  and a cancelled stream leave nothing behind, a deliberately planted group that nothing is
+  waiting on is killed by the sweep and reported (`killed 1 abandoned process group(s)`),
+  and the stray listing afterwards shows only zombies, no live process.
 - Build, type checks, tests and image build pass in CI.
 
 Assumed, not verified:
 
 - That exec works from inside the marimohub container rather than from the host; the kind
   API server certificate makes that route non-obvious (see README).
-- That the kernel image provides `/bin/sh`, GNU `find` and `setsid`. Verified only against
-  the local `marimo-sandbox:local` image, which is Debian-family; see decision 22.
+- That the kernel image provides `/bin/sh`, GNU `find` and `setsid` with `--wait`. Verified
+  only against the local `marimo-sandbox:local` image, which is Debian-family; see decision 22.
 - That an interactive session survives normal scheduling behaviour once decisions 7 to 9 are
   applied.
 - That the generated Ingress carries WebSocket traffic with a real ingress controller.
@@ -527,8 +731,9 @@ Assumed, not verified:
 | ----------------------------- | --------------------------------------------------------------------------------------------- |
 | `src/types.ts`                | marimohub's adapter interface, transcribed by hand. Not ours to change.                       |
 | `src/armada.ts`               | Placement: submit, watch, ingress address, cancel. `listActive` stubbed.                      |
-| `src/exec.ts`                 | Control channel: exec into a located pod.                                                     |
+| `src/exec.ts`                 | Control channel: exec into a located pod, buffered or streamed.                               |
 | `src/shell.ts`                | Quoting, env prefix, port waiter, read and list commands, transcribed from `compute-commons`. |
+| `src/sweeper.ts`              | The provider's one ghost sweeper: registration, cap, timer.                                   |
 | `src/sandbox.ts`              | One kernel session. Everything below `exec` is ordinary shell commands.                       |
 | `src/armada-types.ts`         | Hand-written Armada wire types, with the reasoning in the header.                             |
 | `scripts/check-armada-api.ts` | The contract check that keeps those types honest.                                             |

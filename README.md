@@ -25,20 +25,22 @@ Everything in `src/sandbox.ts` above `exec` is ordinary shell commands.
 
 ## Configuration
 
-| Variable                             | Required | Description                                          |
-| ------------------------------------ | -------- | ---------------------------------------------------- |
-| `ARMADA_URL`                         | yes      | Armada API base URL                                  |
-| `ARMADA_QUEUE`                       | yes      | Queue jobs are submitted to                          |
-| `ARMADA_NAMESPACE`                   | no       | Pod namespace (default `default`)                    |
-| `ARMADA_PRIORITY_CLASS`              | no       | Use a non-preemptible class for interactive sessions |
-| `ARMADA_KERNEL_PORT`                 | no       | Port marimo serves on (default `2718`)               |
-| `MARIMOHUB_COMPUTE_IMAGE`            | yes      | Kernel image (first entry of the list)               |
-| `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` | no       | Public kernel hostname                               |
-| `ARMADA_AUTH_USERNAME`               | no       | Basic auth, set with the password                    |
-| `ARMADA_AUTH_PASSWORD`               | no       | Basic auth, set with the username                    |
-| `ARMADA_AUTH_TOKEN`                  | no       | Bearer token, for example from OIDC                  |
-| `ARMADA_AUTH_TOKEN_FILE`             | no       | Bearer token file, re-read on every request          |
-| `ARMADA_KUBECONFIG_PATTERN`          | no       | Kubeconfig path, `{CLUSTER_ID}` substituted          |
+| Variable                             | Required | Description                                              |
+| ------------------------------------ | -------- | -------------------------------------------------------- |
+| `ARMADA_URL`                         | yes      | Armada API base URL                                      |
+| `ARMADA_QUEUE`                       | yes      | Queue jobs are submitted to                              |
+| `ARMADA_NAMESPACE`                   | no       | Pod namespace (default `default`)                        |
+| `ARMADA_PRIORITY_CLASS`              | no       | Use a non-preemptible class for interactive sessions     |
+| `ARMADA_KERNEL_PORT`                 | no       | Port marimo serves on (default `2718`)                   |
+| `ARMADA_GHOST_SWEEP_SECONDS`         | no       | Abandoned-process sweep interval (default `60`, `0` off) |
+| `ARMADA_COMMAND_MAX_SECONDS`         | no       | Backstop for one exec (default `21600`, `0` off)         |
+| `MARIMOHUB_COMPUTE_IMAGE`            | yes      | Kernel image (first entry of the list)                   |
+| `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` | no       | Public kernel hostname                                   |
+| `ARMADA_AUTH_USERNAME`               | no       | Basic auth, set with the password                        |
+| `ARMADA_AUTH_PASSWORD`               | no       | Basic auth, set with the username                        |
+| `ARMADA_AUTH_TOKEN`                  | no       | Bearer token, for example from OIDC                      |
+| `ARMADA_AUTH_TOKEN_FILE`             | no       | Bearer token file, re-read on every request              |
+| `ARMADA_KUBECONFIG_PATTERN`          | no       | Kubeconfig path, `{CLUSTER_ID}` substituted              |
 
 `ARMADA_KUBECONFIG_PATTERN` is how the adapter reaches the cluster a job landed on,
 which Armada names only as a `clusterId`. It mirrors Lookout's `binocularsBaseUrlPattern`:
@@ -231,14 +233,15 @@ with `setsid` and waits for its port in-pod, and `exposePort` returns the addres
 Armada assigned to the NodePort service, read from `JobIngressInfoEvent`. Session
 capture can also read back out: `readFile` returns a file as text or, for content
 that is not valid UTF-8, as base64, and `listFiles` lists a directory through
-`find`.
+`find`. `execStream` streams a command's stdout as it is produced, and cancelling
+the stream kills the command's process group.
 
 One gap remains before a notebook is usable locally: the returned URL is
 `<node-ip>:<nodePort>` on the docker network, which a browser on the host cannot
 reach, so connecting to the kernel needs a route (or a real Ingress, which the
-adapter does not submit yet). Beyond that, `execStream` and `gitCheckout` are
-still stubs, so a session that streams a command or loads from a repository hits
-`ArmadaSandbox.<method> is not implemented`. When a start does fail, the notebook
+adapter does not submit yet). Beyond that, `gitCheckout` is still a stub, so a
+session that loads from a repository hits
+`ArmadaSandbox.gitCheckout is not implemented`. When a start does fail, the notebook
 shows a generic _"Sandbox compute backend is not available"_ with a Retry button;
 the real error is nested in the server log's `cause` field. Dig it out with:
 
@@ -278,6 +281,23 @@ bun install
 bun run build   # bundles src + all dependencies into dist/index.js (bun build --target=node)
 bun run test
 bun run smoke   # submit one job to a running Armada, see where it lands
+```
+
+`bun run smoke` also exercises the ghost machinery, because closing an exec
+websocket does not stop the command it started (decisions 23 to 25). It abandons a
+command by timing it out, cancels a stream mid-command, and plants a group nothing
+is waiting on, which is what a failed kill or a marimohub restart leaves behind.
+Then it sweeps and lists every process that is not PID 1 and not the shell doing
+the asking. A healthy run kills the planted group and reports no live strays;
+anything else exits non-zero. A process in state `Z` is a zombie rather than a
+leak: the pod's PID 1 is `sleep infinity` and never reaps.
+
+While marimohub is running, the same sweep happens on a timer per sandbox, every
+`ARMADA_GHOST_SWEEP_SECONDS`. When it finds something it says so in marimohub's
+log, and the count reaches the `session_provision` line as `ghosts_killed`:
+
+```bash
+docker logs marimohub-armada 2>&1 | grep "killed .* abandoned process group"
 ```
 
 CI (`.github/workflows/ci.yml`) runs `check` (oxfmt + oxlint), `typecheck`, `test` and
