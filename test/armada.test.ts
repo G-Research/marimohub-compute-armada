@@ -4,6 +4,7 @@ import type { PodLocation, SubmittedJob } from '../src/armada.js';
 import { readConfig } from '../src/config.js';
 import type { ArmadaConfig } from '../src/config.js';
 import { buildPodSpec } from '../src/podspec.js';
+import type { ActiveSandbox } from '../src/types.js';
 
 const config: ArmadaConfig = readConfig({
 	ARMADA_URL: 'http://armada.example.com/',
@@ -288,5 +289,74 @@ describe('cancel', () => {
 			jobSetId: 'sandbox-7',
 			jobId: 'job-1',
 		});
+	});
+
+	it('cancels a whole set with no job id, which the server routes to CancelJobSet', async () => {
+		stubFetch(Response.json({}));
+
+		await new ArmadaClient(config).cancelSet('sandbox-7');
+
+		expect(calls[0]?.body).toEqual({ queue: 'marimohub', jobSetId: 'sandbox-7' });
+	});
+});
+
+const lookoutConfig: ArmadaConfig = readConfig({
+	ARMADA_URL: 'http://armada.example.com/',
+	ARMADA_QUEUE: 'marimohub',
+	ARMADA_LOOKOUT_URL: 'http://lookout.example.com',
+	MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
+});
+
+/** A full-or-partial Lookout page of jobs, for the pagination test. */
+function lookoutPage(start: number, count: number): Response {
+	return Response.json({
+		jobs: Array.from({ length: count }, (_: unknown, n: number) => ({
+			jobSet: `sb-${String(start + n)}`,
+		})),
+	});
+}
+
+describe('listActive', () => {
+	it('asks Lookout for marked, active jobs in our queue', async () => {
+		stubFetch(
+			Response.json({
+				jobs: [
+					{ jobId: 'job-1', jobSet: 'sb-one', state: 'RUNNING', submitted: '2026-09-02T12:00:00Z' },
+					{ jobId: 'job-2', jobSet: 'sb-two', state: 'QUEUED' },
+				],
+			}),
+		);
+
+		const active: ActiveSandbox[] = await new ArmadaClient(lookoutConfig).listActive();
+
+		expect(calls[0]?.url).toBe('http://lookout.example.com/api/v1/jobs');
+		expect(calls[0]?.body).toEqual({
+			filters: [
+				{ field: 'queue', value: 'marimohub', match: 'exact' },
+				{ field: 'state', value: ['QUEUED', 'LEASED', 'PENDING', 'RUNNING'], match: 'anyOf' },
+				{ field: 'marimohub/sandbox', value: 'true', match: 'exact', isAnnotation: true },
+			],
+			order: { field: 'submitted', direction: 'ASC' },
+			skip: 0,
+			take: 500,
+		});
+		// A QUEUED job has no pod anywhere yet, but its sandbox is on its way and
+		// must not look reapable, so it is in the list, with no createdAt to give.
+		expect(active).toEqual([{ id: 'sb-one', createdAt: '2026-09-02T12:00:00Z' }, { id: 'sb-two' }]);
+	});
+
+	it('pages until a page comes back short', async () => {
+		let requests = 0;
+		stubFetch((): Response => (requests++ === 0 ? lookoutPage(0, 500) : lookoutPage(500, 1)));
+
+		const active: ActiveSandbox[] = await new ArmadaClient(lookoutConfig).listActive();
+
+		expect(calls).toHaveLength(2);
+		expect(calls[1]?.body).toMatchObject({ skip: 500 });
+		expect(active).toHaveLength(501);
+	});
+
+	it('rejects with the missing variable when Lookout is not configured', async () => {
+		expect(await rejection(new ArmadaClient(config).listActive())).toContain('ARMADA_LOOKOUT_URL');
 	});
 });

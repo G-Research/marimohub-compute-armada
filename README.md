@@ -30,6 +30,7 @@ Everything in `src/sandbox.ts` above `exec` is ordinary shell commands.
 | `ARMADA_URL`                         | yes      | Armada API base URL                                      |
 | `ARMADA_QUEUE`                       | yes      | Queue jobs are submitted to                              |
 | `ARMADA_NAMESPACE`                   | no       | Pod namespace (default `default`)                        |
+| `ARMADA_LOOKOUT_URL`                 | no       | Lookout base URL; enables `listActive` reconciliation    |
 | `ARMADA_PRIORITY_CLASS`              | no       | Use a non-preemptible class for interactive sessions     |
 | `ARMADA_KERNEL_PORT`                 | no       | Port marimo serves on (default `2718`)                   |
 | `ARMADA_GHOST_SWEEP_SECONDS`         | no       | Abandoned-process sweep interval (default `60`, `0` off) |
@@ -47,6 +48,11 @@ which Armada names only as a `clusterId`. It mirrors Lookout's `binocularsBaseUr
 `/etc/marimohub/clusters/{CLUSTER_ID}.yaml` in a multi-cluster deployment, a plain path
 when there is one cluster, and unset to use the ambient credentials (the in-cluster
 service account, or `~/.kube/config` on a laptop).
+
+`ARMADA_LOOKOUT_URL` is optional and gates a capability: set it to Lookout's base URL and
+the adapter advertises `listActive`, which marimohub's reconciler uses to enumerate live
+sandboxes after a restart. Leave it unset and the adapter never lists jobs, so
+reconciliation is a clean no-op.
 
 Configure at most one auth mechanism. With none, no `Authorization` header is sent, which
 is what a server running `anonymousAuth: true` expects. Prefer `ARMADA_AUTH_TOKEN_FILE`

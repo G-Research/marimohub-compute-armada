@@ -145,9 +145,45 @@ const ENUMS: Record<string, readonly string[]> = {
 	],
 };
 
+/**
+ * What `listActive` reads from Lookout, whose spec is a separate file
+ * (`internal/lookout/swagger.yaml`) and YAML rather than JSON. We own no YAML
+ * parser and a handful of fields does not justify one, so these are checked as
+ * tokens in the raw text: a rename or removal makes its token vanish, which is
+ * the drift this guards against. Coarser than the structural check above, and
+ * deliberately so.
+ */
+const LOOKOUT_TOKENS: readonly string[] = [
+	// The one endpoint we call, and its request shape.
+	'/api/v1/jobs:',
+	'filters:',
+	'order:',
+	'skip:',
+	'take:',
+	// The filter definition: match modes we send, and annotation matching.
+	'isAnnotation:',
+	'- exact',
+	'- anyOf',
+	// The job fields we read. `jobSet` is the sandbox id, `submitted` becomes
+	// `createdAt`.
+	'jobSet:',
+	'submitted:',
+	'state:',
+	'jobs:',
+];
+
 function actualType(schema: SwaggerSchema): string {
 	if (schema.$ref !== undefined) return 'ref';
 	return schema.type ?? 'unknown';
+}
+
+/** Fetch a spec file at the pinned release, failing loudly when it is missing. */
+async function fetchSpec(url: string): Promise<string> {
+	const response: Response = await fetch(url);
+	if (!response.ok) {
+		throw new Error(`could not fetch the spec (${response.status}): ${url}`);
+	}
+	return response.text();
 }
 
 async function main(): Promise<void> {
@@ -157,11 +193,7 @@ async function main(): Promise<void> {
 	const url: string = `https://raw.githubusercontent.com/armadaproject/armada/${version}/pkg/api/api.swagger.json`;
 
 	console.log(`checking src/armada-types.ts against armada ${version}`);
-	const response: Response = await fetch(url);
-	if (!response.ok) {
-		throw new Error(`could not fetch the spec (${response.status}): ${url}`);
-	}
-	const parsed: unknown = await response.json();
+	const parsed: unknown = JSON.parse(await fetchSpec(url));
 	if (typeof parsed !== 'object' || parsed === null) {
 		throw new Error(`the spec at ${url} is not a JSON object`);
 	}
@@ -203,6 +235,14 @@ async function main(): Promise<void> {
 		}
 	}
 
+	const lookoutUrl: string = `https://raw.githubusercontent.com/armadaproject/armada/${version}/internal/lookout/swagger.yaml`;
+	const lookoutSpec: string = await fetchSpec(lookoutUrl);
+	for (const token of LOOKOUT_TOKENS) {
+		if (!lookoutSpec.includes(token)) {
+			problems.push(`lookout swagger no longer contains "${token}" (${lookoutUrl})`);
+		}
+	}
+
 	if (problems.length > 0) {
 		console.error(`\n${problems.length} mismatch(es) against armada ${version}:\n`);
 		for (const problem of problems) console.error(`  ${problem}`);
@@ -220,7 +260,7 @@ async function main(): Promise<void> {
 		0,
 	);
 	console.log(
-		`ok: ${Object.keys(ENDPOINTS).length} endpoints, ${Object.keys(CONTRACT).length} definitions, ${fieldCount} fields`,
+		`ok: ${Object.keys(ENDPOINTS).length} endpoints, ${Object.keys(CONTRACT).length} definitions, ${fieldCount} fields, ${LOOKOUT_TOKENS.length} lookout tokens`,
 	);
 }
 

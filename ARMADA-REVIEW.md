@@ -4,12 +4,13 @@ This document records every design decision behind `marimohub-compute-armada`, t
 for it, and what is still a judgement call. It is meant to be read by someone who knows
 Armada and does not know this repo.
 
-The adapter partially works. The whole provision sequence is implemented and verified
-against a real local Armada: placement (submit, wait for running, cancel), exec into the
-placed pod, file writes, env vars, detached process launch, the exposed-port URL from
-Armada's ingress event, reading files and directories back out, streaming a command's
-output, and cloning a repository. The one remaining stub that throws is `listActive` on
-the client.
+The adapter covers marimohub's whole interface. The provision sequence is implemented and
+verified against a real local Armada: placement (submit, wait for running, cancel), exec
+into the placed pod, file writes, env vars, detached process launch, the exposed-port URL
+from Armada's ingress event, reading files and directories back out, streaming a command's
+output, and cloning a repository. `listActive`, the last stub, now asks Lookout
+(decision 27) and is covered by tests against stubbed responses; it has not yet been
+exercised against the local cluster's own Lookout.
 
 Every claim below is cited against the Armada source at `v0.22.7`, which is the release
 pinned in `.armada-version`, in the form `path:line`. Where we had open questions earlier,
@@ -95,6 +96,10 @@ submit time, and reconciliation after a restart is one call per sandbox with no 
 
 This was previously an open question and it had a deadline attached, because
 `externalJobUri` can only be set at submit. It is now settled before the first submit.
+
+What that leaves out is enumeration: listing the sandboxes that exist at all, with no local
+state to consult, is the other half of reconciliation, and it is the one question the calls
+above cannot answer because they all name a job. Decision 27 is where it went.
 
 ### 5. `clientId` is the sandbox id, for dedupe
 
@@ -641,6 +646,42 @@ fetching into a dead directory for the rest of the session.
 way upstream's kubernetes adapter does. A missing git fails the clone with sh's own
 "git: not found" in the thrown stderr, so the diagnosis is immediate.
 
+### 27. `listActive` asks Lookout, and only exists when Lookout is configured
+
+marimohub's reconciler needs the one question decision 4 left open: after a restart, which
+sandboxes exist? A local registry would reintroduce exactly the state decision 4's design
+exists to avoid, and the Armada server has no call that enumerates a queue's jobs. The
+component that aggregates jobs across every executor cluster is Lookout, which is why its
+UI can list jobs and the server API cannot.
+
+So `listActive` is a paged `POST /api/v1/jobs` to Lookout:
+
+- Filters scope the answer to our queue (`match: exact`), to the states where a sandbox is
+  alive or on its way (`QUEUED`, `LEASED`, `PENDING`, `RUNNING`), and to jobs carrying the
+  `marimohub/sandbox` annotation set at submit. The annotation filter is the safety
+  property, not decoration: **the reconciler destroys what `listActive` returns**, and a
+  queue may hold jobs that are not marimohub's, so an unfiltered answer would cancel
+  strangers' work on the next sweep.
+- `order: submitted ASC` with `take: 500` pages until a page comes back short, so more
+  active kernels than a page loops rather than truncates.
+- The response is keyed on `jobSet`, which is the sandbox id (decision 4), so the mapping to
+  `ActiveSandbox` is direct and `submitted` becomes `createdAt`. A `QUEUED` job is reported
+  deliberately: its sandbox is on its way and must not look reapable, and it has no
+  creation time to give.
+
+`ARMADA_LOOKOUT_URL` is optional, and the provider **advertises `listActive` only when it
+is set** (`src/provider.ts`). marimohub treats a declared `listActive` as a promise:
+declaring one we could not answer would fail every reconciliation sweep, where the absent
+method makes reconciliation a clean no-op. Unset, this is a placement-and-control adapter
+and nothing else.
+
+The cost of leaning on Lookout is that its API is a UI's API, not a documented public
+contract like the server's: the spec is a separate file
+(`internal/lookout/swagger.yaml`), YAML rather than JSON. `check-armada-api` therefore also
+asserts that the twelve tokens we depend on still exist in that swagger at the pinned
+release, which is coarser than the structural check above and deliberately so. Whether
+depending on Lookout at all is right is [still open](#still-open).
+
 ## Constraints on the first submit
 
 Collected from `internal/server/submit/validation/submit_request.go` so the first real submit
@@ -694,14 +735,22 @@ These are judgement calls, not missing homework.
    is computed from resource _requests_ of running jobs, so an idle kernel costs its full
    request all session. That is a capacity-planning question for whoever runs the cluster,
    not an API question.
+4. **Is depending on Lookout acceptable in your deployment?** The server API cannot
+   enumerate jobs, so `listActive` asks Lookout (decision 27), a UI component whose API is
+   not offered as a stable public contract. If an operator says no, the answers in order of
+   preference: drop the capability (the adapter already degrades to a no-op reconciler when
+   `ARMADA_LOOKOUT_URL` is unset), add a list call to binoculars upstream, or wait for
+   Armada to grow a first-class enumeration call. Also worth asking: is your Lookout meant
+   to be called server-to-server at all, auth included?
 
 ## What has been verified
 
 Verified:
 
 - Every endpoint, definition, field and enum in `src/armada-types.ts` exists in Armada
-  `v0.22.7` as we describe it. Reproducible: `bun run check:armada-api`, currently 4
-  endpoints, 17 definitions, 71 fields.
+  `v0.22.7` as we describe it, and the Lookout tokens in `scripts/check-armada-api.ts`
+  exist in that release's Lookout swagger. Reproducible: `bun run check:armada-api`,
+  currently 4 endpoints, 17 definitions, 71 fields, 12 lookout tokens.
 - Every citation in this document was read in the Armada source at that release.
 - The local environment works: armada-operator's kind quickstart, REST gateway on port 30001,
   jobs submittable with `armadactl`.
@@ -751,6 +800,11 @@ Verified:
   and a cancelled stream leave nothing behind, a deliberately planted group that nothing is
   waiting on is killed by the sweep and reported (`killed 1 abandoned process group(s)`),
   and the stray listing afterwards shows only zombies, no live process.
+- `listActive` against stubbed Lookout responses: the request body (queue and annotation
+  filters, the four active states, ordering, page size), pagination until a page comes back
+  short, `jobSet` mapping with `createdAt` only when `submitted` is present, the missing
+  `ARMADA_LOOKOUT_URL` rejection, and the provider advertising the capability only when
+  Lookout is configured.
 - A whole notebook session end to end, from a real browser against the local cluster:
   opening a notebook provisions a pod (12.1s total, 11.1s of it placement), the marimo
   editor loads through marimohub's `/proxy/<token>/` route, the kernel executes the
@@ -767,14 +821,16 @@ Assumed, not verified:
 - That the generated Ingress carries WebSocket traffic with a real ingress controller.
   This only matters for `subdomain` exposure; `proxy` exposure carries websockets through
   marimohub and is verified.
-- The three items under [Still open](#still-open).
+- That `listActive` answers against a real Lookout. The tests stub its responses; the local
+  cluster's Lookout on port 30000 has not been asked yet.
+- The four items under [Still open](#still-open).
 
 ## Where to look in the code
 
 | Path                          | What it is                                                                               |
 | ----------------------------- | ---------------------------------------------------------------------------------------- |
 | `src/types.ts`                | marimohub's adapter interface, transcribed by hand. Not ours to change.                  |
-| `src/armada.ts`               | Placement: submit, watch, ingress address, cancel. `listActive` stubbed.                 |
+| `src/armada.ts`               | Placement: submit, watch, ingress address, cancel; `listActive` via Lookout.             |
 | `src/exec.ts`                 | Control channel: exec into a located pod, buffered or streamed.                          |
 | `src/shell.ts`                | Quoting, env prefix, port waiter, read, list and clone commands, from `compute-commons`. |
 | `src/sweeper.ts`              | The provider's one ghost sweeper: registration, cap, timer.                              |

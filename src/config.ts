@@ -58,6 +58,14 @@ export interface ArmadaConfig {
 	commandMaxSeconds: number;
 	/** How to authenticate to Armada. */
 	auth: ArmadaAuth;
+	/**
+	 * Lookout base URL, for `listActive`. Armada's own API has no "list the jobs
+	 * I own" call, and Lookout is the component that aggregates jobs across every
+	 * executor cluster, so enumeration goes through it. Optional: without it the
+	 * provider does not advertise `listActive` and marimohub skips reconciliation,
+	 * which is exactly the behaviour before this existed.
+	 */
+	lookoutUrl?: string | undefined;
 }
 
 function required(env: Record<string, string | undefined>, name: string): string {
@@ -74,6 +82,12 @@ function requiredUrl(env: Record<string, string | undefined>, name: string): str
 		throw new Error(`${name} must be an http(s) URL, got: ${value}`);
 	}
 	return value;
+}
+
+/** As `requiredUrl`, but absent is a valid answer. */
+function optionalUrl(env: Record<string, string | undefined>, name: string): string | undefined {
+	if (env[name] === undefined) return undefined;
+	return requiredUrl(env, name);
 }
 
 function optionalPort(
@@ -186,6 +200,7 @@ export function readConfig(
 		sandboxHostname: env.MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME,
 		port: optionalPort(env, 'ARMADA_KERNEL_PORT', 2718),
 		kubeconfigPattern: env.ARMADA_KUBECONFIG_PATTERN,
+		lookoutUrl: optionalUrl(env, 'ARMADA_LOOKOUT_URL'),
 		maxLifetimeSeconds:
 			compute?.sessionMaxLifetimeSeconds ??
 			optionalSeconds(env, 'ARMADA_KERNEL_MAX_LIFETIME_SECONDS', DEFAULT_MAX_LIFETIME_SECONDS),

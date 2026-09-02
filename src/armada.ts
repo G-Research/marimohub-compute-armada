@@ -18,11 +18,14 @@ import type {
 	JobSubmitRequest,
 	JobSubmitResponse,
 	JobSubmitResponseItem,
+	LookoutGetJobsRequest,
+	LookoutGetJobsResponse,
+	LookoutJob,
 } from './armada-types.js';
 import { authorizationHeader } from './auth.js';
 import type { ArmadaConfig } from './config.js';
 import { readNdjson } from './ndjson.js';
-import type { SandboxId } from './types.js';
+import type { ActiveSandbox, SandboxId } from './types.js';
 
 /** Where a running job's pod lives, from `JobRunningEvent`. */
 export interface PodLocation {
@@ -55,6 +58,19 @@ const DEFAULT_RUNNING_TIMEOUT_MS = 5 * 60 * 1000;
 
 /** The ingress event lands around Running, so by expose time it usually replays. */
 const DEFAULT_INGRESS_TIMEOUT_MS = 60 * 1000;
+
+/**
+ * Annotation marking a job as this adapter's, set at submit and filtered on by
+ * `listActive`. Job annotations land on the pod too, so the mark is visible
+ * from Lookout and from Kubernetes alike.
+ */
+export const SANDBOX_MARK = 'marimohub/sandbox';
+
+/** Lookout job states meaning "this sandbox is alive or on its way". */
+const ACTIVE_JOB_STATES: string[] = ['QUEUED', 'LEASED', 'PENDING', 'RUNNING'];
+
+/** Lookout page size; more active kernels than this loops rather than truncates. */
+const LIST_ACTIVE_PAGE = 500;
 
 export class ArmadaClient {
 	constructor(private readonly config: ArmadaConfig) {}
@@ -92,8 +108,11 @@ export class ArmadaClient {
 					namespace: this.config.namespace,
 					podSpec,
 					// A retry would hand the user an empty kernel wearing their session's
-					// name, so fail terminally and let marimohub offer the retry.
-					annotations: { 'armadaproject.io/failFast': 'true' },
+					// name, so fail terminally and let marimohub offer the retry. The
+					// sandbox mark is what `listActive` filters on: a queue may hold jobs
+					// that are not marimohub's, and enumeration feeds a reconciler that
+					// destroys what it does not recognise, so only marked jobs may appear.
+					annotations: { 'armadaproject.io/failFast': 'true', [SANDBOX_MARK]: 'true' },
 					services: [{ type: 'NodePort', ports: [this.config.port] }],
 				},
 			],
@@ -231,13 +250,77 @@ export class ArmadaClient {
 		await this.post('/v1/job/cancel', request);
 	}
 
-	/** Jobs this deployment owns, for the reconciler. */
-	async listActive(): Promise<SubmittedJob[]> {
-		throw new Error('ArmadaClient.listActive is not implemented');
+	/**
+	 * Cancel every job in a set, for a sandbox this process never submitted.
+	 *
+	 * The reconciler addresses sandboxes by id alone, and a job set id is a
+	 * sandbox id, so no job lookup is needed: a cancel with no job id is
+	 * explicitly redirected to CancelJobSet by the server
+	 * (`internal/server/submit/submit.go:170`). Cancelling a set that no longer
+	 * exists (or never did) is a no-op, not an error.
+	 */
+	async cancelSet(jobSetId: string): Promise<void> {
+		const request: JobCancelRequest = { queue: this.config.queue, jobSetId };
+		await this.post('/v1/job/cancel', request);
+	}
+
+	/**
+	 * Every sandbox with a live job, for marimohub's reconciler.
+	 *
+	 * Asked of Lookout, not the Armada server, because the server has no "list
+	 * the jobs I own" call at all (decision 4). Lookout is the component that
+	 * aggregates jobs across every executor cluster, so this needs no cluster
+	 * inventory, and it sees jobs still QUEUED, which have no pod anywhere yet.
+	 * The filters scope the answer to our queue and to jobs carrying the
+	 * {@link SANDBOX_MARK} annotation, because the reconciler destroys
+	 * sandboxes it has no record of and must never be shown a job that is not
+	 * marimohub's.
+	 */
+	async listActive(): Promise<ActiveSandbox[]> {
+		const lookout: string | undefined = this.config.lookoutUrl;
+		if (lookout === undefined) {
+			throw new Error('listActive needs ARMADA_LOOKOUT_URL, which is not configured');
+		}
+
+		// Keyed by job set so a set holding several jobs (ours hold one) appears
+		// once. Insertion order is submission order, per `order` below.
+		const sandboxes: Map<string, ActiveSandbox> = new Map();
+		for (let skip = 0; ; skip += LIST_ACTIVE_PAGE) {
+			const request: LookoutGetJobsRequest = {
+				filters: [
+					{ field: 'queue', value: this.config.queue, match: 'exact' },
+					{ field: 'state', value: ACTIVE_JOB_STATES, match: 'anyOf' },
+					{ field: SANDBOX_MARK, value: 'true', match: 'exact', isAnnotation: true },
+				],
+				order: { field: 'submitted', direction: 'ASC' },
+				skip,
+				take: LIST_ACTIVE_PAGE,
+			};
+			// oxlint-disable-next-line no-await-in-loop -- each page's fullness decides whether another exists
+			const response: object = await this.postJsonTo(lookout, '/api/v1/jobs', request);
+			const jobs: LookoutJob[] = (response as LookoutGetJobsResponse).jobs ?? [];
+			for (const job of jobs) {
+				if (job.jobSet === undefined || job.jobSet === '') continue;
+				sandboxes.set(job.jobSet, {
+					id: job.jobSet,
+					...(job.submitted === undefined ? {} : { createdAt: job.submitted }),
+				});
+			}
+			if (jobs.length < LIST_ACTIVE_PAGE) return [...sandboxes.values()];
+		}
 	}
 
 	private async post(path: string, body: unknown, signal?: AbortSignal): Promise<Response> {
-		const response: Response = await fetch(`${this.config.url.replace(/\/$/, '')}${path}`, {
+		return this.postTo(this.config.url, path, body, signal);
+	}
+
+	private async postTo(
+		base: string,
+		path: string,
+		body: unknown,
+		signal?: AbortSignal,
+	): Promise<Response> {
+		const response: Response = await fetch(`${base.replace(/\/$/, '')}${path}`, {
 			method: 'POST',
 			headers: await this.requestHeaders(),
 			body: JSON.stringify(body),
@@ -256,6 +339,11 @@ export class ArmadaClient {
 
 	private async postJson(path: string, body: unknown): Promise<object> {
 		const response: Response = await this.post(path, body);
+		return asObject(await response.json(), `a response to ${path}`);
+	}
+
+	private async postJsonTo(base: string, path: string, body: unknown): Promise<object> {
+		const response: Response = await this.postTo(base, path, body);
 		return asObject(await response.json(), `a response to ${path}`);
 	}
 }
