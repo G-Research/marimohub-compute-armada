@@ -42,6 +42,13 @@ fi
 
 echo "==> restarting marimohub"
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+# Sandbox exposure is `proxy`: the browser reaches the kernel through the app at
+# /proxy/<token>/, and marimohub forwards to the exposePort() URL server-side.
+# That is what makes a kernel reachable from a Mac browser at all: the NodePort
+# address Armada assigns (172.18.x.x:3xxxx) lives on the docker network, which
+# macOS cannot route to, but this container sits on that network and can. The
+# ack flag is proxy mode's required opt-in (kernels become same-origin with the
+# app), and the session secret signs its routing tokens; both are dev values.
 docker run -d --name "$CONTAINER" --platform linux/amd64 \
 	--network kind \
 	-p "$PORT:3000" \
@@ -50,6 +57,9 @@ docker run -d --name "$CONTAINER" --platform linux/amd64 \
 	-e MARIMOHUB_STORAGE_BACKEND=fs \
 	-e MARIMOHUB_STORAGE_FS_ROOT=/data \
 	-e MARIMOHUB_AUTH_BACKEND=dev \
+	-e MARIMOHUB_SANDBOX_EXPOSURE=proxy \
+	-e MARIMOHUB_SANDBOX_PROXY_ACK_UNTRUSTED=true \
+	-e MARIMOHUB_AUTH_SESSION_SECRET="${MARIMOHUB_AUTH_SESSION_SECRET:-armada-dev-only-proxy-secret}" \
 	-e MARIMOHUB_COMPUTE_IMAGE=marimo-sandbox:local \
 	-e ARMADA_URL="${ARMADA_URL:-http://host.docker.internal:30001}" \
 	-e ARMADA_QUEUE="$QUEUE" \

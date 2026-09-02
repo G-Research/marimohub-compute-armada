@@ -325,8 +325,12 @@ wait out.
 read it. The URL is plain `http://` because what the submit creates today is a NodePort
 service; the scheme choice revisits when an Ingress config with TLS lands. That NodePort
 address is only reachable from the cluster's network, which is fine for marimohub running
-next to it and a visible gap for a browser on a laptop; the Ingress config is the answer
-there too.
+next to it and a visible gap for a browser on a laptop. Both answers to that gap are
+marimohub's, not this adapter's: in `subdomain` exposure the browser dereferences our URL
+directly, which needs a public address and is what the Ingress config will provide; in
+`proxy` exposure (`MARIMOHUB_SANDBOX_EXPOSURE=proxy`) kernel traffic is forwarded through
+the app, so our URL only has to be reachable from marimohub. The local environment uses
+proxy exposure, and a full session works end to end through it.
 
 ### 21. Read files back as base64, and let the bytes choose the encoding
 
@@ -747,6 +751,11 @@ Verified:
   and a cancelled stream leave nothing behind, a deliberately planted group that nothing is
   waiting on is killed by the sweep and reported (`killed 1 abandoned process group(s)`),
   and the stray listing afterwards shows only zombies, no live process.
+- A whole notebook session end to end, from a real browser against the local cluster:
+  opening a notebook provisions a pod (12.1s total, 11.1s of it placement), the marimo
+  editor loads through marimohub's `/proxy/<token>/` route, the kernel executes the
+  notebook's cells, autosave writes back to `/workspace/notebook.py` over the proxied
+  websocket, and the kernel's `/api/status` through the proxy reports healthy.
 - Build, type checks, tests and image build pass in CI.
 
 Assumed, not verified:
@@ -756,6 +765,8 @@ Assumed, not verified:
 - That an interactive session survives normal scheduling behaviour once decisions 7 to 9 are
   applied.
 - That the generated Ingress carries WebSocket traffic with a real ingress controller.
+  This only matters for `subdomain` exposure; `proxy` exposure carries websockets through
+  marimohub and is verified.
 - The three items under [Still open](#still-open).
 
 ## Where to look in the code

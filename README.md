@@ -228,7 +228,8 @@ The script does six things:
    marimohub image plus one `COPY`.
 4. `armadactl create queue marimohub` — idempotent.
 5. `docker run` — starts the container on port 3000, joined to the `kind`
-   network, with `fs` storage (a named volume), `dev` auth, the `ARMADA_*`
+   network, with `fs` storage (a named volume), `dev` auth, `proxy` sandbox
+   exposure (see step 5's note on reaching the kernel), the `ARMADA_*`
    variables, and the kubeconfig mounted read-only.
 6. Polls `/api/health` until it answers, then prints the URL.
 
@@ -254,10 +255,14 @@ the stream kills the command's process group. `gitCheckout` clones a repository
 through the same exec path, so a session that loads from a repository works too
 (provided the kernel image ships `git`).
 
-One gap remains before a notebook is usable locally: the returned URL is
-`<node-ip>:<nodePort>` on the docker network, which a browser on the host cannot
-reach, so connecting to the kernel needs a route (or a real Ingress, which the
-adapter does not submit yet). When a start does fail, the notebook
+The URL `exposePort` returns is `<node-ip>:<nodePort>` on the docker network,
+which a browser on the host cannot reach. That is why `run-local.sh` sets
+`MARIMOHUB_SANDBOX_EXPOSURE=proxy`: the browser talks to the kernel through the
+app at `/proxy/<token>/…`, and only marimohub, which sits on the `kind` network,
+dereferences the NodePort address. With that in place a notebook works end to
+end locally: opening one provisions the pod (about 12s warm) and the marimo
+editor connects through the proxy, websocket included. When a start does fail,
+the notebook
 shows a generic _"Sandbox compute backend is not available"_ with a Retry button;
 the real error is nested in the server log's `cause` field. Dig it out with:
 
