@@ -6,10 +6,9 @@ Armada and does not know this repo.
 
 The adapter partially works. The whole provision sequence is implemented and verified
 against a real local Armada: placement (submit, wait for running, cancel), exec into the
-placed pod, file writes, env vars, detached process launch, and the exposed-port URL from
-Armada's ingress event. Still stubs that throw: `execStream`, `readFile`, `listFiles` and
-`gitCheckout`, which session capture hits at snapshot or teardown, plus `listActive` on
-the client.
+placed pod, file writes, env vars, detached process launch, the exposed-port URL from
+Armada's ingress event, and reading files and directories back out. Still stubs that
+throw: `execStream` and `gitCheckout`, plus `listActive` on the client.
 
 Every claim below is cited against the Armada source at `v0.22.7`, which is the release
 pinned in `.armada-version`, in the form `path:line`. Where we had open questions earlier,
@@ -325,6 +324,102 @@ address is only reachable from the cluster's network, which is fine for marimohu
 next to it and a visible gap for a browser on a laptop; the Ingress config is the answer
 there too.
 
+### 21. Read files back as base64, and let the bytes choose the encoding
+
+`readFile` and `listFiles` are the read side of decision 18, and like it they transcribe
+marimohub's kubernetes adapter. Both run in a non-login `sh -c` with no env prefix, because
+their stdout is a protocol value we parse and a profile script that prints anything would
+corrupt it. Upstream states that rule for `readFile` and then breaks it for `listFiles`,
+which goes through its ordinary `exec` path; we apply it to both.
+
+`readFile` does not `cat`. Our exec channel returns stdout as `Buffer.concat(...).toString('utf8')`,
+so any byte that is not valid UTF-8 becomes U+FFFD: a plain `cat` would silently corrupt
+exactly the content decision 18 took care to carry in verbatim. The pod runs `base64`
+instead, which is ASCII and survives the channel, and the adapter decodes it.
+
+What encoding we then report is decided from the bytes, and this is the one place the two
+first-party consumers disagree. `ReadFileResult` carries an optional `encoding` of `utf-8`
+or `base64`, but marimohub's `readSessionArtifacts`
+(`packages/core/src/services/runtime/sandboxFiles.ts:352`) takes `result.content` and never
+looks at `encoding`, while `proposalCapture`
+(`packages/core/src/services/content/proposalCapture.ts:201`) passes both to
+`decodeProposalContent`. So reporting base64 unconditionally would store base64 as the
+notebook source, and reporting UTF-8 unconditionally would corrupt an image the user
+changed. We decode the bytes, return them as text with `encoding: 'utf-8'` when they are
+valid UTF-8, and as `base64` otherwise. Text works for both consumers; binary is at least
+intact for the one that can decode it. The base64 is re-encoded rather than passed through,
+because GNU `base64` wraps at 76 columns and the decoders downstream take one line. A byte
+order mark is preserved (`TextDecoder` is given `ignoreBOM: true`, which means "do not strip
+it"), so a file that has one round-trips exactly.
+
+Two smaller divergences. The path reaches `base64` by redirection rather than as an operand,
+so a path starting with `-` needs no `--`, which GNU coreutils supports and busybox does not.
+And an absent path is `NOT_FOUND`, not upstream's blanket `READ_FAILED`: session capture
+reads four fixed paths of which several routinely do not exist (a notebook that never
+rendered has no `__marimo__/notebook.html`), so "never written" is the common answer and is
+worth telling apart from "could not be read". A shell `[ -e ] || [ -L ]` test in the same
+command carries it, at exit code 44, so it costs no extra round trip.
+
+`listFiles` is upstream's `find` with upstream's directory probe in front of it. The probe is
+what marimohub's compute contract demands: listing a file must be `NOT_A_DIRECTORY` and never
+an empty success (`packages/core/src/testing/computeContract.ts:260`), which an unguarded
+`find` cannot distinguish from an empty directory. We classify on the probe's exit code (20)
+rather than on upstream's stderr marker, since a pod exec gives us the exit code directly;
+the marker is still printed so a failing exec explains itself in a log. Records are
+NUL-separated `type<TAB>size<TAB>path`, the path last so one containing a tab rejoins intact.
+`includeHidden` filters on an entry's own name, so a recursive listing still descends into a
+dot directory, which is upstream's behaviour and what `readSessionArtifacts` relies on when
+it enumerates `__marimo__` trees.
+
+`find -printf` is GNU find, as it is upstream; busybox has no equivalent. That is the same
+class of assumption as `setsid` and `python3` in decision 19, and holds for any
+Debian-family kernel image. `base64` is coreutils and present in busybox too.
+
+### 22. Every command goes through `sh`
+
+The Pod exec subresource takes an argv, not a command line, so the interpreter is our
+choice and not something the API imposes. We could exec binaries directly, `['find', path,
+'-mindepth', '1', ...]`, and depend on no shell at all. We do not, because every capability
+above `exec` needs shell features: the env prefix is `export` statements (decision 18), the
+port waiter and the kernel launch need redirection, backgrounding and `setsid` (decision 19),
+and the read and list commands need redirection and `[ -e ]` tests (decision 21). Building
+those out of bare argv would mean either several round trips where there is now one, or
+reimplementing a shell.
+
+So `['sh', '-c', ...]` is the shape of every exec this adapter makes, with `-lc` where the
+command runs user code and needs a profile-provided PATH. That is also what marimohub's
+kubernetes adapter does (`packages/compute-kubernetes/src/index.ts:122`), so the images that
+work there work here.
+
+This makes `/bin/sh` a hard dependency of the whole adapter rather than of any one method.
+It is the safest of the assumptions we make: POSIX requires it, and every Linux image that
+is not `scratch` or distroless has it, whether that is dash on Debian or busybox on Alpine.
+A kernel image without it fails at the first exec with the API server's own "executable file
+not found in $PATH", wrapped with the pod, cluster and command by `execFailure`
+(`src/exec.ts`), so the diagnosis is immediate rather than mysterious.
+
+The narrower assumptions are the ones to watch, and they are all GNU or util-linux specifics
+that busybox lacks: `find -printf` (decision 21), `setsid` (decision 19). `base64` (decision 21) exists in both coreutils and busybox, and `python3` (decision 19) is definitional for a
+Python kernel image.
+
+Note what this rules out: the adapter probes for no capability anywhere. It never asks
+whether `setsid` exists or whether the interpreter is `python3` or `python`; it assumes, and
+a wrong assumption surfaces as that command's own failure. Upstream does probe, and
+re-probes on every call (`packages/core/src/services/content/proposalCapture.ts:218` runs
+`command -v python3 ... elif command -v python` per read).
+
+If a probe ever becomes necessary, inline it into the command that needs it, the way
+`listFilesCommand` inlines its directory test: a `command -v` inside the same `sh -c` picks a
+branch for free, and there is then nothing to cache. Memoize only when the answer has to
+reach JavaScript, for instance because it changes how we parse the output, and memoize it on
+the `ArmadaSandbox` instance next to `this.pod`, never module-globally. A pod's binaries are
+fixed when its image is built, so once per sandbox is the correct lifetime, and two sandboxes
+may be running different images (`options.image` overrides the configured one).
+
+The directory test in `listFiles` is not such a probe and must not be memoized: it answers
+what a path is right now, and a path becomes a directory or stops being one while the kernel
+runs.
+
 ## Constraints on the first submit
 
 Collected from `internal/server/submit/validation/submit_request.go` so the first real submit
@@ -405,12 +500,22 @@ Verified:
 - `exposePort` against a real pod: the URL comes back as `http://<node-ip>:<nodePort>` in
   single-digit milliseconds (the ingress event replays from the stream), and an HTTP
   request through that NodePort reaches a server listening on the kernel port.
+- `readFile` and `listFiles` against a real pod: text read back byte for byte (including
+  a non-ASCII character), binary content returned as base64 that decodes to the exact
+  bytes written, a 500-byte file whose wrapped base64 rejoins, an empty file as an empty
+  success, a quoted path, an absent path as `NOT_FOUND` and a directory as `READ_FAILED`;
+  a flat listing that hides dotfiles and does not descend, a recursive one that reaches
+  `__marimo__/session/notebook.py.json` and shows `.env`, a file listed as
+  `NOT_A_DIRECTORY`, an absent directory as `LIST_FAILED`, and a read that is unchanged
+  after `setEnvVars`.
 - Build, type checks, tests and image build pass in CI.
 
 Assumed, not verified:
 
 - That exec works from inside the marimohub container rather than from the host; the kind
   API server certificate makes that route non-obvious (see README).
+- That the kernel image provides `/bin/sh`, GNU `find` and `setsid`. Verified only against
+  the local `marimo-sandbox:local` image, which is Debian-family; see decision 22.
 - That an interactive session survives normal scheduling behaviour once decisions 7 to 9 are
   applied.
 - That the generated Ingress carries WebSocket traffic with a real ingress controller.
@@ -418,13 +523,13 @@ Assumed, not verified:
 
 ## Where to look in the code
 
-| Path                          | What it is                                                               |
-| ----------------------------- | ------------------------------------------------------------------------ |
-| `src/types.ts`                | marimohub's adapter interface, transcribed by hand. Not ours to change.  |
-| `src/armada.ts`               | Placement: submit, watch, ingress address, cancel. `listActive` stubbed. |
-| `src/exec.ts`                 | Control channel: exec into a located pod.                                |
-| `src/shell.ts`                | Quoting, env prefix, port waiter, transcribed from `compute-commons`.    |
-| `src/sandbox.ts`              | One kernel session. Everything below `exec` is ordinary shell commands.  |
-| `src/armada-types.ts`         | Hand-written Armada wire types, with the reasoning in the header.        |
-| `scripts/check-armada-api.ts` | The contract check that keeps those types honest.                        |
-| `README.md`                   | How to run the whole thing locally, and what failure looks like today.   |
+| Path                          | What it is                                                                                    |
+| ----------------------------- | --------------------------------------------------------------------------------------------- |
+| `src/types.ts`                | marimohub's adapter interface, transcribed by hand. Not ours to change.                       |
+| `src/armada.ts`               | Placement: submit, watch, ingress address, cancel. `listActive` stubbed.                      |
+| `src/exec.ts`                 | Control channel: exec into a located pod.                                                     |
+| `src/shell.ts`                | Quoting, env prefix, port waiter, read and list commands, transcribed from `compute-commons`. |
+| `src/sandbox.ts`              | One kernel session. Everything below `exec` is ordinary shell commands.                       |
+| `src/armada-types.ts`         | Hand-written Armada wire types, with the reasoning in the header.                             |
+| `scripts/check-armada-api.ts` | The contract check that keeps those types honest.                                             |
+| `README.md`                   | How to run the whole thing locally, and what failure looks like today.                        |

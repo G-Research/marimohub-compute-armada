@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'bun:test';
-import { assertEnvName, portWaitCommand, shellQuote, withEnvPrefix } from '../src/shell.js';
+import {
+	assertEnvName,
+	listFilesCommand,
+	parseListFilesOutput,
+	portWaitCommand,
+	readFileCommand,
+	shellQuote,
+	withEnvPrefix,
+} from '../src/shell.js';
+import type { FileInfo } from '../src/types.js';
 
 describe('shell quoting', () => {
 	it('wraps a value in single quotes', () => {
@@ -61,5 +70,84 @@ describe('env names', () => {
 		expect(() => assertEnvName('1BAD')).toThrow('Invalid environment variable name');
 		expect(() => assertEnvName('A B')).toThrow('"A B"');
 		expect(() => assertEnvName('X;rm -rf /')).toThrow('Invalid environment variable name');
+	});
+});
+
+describe('read command', () => {
+	it('feeds the path in by redirection, so a leading dash needs no `--`', () => {
+		expect(readFileCommand('-weird.py')).toContain("base64 < '-weird.py'");
+	});
+
+	it('quotes the path in every branch of the existence probe', () => {
+		const command: string = readFileCommand("/work/it's.py");
+		expect(command).toBe(
+			"if [ -e '/work/it'\\''s.py' ] || [ -L '/work/it'\\''s.py' ]; " +
+				"then base64 < '/work/it'\\''s.py'; else exit 44; fi",
+		);
+	});
+});
+
+describe('list command', () => {
+	it('stays in the directory unless recursion is asked for', () => {
+		expect(listFilesCommand('/work')).toContain("find '/work' -mindepth 1 -maxdepth 1 -printf");
+		expect(listFilesCommand('/work', { recursive: true })).toContain(
+			"find '/work' -mindepth 1 -printf",
+		);
+	});
+
+	it('exits 20 for a path that exists but is not a directory, and 1 for one that does not', () => {
+		const command: string = listFilesCommand('/work/notebook.py');
+		expect(command).toContain('exit 20');
+		expect(command).toContain('else exit 1; fi');
+		expect(command).toContain('MARIMOHUB_NOT_A_DIRECTORY');
+	});
+});
+
+describe('list parsing', () => {
+	const records: string =
+		'f\t12\t/work/notebook.py\0d\t4096\t/work/data\0l\t7\t/work/link\0s\t0\t/work/sock\0';
+
+	it('reads the type, size and path of every record', () => {
+		const files: FileInfo[] = parseListFilesOutput(records, '/work');
+		expect(files.map((file: FileInfo) => file.type)).toEqual([
+			'file',
+			'directory',
+			'symlink',
+			'other',
+		]);
+		expect(files[0]).toEqual({
+			name: 'notebook.py',
+			absolutePath: '/work/notebook.py',
+			relativePath: 'notebook.py',
+			type: 'file',
+			size: 12,
+		});
+	});
+
+	it('keeps a tab inside a path, because only the NUL separates records', () => {
+		const files: FileInfo[] = parseListFilesOutput('f\t3\t/work/a\tb.py\0', '/work');
+		expect(files[0]?.absolutePath).toBe('/work/a\tb.py');
+		expect(files[0]?.name).toBe('a\tb.py');
+	});
+
+	it('hides dotfiles unless asked, and hides nothing else', () => {
+		const hidden: string = 'f\t1\t/work/.env\0f\t2\t/work/notebook.py\0';
+		expect(parseListFilesOutput(hidden, '/work').map((file: FileInfo) => file.name)).toEqual([
+			'notebook.py',
+		]);
+		expect(
+			parseListFilesOutput(hidden, '/work', { includeHidden: true }).map(
+				(file: FileInfo) => file.name,
+			),
+		).toEqual(['.env', 'notebook.py']);
+	});
+
+	it('reports a path outside the root as its own relative path', () => {
+		const files: FileInfo[] = parseListFilesOutput('f\t1\t/elsewhere/x.py\0', '/work');
+		expect(files[0]?.relativePath).toBe('/elsewhere/x.py');
+	});
+
+	it('reads an empty listing as no files', () => {
+		expect(parseListFilesOutput('', '/work')).toEqual([]);
 	});
 });

@@ -5,7 +5,7 @@ import type { ArmadaConfig } from '../src/config.js';
 import type { PodExec, PodExecOptions, PodExecResult } from '../src/exec.js';
 import { ArmadaSandbox } from '../src/sandbox.js';
 import { shellQuote } from '../src/shell.js';
-import type { SandboxProcess } from '../src/types.js';
+import type { FileInfo, ListFilesResult, ReadFileResult, SandboxProcess } from '../src/types.js';
 
 const config: ArmadaConfig = readConfig({
 	ARMADA_URL: 'http://armada.example.com/',
@@ -242,5 +242,171 @@ describe('startProcess', () => {
 		const message: string = await rejection(started.waitForPort(2718, { timeout: 50 }));
 		expect(message).toContain('timed out waiting for port 2718');
 		expect(message).toContain('still starting');
+	});
+});
+
+/** What the pod's `base64` prints for `content`, wrapped at 76 columns as GNU does. */
+function base64Of(content: string | Uint8Array): string {
+	const encoded: string = Buffer.from(content).toString('base64');
+	return `${encoded.replace(/(.{76})/g, '$1\n')}\n`;
+}
+
+describe('readFile', () => {
+	it('decodes the base64 the pod printed and reports it as text', async () => {
+		const { sandbox, calls } = stubSandbox({
+			stdout: base64Of('print(1)\n'),
+			stderr: '',
+			exitCode: 0,
+		});
+		const result: ReadFileResult = await sandbox.readFile('/work/notebook.py');
+
+		expect(result).toEqual({ success: true, content: 'print(1)\n', encoding: 'utf-8' });
+		expect(calls[0]?.command[0]).toBe('sh');
+		// Not `sh -lc`: profile output on stdout would corrupt the base64.
+		expect(calls[0]?.command[1]).toBe('-c');
+		expect(calls[0]?.command[2]).toContain(`base64 < ${shellQuote('/work/notebook.py')}`);
+	});
+
+	it('joins the lines GNU base64 wrapped, for a file past 57 bytes', async () => {
+		const long: string = 'x'.repeat(200);
+		const { sandbox } = stubSandbox({ stdout: base64Of(long), stderr: '', exitCode: 0 });
+		const result: ReadFileResult = await sandbox.readFile('/work/long.txt');
+
+		expect(result.success && result.content).toBe(long);
+	});
+
+	it('returns bytes that are not UTF-8 as base64, so nothing is corrupted', async () => {
+		const bytes: Uint8Array = new Uint8Array([0, 159, 146, 150]);
+		const { sandbox } = stubSandbox({ stdout: base64Of(bytes), stderr: '', exitCode: 0 });
+		const result: ReadFileResult = await sandbox.readFile('/work/blob.bin');
+
+		expect(result).toEqual({
+			success: true,
+			content: Buffer.from(bytes).toString('base64'),
+			encoding: 'base64',
+		});
+		expect(result.success && Buffer.from(result.content, 'base64')).toEqual(Buffer.from(bytes));
+	});
+
+	it('keeps a byte order mark rather than swallowing it', async () => {
+		const withBom: Uint8Array = new Uint8Array([0xef, 0xbb, 0xbf, 0x61]);
+		const { sandbox } = stubSandbox({ stdout: base64Of(withBom), stderr: '', exitCode: 0 });
+		const result: ReadFileResult = await sandbox.readFile('/work/bom.txt');
+
+		expect(result.success && result.content).toBe('\ufeffa');
+	});
+
+	it('reads an empty file as empty text, not as a failure', async () => {
+		const { sandbox } = stubSandbox({ stdout: '', stderr: '', exitCode: 0 });
+		const result: ReadFileResult = await sandbox.readFile('/work/empty.py');
+
+		expect(result).toEqual({ success: true, content: '', encoding: 'utf-8' });
+	});
+
+	it('separates a path that is not there from one that cannot be read', async () => {
+		const { sandbox: absent } = stubSandbox({ stdout: '', stderr: '', exitCode: 44 });
+		expect(await absent.readFile('/work/missing.py')).toEqual({
+			success: false,
+			content: '',
+			error: { code: 'NOT_FOUND' },
+		});
+
+		const { sandbox: unreadable } = stubSandbox({
+			stdout: '',
+			stderr: 'Is a directory',
+			exitCode: 2,
+		});
+		expect(await unreadable.readFile('/work')).toEqual({
+			success: false,
+			content: '',
+			error: { code: 'READ_FAILED' },
+		});
+	});
+
+	it('reports a broken control channel as a backend error, never a throw', async () => {
+		const { sandbox } = stubSandbox(() => {
+			throw new Error('websocket closed');
+		});
+		expect(await sandbox.readFile('/work/notebook.py')).toEqual({
+			success: false,
+			content: '',
+			error: { code: 'BACKEND_ERROR' },
+		});
+	});
+
+	it('runs without the env prefix, which would print nothing but is not ours to parse', async () => {
+		const { sandbox, calls } = stubSandbox();
+		await sandbox.setEnvVars({ API_KEY: 'secret' });
+		await sandbox.readFile('/work/notebook.py');
+
+		expect(calls[0]?.command[2]?.startsWith('if [ -e ')).toBe(true);
+	});
+});
+
+describe('listFiles', () => {
+	it('parses the records find printed', async () => {
+		const { sandbox, calls } = stubSandbox({
+			stdout: 'f\t12\t/work/notebook.py\0d\t4096\t/work/data\0',
+			stderr: '',
+			exitCode: 0,
+		});
+		const result: ListFilesResult = await sandbox.listFiles('/work');
+
+		expect(result.success).toBe(true);
+		expect(result.files.map((file: FileInfo) => file.name)).toEqual(['notebook.py', 'data']);
+		expect(calls[0]?.command[1]).toBe('-c');
+	});
+
+	it('passes recursion through to find and hiding through to the parser', async () => {
+		const { sandbox, calls } = stubSandbox({
+			stdout: 'f\t1\t/work/.env\0',
+			stderr: '',
+			exitCode: 0,
+		});
+		const result: ListFilesResult = await sandbox.listFiles('/work', {
+			recursive: true,
+			includeHidden: true,
+		});
+
+		expect(calls[0]?.command[2]).not.toContain('-maxdepth');
+		expect(result.files.map((file: FileInfo) => file.name)).toEqual(['.env']);
+	});
+
+	it('reports a file as NOT_A_DIRECTORY, never as an empty directory', async () => {
+		const { sandbox } = stubSandbox({
+			stdout: '',
+			stderr: 'MARIMOHUB_NOT_A_DIRECTORY\n',
+			exitCode: 20,
+		});
+		expect(await sandbox.listFiles('/work/notebook.py')).toEqual({
+			success: false,
+			files: [],
+			error: { code: 'NOT_A_DIRECTORY' },
+		});
+	});
+
+	it('reports any other non-zero exit as a failed listing', async () => {
+		const { sandbox } = stubSandbox({ stdout: '', stderr: '', exitCode: 1 });
+		expect(await sandbox.listFiles('/work/missing')).toEqual({
+			success: false,
+			files: [],
+			error: { code: 'LIST_FAILED' },
+		});
+	});
+
+	it('reports a broken control channel as a backend error, never a throw', async () => {
+		const { sandbox } = stubSandbox(() => {
+			throw new Error('websocket closed');
+		});
+		expect(await sandbox.listFiles('/work')).toEqual({
+			success: false,
+			files: [],
+			error: { code: 'BACKEND_ERROR' },
+		});
+	});
+
+	it('reads an empty directory as a success with no files', async () => {
+		const { sandbox } = stubSandbox();
+		expect(await sandbox.listFiles('/work')).toEqual({ success: true, files: [] });
 	});
 });

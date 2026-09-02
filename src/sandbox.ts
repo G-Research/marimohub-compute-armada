@@ -2,7 +2,17 @@ import type { ArmadaClient, PodLocation, SubmittedJob } from './armada.js';
 import type { ArmadaConfig } from './config.js';
 import type { PodExec, PodExecOptions, PodExecResult } from './exec.js';
 import { buildPodSpec } from './podspec.js';
-import { assertEnvName, portWaitCommand, shellQuote, withEnvPrefix } from './shell.js';
+import {
+	assertEnvName,
+	listFilesCommand,
+	NOT_A_DIRECTORY_EXIT,
+	parseListFilesOutput,
+	portWaitCommand,
+	READ_FILE_NOT_FOUND_EXIT,
+	readFileCommand,
+	shellQuote,
+	withEnvPrefix,
+} from './shell.js';
 import type {
 	CreateSandboxOptions,
 	ExecOptions,
@@ -27,6 +37,20 @@ import type {
 const todo: (method: string) => never = (method: string) => {
 	throw new Error(`ArmadaSandbox.${method} is not implemented`);
 };
+
+/**
+ * The bytes as text, or undefined when they are not valid UTF-8, which is how
+ * `readFile` chooses what encoding to report. `ignoreBOM` keeps a leading BOM in
+ * the string (the flag means "do not treat it specially"), so a file that has
+ * one round-trips byte for byte.
+ */
+function decodeUtf8(bytes: Uint8Array): string | undefined {
+	try {
+		return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+	} catch {
+		return undefined;
+	}
+}
 
 /** Each write is one exec, so one websocket; cap how many are in flight. */
 const WRITE_CONCURRENCY = 8;
@@ -131,12 +155,73 @@ export class ArmadaSandbox implements SandboxInstance {
 		return todo('execStream');
 	}
 
-	async readFile(_path: string): Promise<ReadFileResult> {
-		return todo('readFile');
+	/**
+	 * Read one file back out of the pod.
+	 *
+	 * The bytes cross as base64 ({@link readFileCommand} says why) and the
+	 * encoding we report is decided from them: text is returned decoded, because
+	 * marimohub's `readSessionArtifacts` takes `content` and never looks at
+	 * `encoding`, and anything that is not valid UTF-8 is returned as base64,
+	 * which is what `proposalCapture` decodes. Reporting base64 unconditionally
+	 * would store base64 as the notebook source; reporting UTF-8 unconditionally
+	 * would corrupt an image the user changed.
+	 *
+	 * Unlike upstream, an absent path is `NOT_FOUND` rather than `READ_FAILED`.
+	 * Session capture reads four fixed paths of which some routinely do not
+	 * exist, so "never written" is the common answer and worth distinguishing
+	 * from "could not be read".
+	 */
+	async readFile(path: string): Promise<ReadFileResult> {
+		let result: PodExecResult;
+		try {
+			// No login shell and no env prefix: this stdout is a protocol value we
+			// parse, and profile scripts print to stdout.
+			result = await this.podExec.run(await this.location(), ['sh', '-c', readFileCommand(path)]);
+		} catch {
+			return { success: false, content: '', error: { code: 'BACKEND_ERROR' } };
+		}
+		if (result.exitCode === READ_FILE_NOT_FOUND_EXIT) {
+			return { success: false, content: '', error: { code: 'NOT_FOUND' } };
+		}
+		if (result.exitCode !== 0) {
+			return { success: false, content: '', error: { code: 'READ_FAILED' } };
+		}
+		// Re-encoded rather than passed through, because GNU base64 wraps its
+		// output at 76 columns and the decoders downstream take one line.
+		const bytes: Buffer = Buffer.from(result.stdout, 'base64');
+		const text: string | undefined = decodeUtf8(bytes);
+		return text === undefined
+			? { success: true, content: bytes.toString('base64'), encoding: 'base64' }
+			: { success: true, content: text, encoding: 'utf-8' };
 	}
 
-	async listFiles(_path: string, _options?: ListFilesOptions): Promise<ListFilesResult> {
-		return todo('listFiles');
+	/**
+	 * List a directory, which session capture uses to size the files it is about
+	 * to read and to enumerate a workspace.
+	 *
+	 * Also a non-login shell without the env prefix, for the reason `readFile`
+	 * has: the records are NUL-separated protocol output. This is where upstream
+	 * diverges from its own rule, running its `find` through the ordinary `exec`
+	 * path, where a profile script that prints anything corrupts the listing.
+	 */
+	async listFiles(path: string, options?: ListFilesOptions): Promise<ListFilesResult> {
+		let result: PodExecResult;
+		try {
+			result = await this.podExec.run(await this.location(), [
+				'sh',
+				'-c',
+				listFilesCommand(path, options),
+			]);
+		} catch {
+			return { success: false, files: [], error: { code: 'BACKEND_ERROR' } };
+		}
+		if (result.exitCode === NOT_A_DIRECTORY_EXIT) {
+			return { success: false, files: [], error: { code: 'NOT_A_DIRECTORY' } };
+		}
+		if (result.exitCode !== 0) {
+			return { success: false, files: [], error: { code: 'LIST_FAILED' } };
+		}
+		return { success: true, files: parseListFilesOutput(result.stdout, path, options) };
 	}
 
 	/**

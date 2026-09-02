@@ -228,15 +228,19 @@ the job and waits for it to run, the file and environment step goes in over exec
 (`writeFiles` streams each file through the pod's stdin; `setEnvVars` accumulates
 an export prefix for later commands), `startProcess` launches the kernel detached
 with `setsid` and waits for its port in-pod, and `exposePort` returns the address
-Armada assigned to the NodePort service, read from `JobIngressInfoEvent`.
+Armada assigned to the NodePort service, read from `JobIngressInfoEvent`. Session
+capture can also read back out: `readFile` returns a file as text or, for content
+that is not valid UTF-8, as base64, and `listFiles` lists a directory through
+`find`.
 
-Two gaps remain before a notebook is usable locally. The returned URL is
+One gap remains before a notebook is usable locally: the returned URL is
 `<node-ip>:<nodePort>` on the docker network, which a browser on the host cannot
 reach, so connecting to the kernel needs a route (or a real Ingress, which the
-adapter does not submit yet). And session capture at snapshot or teardown still
-hits stubs (`readFile`, `listFiles`). When a start does fail, the notebook shows
-a generic _"Sandbox compute backend is not available"_ with a Retry button; the
-real error is nested in the server log's `cause` field. Dig it out with:
+adapter does not submit yet). Beyond that, `execStream` and `gitCheckout` are
+still stubs, so a session that streams a command or loads from a repository hits
+`ArmadaSandbox.<method> is not implemented`. When a start does fail, the notebook
+shows a generic _"Sandbox compute backend is not available"_ with a Retry button;
+the real error is nested in the server log's `cause` field. Dig it out with:
 
 ```bash
 docker logs marimohub-armada 2>&1 | grep request_error | tail -1 | jq -r '.error.cause.message'

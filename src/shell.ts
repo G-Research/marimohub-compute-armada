@@ -5,6 +5,7 @@
  * like `src/types.ts`, so this adapter behaves the same as marimohub's own
  * pod-exec backends. Replace with an import once the packages are published.
  */
+import type { FileInfo } from './types.js';
 
 /**
  * Single-quote a value for safe interpolation into an `sh -c` string. An
@@ -82,3 +83,103 @@ export function assertEnvName(name: string): string {
 	}
 	return name;
 }
+
+/**
+ * Exit code the read probe uses for "the path is not there", so a caller can
+ * answer `NOT_FOUND` instead of the blanket `READ_FAILED` upstream returns.
+ * 44 is outside the range `base64` and `sh` produce themselves.
+ */
+export const READ_FILE_NOT_FOUND_EXIT = 44;
+
+/**
+ * Read a file as base64.
+ *
+ * Upstream's kubernetes adapter runs a plain `cat` and hands the exec's stdout
+ * back as text. Our exec channel decodes stdout with `toString('utf8')`, so a
+ * byte that is not valid UTF-8 would come back as U+FFFD: `writeFiles` takes
+ * care to carry bytes verbatim into the pod (decision 18) and a raw `cat` would
+ * quietly corrupt them on the way out. base64 is ASCII, so it survives the
+ * channel, and `readFile` decides from the bytes how to report them.
+ *
+ * The path is fed to `base64` by redirection rather than as an operand: a path
+ * beginning with `-` then needs no `--` support, which GNU coreutils has and
+ * busybox does not. A missing path exits {@link READ_FILE_NOT_FOUND_EXIT}; a
+ * directory or an unreadable file fails on the redirect, which is a read
+ * failure and not a missing file.
+ */
+export function readFileCommand(path: string): string {
+	const quoted: string = shellQuote(path);
+	return `if [ -e ${quoted} ] || [ -L ${quoted} ]; then base64 < ${quoted}; else exit ${String(READ_FILE_NOT_FOUND_EXIT)}; fi`;
+}
+
+/** Exit code the list probe uses for "it exists, it is not a directory". */
+export const NOT_A_DIRECTORY_EXIT = 20;
+
+/** Printed to stderr with {@link NOT_A_DIRECTORY_EXIT}, so an exec log says why. */
+export const NOT_A_DIRECTORY_MARKER = 'MARIMOHUB_NOT_A_DIRECTORY';
+
+/**
+ * List a directory as NUL-separated `type<TAB>size<TAB>path` records.
+ *
+ * The probe in front of the `find` is what lets `listFiles` tell "you listed a
+ * file" from "the listing failed": an empty success would otherwise look like
+ * an empty directory, which marimohub's compute contract explicitly rejects.
+ *
+ * `-printf` is GNU find, as it is upstream; busybox find has no equivalent.
+ * That is the same class of assumption as `setsid` in decision 19 and holds for
+ * any Debian-family kernel image.
+ */
+export function listFilesCommand(path: string, options?: { recursive?: boolean }): string {
+	const quoted: string = shellQuote(path);
+	const probe: string =
+		`if [ -d ${quoted} ]; then :; ` +
+		`elif [ -e ${quoted} ] || [ -L ${quoted} ]; then ` +
+		`printf '${NOT_A_DIRECTORY_MARKER}\\n' >&2; exit ${String(NOT_A_DIRECTORY_EXIT)}; ` +
+		`else exit 1; fi`;
+	const depth: string = options?.recursive === true ? '' : ' -maxdepth 1';
+	return `${probe}; find ${quoted} -mindepth 1${depth} -printf '%y\\t%s\\t%p\\0'`;
+}
+
+/** Parse the NUL-separated records {@link listFilesCommand} printed. */
+export function parseListFilesOutput(
+	stdout: string,
+	rootPath: string,
+	options?: { includeHidden?: boolean },
+): FileInfo[] {
+	const files: FileInfo[] = [];
+	for (const record of stdout.split('\0')) {
+		// `find` terminates every record with a NUL, so the split always leaves a
+		// trailing empty string, and an empty directory produces nothing else.
+		if (record === '') continue;
+		const [typeChar, size, ...pathParts] = record.split('\t');
+		// The path is the last field, so one containing a tab rejoins intact.
+		const absolutePath: string = pathParts.join('\t');
+		// A record with no path field is not something `-printf '%y\t%s\t%p'` can
+		// produce; it means the output was truncated or something else wrote to
+		// stdout, and a `FileInfo` cannot be built without a path anyway.
+		if (absolutePath === '') continue;
+		const name: string = absolutePath.slice(absolutePath.lastIndexOf('/') + 1);
+		// Hiding is done here rather than in the `find` expression, so `-prune`
+		// never stops the walk: a recursive listing still descends into a dot
+		// directory and reports its non-dot children, which is what upstream does
+		// and what `readSessionArtifacts` needs for `__marimo__` trees.
+		if (options?.includeHidden !== true && name.startsWith('.')) continue;
+		files.push({
+			name,
+			absolutePath,
+			relativePath: absolutePath.startsWith(rootPath)
+				? absolutePath.slice(rootPath.length).replace(/^\//, '')
+				: absolutePath,
+			type: FILE_TYPES[typeChar ?? ''] ?? 'other',
+			size: Number(size) || 0,
+		});
+	}
+	return files;
+}
+
+/** `find -printf '%y'` type characters we name; everything else is `other`. */
+const FILE_TYPES: Record<string, FileInfo['type']> = {
+	f: 'file',
+	d: 'directory',
+	l: 'symlink',
+};
