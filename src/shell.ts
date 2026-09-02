@@ -85,6 +85,22 @@ export function assertEnvName(name: string): string {
 }
 
 /**
+ * Build a `git clone` command, upstream's `buildGitCloneCommand` verbatim: the
+ * repo, branch and target are all {@link shellQuote}d, closing the injection
+ * hole that interpolating them raw would open, and the target defaults to `.`,
+ * the working directory the caller is already in.
+ */
+export function gitCloneCommand(
+	repo: string,
+	options?: { branch?: string; targetDir?: string },
+): string {
+	const parts: string[] = ['git', 'clone'];
+	if (options?.branch !== undefined) parts.push('--branch', shellQuote(options.branch));
+	parts.push(shellQuote(repo), shellQuote(options?.targetDir ?? '.'));
+	return parts.join(' ');
+}
+
+/**
  * Exit code the read probe uses for "the path is not there", so a caller can
  * answer `NOT_FOUND` instead of the blanket `READ_FAILED` upstream returns.
  * 44 is outside the range `base64` and `sh` produce themselves.

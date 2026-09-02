@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import {
 	assertEnvName,
+	gitCloneCommand,
 	killGroupCommand,
 	listFilesCommand,
 	parseListFilesOutput,
@@ -77,6 +78,24 @@ describe('env names', () => {
 		expect(() => assertEnvName('1BAD')).toThrow('Invalid environment variable name');
 		expect(() => assertEnvName('A B')).toThrow('"A B"');
 		expect(() => assertEnvName('X;rm -rf /')).toThrow('Invalid environment variable name');
+	});
+});
+
+describe('git clone command', () => {
+	it('clones into the working directory when no target is given', () => {
+		expect(gitCloneCommand('https://x/y')).toBe("git clone 'https://x/y' '.'");
+	});
+
+	it('includes the branch flag when given', () => {
+		expect(gitCloneCommand('https://x/y', { branch: 'main', targetDir: 'w' })).toBe(
+			"git clone --branch 'main' 'https://x/y' 'w'",
+		);
+	});
+
+	it('quotes every interpolated argument, so nothing injects', () => {
+		expect(gitCloneCommand('https://x/y; rm -rf /', { targetDir: '$(touch pwn)' })).toBe(
+			"git clone 'https://x/y; rm -rf /' '$(touch pwn)'",
+		);
 	});
 });
 

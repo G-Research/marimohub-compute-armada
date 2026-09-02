@@ -163,6 +163,14 @@ docker build -t marimo-sandbox:local path/to/marimohub/examples/sandbox-image
 kind load docker-image marimo-sandbox:local --name armada
 ```
 
+If you bring your own image instead, the adapter assumes it provides `/bin/sh`,
+`python3`, `git`, GNU `find` and util-linux `setsid` (with `--wait`), and never
+probes for them: a missing one surfaces as that command's own failure. The
+example image has all five (verified, git 2.47.3). A Debian-family base covers
+the shell, `find` and `setsid`, but `python3` and `git` come from the image
+build: `python:*-slim` ships one and not the other, and busybox-based images
+lack the GNU specifics entirely (see ARMADA-REVIEW.md, decision 22).
+
 ### 3. Check that placement works
 
 Before involving marimohub, submit one job the way the adapter does:
@@ -234,14 +242,14 @@ Armada assigned to the NodePort service, read from `JobIngressInfoEvent`. Sessio
 capture can also read back out: `readFile` returns a file as text or, for content
 that is not valid UTF-8, as base64, and `listFiles` lists a directory through
 `find`. `execStream` streams a command's stdout as it is produced, and cancelling
-the stream kills the command's process group.
+the stream kills the command's process group. `gitCheckout` clones a repository
+through the same exec path, so a session that loads from a repository works too
+(provided the kernel image ships `git`).
 
 One gap remains before a notebook is usable locally: the returned URL is
 `<node-ip>:<nodePort>` on the docker network, which a browser on the host cannot
 reach, so connecting to the kernel needs a route (or a real Ingress, which the
-adapter does not submit yet). Beyond that, `gitCheckout` is still a stub, so a
-session that loads from a repository hits
-`ArmadaSandbox.gitCheckout is not implemented`. When a start does fail, the notebook
+adapter does not submit yet). When a start does fail, the notebook
 shows a generic _"Sandbox compute backend is not available"_ with a Retry button;
 the real error is nested in the server log's `cause` field. Dig it out with:
 

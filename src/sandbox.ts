@@ -5,6 +5,7 @@ import { buildPodSpec } from './podspec.js';
 import type { GhostSweeper } from './sweeper.js';
 import {
 	assertEnvName,
+	gitCloneCommand,
 	killGroupCommand,
 	listFilesCommand,
 	parseSweptGroups,
@@ -39,10 +40,6 @@ import type {
 	StartProcessOptions,
 	WaitForPortOptions,
 } from './types.js';
-
-const todo: (method: string) => never = (method: string) => {
-	throw new Error(`ArmadaSandbox.${method} is not implemented`);
-};
 
 /**
  * The bytes as text, or undefined when they are not valid UTF-8, which is how
@@ -479,8 +476,16 @@ export class ArmadaSandbox implements SandboxInstance {
 		}
 	}
 
-	async gitCheckout(_repo: string, _options?: GitCheckoutOptions): Promise<void> {
-		return todo('gitCheckout');
+	/**
+	 * Clone a repository, upstream's one-liner: build a quoted `git clone` and
+	 * run it through the ordinary `exec` path. That path is what gives it a login
+	 * shell (a `git` a profile script put on PATH is found), the accumulated env
+	 * (credential helpers read variables), and a process group the sweep can kill
+	 * if the clone is abandoned mid-transfer.
+	 */
+	async gitCheckout(repo: string, options?: GitCheckoutOptions): Promise<void> {
+		const result: ExecResult = await this.exec(gitCloneCommand(repo, options));
+		if (!result.success) throw new Error(`git checkout failed: ${result.stderr}`);
 	}
 
 	/** Remembered, not sent anywhere: the pod sees these on the next command. */

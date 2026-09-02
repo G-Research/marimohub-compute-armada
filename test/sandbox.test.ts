@@ -465,6 +465,39 @@ describe('exec', () => {
 	});
 });
 
+describe('gitCheckout', () => {
+	it('runs the quoted clone through the ordinary exec path', async () => {
+		const { sandbox, calls } = stubSandbox();
+		await sandbox.setEnvVars({ GIT_TOKEN: 'secret' });
+		await sandbox.gitCheckout('https://x/y', { branch: 'main', targetDir: 'w' });
+
+		// A login shell with the env prefix: git and its credential helpers see
+		// what any other user command sees.
+		expect(calls[0]?.command.slice(2, 4)).toEqual(['sh', '-lc']);
+		expect(scriptOf(calls[0])).toBe(
+			"export GIT_TOKEN='secret'; git clone --branch 'main' 'https://x/y' 'w'",
+		);
+	});
+
+	it('quotes a hostile repo and target, so nothing injects', async () => {
+		const { sandbox, calls } = stubSandbox();
+		await sandbox.gitCheckout('https://x/y; rm -rf /', { targetDir: '$(touch pwn)' });
+
+		expect(scriptOf(calls[0])).toBe("git clone 'https://x/y; rm -rf /' '$(touch pwn)'");
+	});
+
+	it('throws with stderr when the clone fails', async () => {
+		const { sandbox } = stubSandbox({
+			stdout: '',
+			stderr: "fatal: repository 'https://x/y' not found",
+			exitCode: 128,
+		});
+		expect(await rejection(sandbox.gitCheckout('https://x/y'))).toContain(
+			"git checkout failed: fatal: repository 'https://x/y' not found",
+		);
+	});
+});
+
 /** Everything a stream yields, decoded. */
 async function collect(stream: ReadableStream): Promise<string> {
 	return new Response(stream).text();

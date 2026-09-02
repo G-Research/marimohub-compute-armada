@@ -7,8 +7,9 @@ Armada and does not know this repo.
 The adapter partially works. The whole provision sequence is implemented and verified
 against a real local Armada: placement (submit, wait for running, cancel), exec into the
 placed pod, file writes, env vars, detached process launch, the exposed-port URL from
-Armada's ingress event, reading files and directories back out, and streaming a command's
-output. Still stubs that throw: `gitCheckout`, plus `listActive` on the client.
+Armada's ingress event, reading files and directories back out, streaming a command's
+output, and cloning a repository. The one remaining stub that throws is `listActive` on
+the client.
 
 Every claim below is cited against the Armada source at `v0.22.7`, which is the release
 pinned in `.armada-version`, in the form `path:line`. Where we had open questions earlier,
@@ -398,10 +399,13 @@ A kernel image without it fails at the first exec with the API server's own "exe
 not found in $PATH", wrapped with the pod, cluster and command by `execFailure`
 (`src/exec.ts`), so the diagnosis is immediate rather than mysterious.
 
-The narrower assumptions are the ones to watch, and they are all GNU or util-linux specifics
-that busybox lacks: `find -printf` (decision 21), `setsid` and its `--wait` flag
-(decisions 19 and 23). `base64` (decision 21) exists in both coreutils and busybox, and `python3` (decision 19) is definitional for a
-Python kernel image.
+The narrower assumptions are the ones to watch. Most are GNU or util-linux specifics that
+busybox lacks: `find -printf` (decision 21), `setsid` and its `--wait` flag (decisions 19
+and 23). `base64` (decision 21) exists in both coreutils and busybox, and `python3`
+(decision 19) is definitional for a Python kernel image. `git` (decision 26) is the one
+that is a whole package rather than a flag: `python:*-slim` does not ship it, so a kernel
+image built from scratch must install it or sessions that load from a repository fail at
+`gitCheckout`.
 
 Note what this rules out: the adapter probes for no capability anywhere. It never asks
 whether `setsid` exists or whether the interpreter is `python3` or `python`; it assumes, and
@@ -610,6 +614,26 @@ process state too, so a zombie left by a PID 1 that never reaps (decision 19) is
 distinguishable from something still running. A healthy run kills the planted group and finds
 no live strays.
 
+### 26. `gitCheckout` is a quoted clone through the ordinary `exec`
+
+Upstream's one-liner, transcribed: build `git clone --branch 'b' 'repo' 'target'` with every
+argument shell-quoted (`buildGitCloneCommand` in `@marimo-hub/compute-commons`; its comment
+records that the quoting closed a real injection hole), run it through the sandbox's own
+`exec`, and throw `git checkout failed: <stderr>` on a non-zero exit. The target defaults to
+`.`, the pod's working directory.
+
+Going through `exec` rather than a bespoke pod command is the point, because of what that
+path now carries (decisions 22 to 25): a login shell, so a `git` that a profile script put on
+PATH is found; the accumulated env prefix, so a credential helper reading a token variable
+set through `setEnvVars` works; and a process group with a `.pgid` file, so a clone abandoned
+mid-transfer (marimohub restarts, the socket drops) is killed by the sweep instead of
+fetching into a dead directory for the rest of the session.
+
+`git` itself is assumed, not probed, per decision 22's rule, and it is a real assumption:
+`python:*-slim` does not ship git, so this leans on the kernel image providing it, the same
+way upstream's kubernetes adapter does. A missing git fails the clone with sh's own
+"git: not found" in the thrown stderr, so the diagnosis is immediate.
+
 ## Constraints on the first submit
 
 Collected from `internal/server/submit/validation/submit_request.go` so the first real submit
@@ -708,6 +732,10 @@ Verified:
   stdout, stderr and exit status through the `setsid` wrapper, a timed-out loop is dead
   three seconds later rather than still ticking, no group files are left behind, and the
   ghost check reports an empty pod.
+- `gitCheckout` against a real pod: a public repo cloned with a branch and target
+  directory, the cloned README read back through `readFile` and the checked-out branch
+  confirmed in-pod, and a nonexistent repo surfacing as a thrown
+  `git checkout failed: fatal: ...`. The local kernel image ships git 2.47.3.
 - The sweep (decision 25) against a real pod, through `bun run smoke`: a timed-out command
   and a cancelled stream leave nothing behind, a deliberately planted group that nothing is
   waiting on is killed by the sweep and reported (`killed 1 abandoned process group(s)`),
@@ -718,7 +746,7 @@ Assumed, not verified:
 
 - That exec works from inside the marimohub container rather than from the host; the kind
   API server certificate makes that route non-obvious (see README).
-- That the kernel image provides `/bin/sh`, GNU `find` and `setsid` with `--wait`. Verified
+- That the kernel image provides `/bin/sh`, GNU `find`, `git` and `setsid` with `--wait`. Verified
   only against the local `marimo-sandbox:local` image, which is Debian-family; see decision 22.
 - That an interactive session survives normal scheduling behaviour once decisions 7 to 9 are
   applied.
@@ -727,14 +755,14 @@ Assumed, not verified:
 
 ## Where to look in the code
 
-| Path                          | What it is                                                                                    |
-| ----------------------------- | --------------------------------------------------------------------------------------------- |
-| `src/types.ts`                | marimohub's adapter interface, transcribed by hand. Not ours to change.                       |
-| `src/armada.ts`               | Placement: submit, watch, ingress address, cancel. `listActive` stubbed.                      |
-| `src/exec.ts`                 | Control channel: exec into a located pod, buffered or streamed.                               |
-| `src/shell.ts`                | Quoting, env prefix, port waiter, read and list commands, transcribed from `compute-commons`. |
-| `src/sweeper.ts`              | The provider's one ghost sweeper: registration, cap, timer.                                   |
-| `src/sandbox.ts`              | One kernel session. Everything below `exec` is ordinary shell commands.                       |
-| `src/armada-types.ts`         | Hand-written Armada wire types, with the reasoning in the header.                             |
-| `scripts/check-armada-api.ts` | The contract check that keeps those types honest.                                             |
-| `README.md`                   | How to run the whole thing locally, and what failure looks like today.                        |
+| Path                          | What it is                                                                               |
+| ----------------------------- | ---------------------------------------------------------------------------------------- |
+| `src/types.ts`                | marimohub's adapter interface, transcribed by hand. Not ours to change.                  |
+| `src/armada.ts`               | Placement: submit, watch, ingress address, cancel. `listActive` stubbed.                 |
+| `src/exec.ts`                 | Control channel: exec into a located pod, buffered or streamed.                          |
+| `src/shell.ts`                | Quoting, env prefix, port waiter, read, list and clone commands, from `compute-commons`. |
+| `src/sweeper.ts`              | The provider's one ghost sweeper: registration, cap, timer.                              |
+| `src/sandbox.ts`              | One kernel session. Everything below `exec` is ordinary shell commands.                  |
+| `src/armada-types.ts`         | Hand-written Armada wire types, with the reasoning in the header.                        |
+| `scripts/check-armada-api.ts` | The contract check that keeps those types honest.                                        |
+| `README.md`                   | How to run the whole thing locally, and what failure looks like today.                   |
