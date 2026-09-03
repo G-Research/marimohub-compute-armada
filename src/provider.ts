@@ -4,13 +4,8 @@ import type { ArmadaConfig } from './config.js';
 import { PodExec } from './exec.js';
 import { ArmadaSandbox } from './sandbox.js';
 import { GhostSweeper } from './sweeper.js';
-import type { CreateSandboxOptions, SandboxId, SandboxProvider } from './types.js';
+import type { ActiveSandbox, CreateSandboxOptions, SandboxId, SandboxProvider } from './types.js';
 
-/**
- * `listActive` is deliberately absent: marimohub treats the optional members of
- * `SandboxProvider` as capability flags, so declaring one we cannot answer is
- * worse than not having it. Add it back with the reconciler that needs it.
- */
 export class ArmadaCompute implements SandboxProvider {
 	private readonly armada: ArmadaClient;
 	private readonly podExec: PodExec;
@@ -21,10 +16,21 @@ export class ArmadaCompute implements SandboxProvider {
 	 */
 	private readonly sweeper: GhostSweeper;
 
+	/**
+	 * Present only when `ARMADA_LOOKOUT_URL` is configured, because marimohub
+	 * treats the optional members of `SandboxProvider` as capability flags:
+	 * declaring a `listActive` we cannot answer would make every reconciliation
+	 * sweep fail, where its absence makes reconciliation a clean no-op.
+	 */
+	readonly listActive?: () => Promise<ActiveSandbox[]>;
+
 	constructor(private readonly config: ArmadaConfig) {
 		this.armada = new ArmadaClient(config);
 		this.podExec = new PodExec(new ClusterAccess(config.kubeconfigPattern));
 		this.sweeper = new GhostSweeper(config.ghostSweepSeconds * 1000);
+		if (config.lookoutUrl !== undefined) {
+			this.listActive = async (): Promise<ActiveSandbox[]> => this.armada.listActive();
+		}
 	}
 
 	create(id: SandboxId, options?: CreateSandboxOptions): ArmadaSandbox {

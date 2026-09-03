@@ -55,6 +55,7 @@ function stubSandbox(
 ): {
 	sandbox: ArmadaSandbox;
 	calls: ExecCall[];
+	cancelled: string[];
 } {
 	const settings: ArmadaConfig =
 		Object.keys(env).length === 0
@@ -66,11 +67,18 @@ function stubSandbox(
 					...env,
 				});
 	const calls: ExecCall[] = [];
+	const cancelled: string[] = [];
 	// oxlint-disable-next-line no-unsafe-type-assertion -- a stub of a class with private fields; structural typing cannot satisfy it
 	const armada: ArmadaClient = {
 		submit: async () => ({ jobId: 'job-1', jobSetId: 'set-1' }),
 		waitForRunning: async () => pod,
 		ingressAddress: async (_job: unknown, port: number) => `172.18.0.3:${String(30000 + port)}`,
+		cancel: async (job: { jobId: string }) => {
+			cancelled.push(`job:${job.jobId}`);
+		},
+		cancelSet: async (jobSetId: string) => {
+			cancelled.push(`set:${jobSetId}`);
+		},
 	} as unknown as ArmadaClient;
 	// oxlint-disable-next-line no-unsafe-type-assertion -- a stub of a class with private fields; structural typing cannot satisfy it
 	const podExec: PodExec = {
@@ -101,8 +109,26 @@ function stubSandbox(
 			});
 		},
 	} as unknown as PodExec;
-	return { sandbox: new ArmadaSandbox('sandbox-1', settings, armada, podExec), calls };
+	return { sandbox: new ArmadaSandbox('sandbox-1', settings, armada, podExec), calls, cancelled };
 }
+
+describe('destroy', () => {
+	it('cancels the submitted job when this process submitted it', async () => {
+		const { sandbox, cancelled } = stubSandbox();
+		await sandbox.exec('echo hi'); // forces ready(), so a job exists
+		await sandbox.destroy();
+
+		expect(cancelled).toEqual(['job:job-1']);
+	});
+
+	it('cancels by job set when addressed by id alone, as the reconciler does', async () => {
+		const { sandbox, cancelled } = stubSandbox();
+		await sandbox.destroy();
+
+		// The job set id is the sandbox id, so no job lookup is needed.
+		expect(cancelled).toEqual(['set:sandbox-1']);
+	});
+});
 
 describe('writeFiles', () => {
 	it('creates the parent and streams content over stdin, never the command line', async () => {

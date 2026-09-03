@@ -187,3 +187,63 @@ export type JobState =
 	| 'PREEMPTED'
 	| 'CANCELLED'
 	| 'REJECTED';
+
+/*
+ * Lookout's job-query API, a separate service from the Armada server with its
+ * own spec (`internal/lookout/swagger.yaml` in the Armada repo, not
+ * `api.swagger.json`). It exists here because enumeration is the one question
+ * the server cannot answer: Lookout is the component that aggregates jobs
+ * across every executor cluster, which is why its UI can list them and the
+ * server API cannot. The contract check verifies these fields against the
+ * swagger at the pinned release, like everything above.
+ */
+
+/** One predicate of `POST /api/v1/jobs` (`definitions.filter`). */
+export interface LookoutFilter {
+	field: string;
+	/** The swagger says `object`; in practice a scalar, or an array for `anyOf`. */
+	value: string | number | string[];
+	match:
+		| 'exact'
+		| 'anyOf'
+		| 'startsWith'
+		| 'contains'
+		| 'greaterThan'
+		| 'lessThan'
+		| 'greaterThanOrEqualTo'
+		| 'lessThanOrEqualTo'
+		| 'exists';
+	/** Match `field` against the job's annotations instead of its columns. */
+	isAnnotation?: boolean;
+}
+
+/** `definitions.order` */
+export interface LookoutOrder {
+	field: string;
+	direction: 'ASC' | 'DESC';
+}
+
+/** `POST /api/v1/jobs` request body. */
+export interface LookoutGetJobsRequest {
+	filters: LookoutFilter[];
+	order: LookoutOrder;
+	/** First elements to skip, for pagination. */
+	skip: number;
+	/** Page size. */
+	take: number;
+}
+
+/** The fields of `definitions.job` we read; the response carries many more. */
+export interface LookoutJob {
+	jobId?: string;
+	/** Our job set id is the sandbox id, so this is how a job names its sandbox. */
+	jobSet?: string;
+	state?: string;
+	/** RFC 3339 submission time. */
+	submitted?: string;
+}
+
+/** `POST /api/v1/jobs` response body. */
+export interface LookoutGetJobsResponse {
+	jobs?: LookoutJob[];
+}

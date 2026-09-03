@@ -564,11 +564,18 @@ export class ArmadaSandbox implements SandboxInstance {
 		return { url: address.includes('://') ? address : `http://${address}` };
 	}
 
-	/** Cancelling the job deletes the pod and every object Armada created with it. */
+	/**
+	 * Cancelling the job deletes the pod and every object Armada created with it.
+	 *
+	 * A sandbox the reconciler addresses by id alone has no `job` in this
+	 * process, but the job set id is the sandbox id, so cancelling the set
+	 * reaches the job without a lookup. That also covers a sandbox that was
+	 * never submitted at all: cancelling an empty set is a no-op.
+	 */
 	async destroy(): Promise<void> {
 		this.sweeper?.remove(this);
-		if (this.job === undefined) return;
-		await this.armada.cancel(this.job);
+		if (this.job === undefined) await this.armada.cancelSet(this.id);
+		else await this.armada.cancel(this.job);
 		this.pod = undefined;
 	}
 }
