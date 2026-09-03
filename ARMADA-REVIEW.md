@@ -4,6 +4,25 @@ This document records every design decision behind `marimohub-compute-armada`, t
 for it, and what is still a judgement call. It is meant to be read by someone who knows
 Armada and does not know this repo.
 
+Underneath every decision sits the one question we want answered more than any other:
+**is this a sensible use of Armada, or are we abusing it?** Long-lived, exec-controlled,
+mostly idle interactive jobs, one job set per session, a single queue today. Our position is
+that it is sensible, and the evidence exists to earn that position rather than assume it. If
+you read nothing else, read [The central bet](#the-central-bet) and
+[Still open](#still-open): the five judgement calls there are the ones we cannot settle
+without you, and the twenty-seven decisions exist to support them. They are written to be
+checked, not taken on faith.
+
+Marimohub questions will come up, and they are out of scope here: this document explains the
+Armada side of the seam and only summarizes what marimohub needs from it. marimohub is open
+source at `https://github.com/marimo-team/marimohub`; clone it, check out the 0.3.12 release
+the interface was transcribed from, and the citations of the form `packages/...` point into
+it. When a question is about marimohub's side (what the provisioner does between `create` and
+`ready`, why the reconciler destroys what `listActive` returns, what happens when a user stops
+a kernel), do not answer it from this document: run an agentic session with that checkout in
+reach and let it read the source, the same way this document's Armada claims were answered
+by reading Armada's.
+
 The adapter covers marimohub's whole interface. The provision sequence is implemented and
 verified against a real local Armada: placement (submit, wait for running, cancel), exec
 into the placed pod, file writes, env vars, detached process launch, the exposed-port URL
@@ -16,6 +35,13 @@ Every claim below is cited against the Armada source at `v0.22.7`, which is the 
 pinned in `.armada-version`, in the form `path:line`. Where we had open questions earlier,
 they were answered by reading that source rather than by guessing, and the decision that
 follows is recorded with them.
+
+How this text exists matters too: it was written with heavy AI assistance, as was the adapter
+itself. The Armada claims were gathered by agents reading the pinned release, not quoted from
+human experience. We say so to calibrate trust correctly: a wrong citation is a bug to
+report, not a memory to argue with, and the same machinery serves your review in reverse,
+because marimohub-side questions can be answered by an agent reading that checkout, as
+described above.
 
 ## What this is
 
@@ -265,7 +291,7 @@ that will drift silently.
 
 marimohub ships its own pod-exec backend (`packages/compute-kubernetes`), which is the same
 control channel we use, so its semantics are the reference rather than something to invent.
-A local marimohub checkout is assumed at `~/Projects/marimohub`; `src/shell.ts` transcribes
+A local marimohub checkout is assumed (the introduction says where it lives); `src/shell.ts` transcribes
 the helpers from `@marimo-hub/compute-commons` the way `src/types.ts` transcribes the ports.
 
 - `writeFiles` is one exec per file, `mkdir -p` for the parent plus `cat > path`, with the
@@ -742,6 +768,14 @@ These are judgement calls, not missing homework.
    `ARMADA_LOOKOUT_URL` is unset), add a list call to binoculars upstream, or wait for
    Armada to grow a first-class enumeration call. Also worth asking: is your Lookout meant
    to be called server-to-server at all, auth included?
+5. **Is a churn of one-job job sets a reasonable footprint for the server and Lookout?**
+   Every kernel session is its own job set (decision 4), created and cancelled continuously
+   as users open and close notebooks, and `listActive` pages Lookout on every reconciliation
+   sweep (decision 27). Nothing in the API surface suggests either minds, but event
+   retention and storage per job set, and whatever Lookout does with a growing population of
+   terminal one-job sets, are operational matters we cannot see from here. Is there a scale
+   at which this shape becomes an anti-pattern, and is there server-side tuning (event
+   retention, expiry) an operator should set for it?
 
 ## What has been verified
 
@@ -838,3 +872,9 @@ Assumed, not verified:
 | `src/armada-types.ts`         | Hand-written Armada wire types, with the reasoning in the header.                        |
 | `scripts/check-armada-api.ts` | The contract check that keeps those types honest.                                        |
 | `README.md`                   | How to run the whole thing locally, and what failure looks like today.                   |
+
+One path is deliberately absent from the table: marimohub itself, cloned from the URL in the
+introduction. Its provisioner, reconciler, compute contract and kubernetes adapter
+are the other half of most claims above, and `src/types.ts` and `src/shell.ts` are
+transcriptions of its code. Questions about that half are best answered in that checkout,
+with an agent doing the reading (see the introduction).
