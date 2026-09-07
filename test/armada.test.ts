@@ -4,13 +4,17 @@ import type { PodLocation, SubmittedJob } from '../src/armada.js';
 import { readConfig } from '../src/config.js';
 import type { ArmadaConfig } from '../src/config.js';
 import { buildPodSpec } from '../src/podspec.js';
+import type { AgentSpec } from '../src/podspec.js';
 import type { ActiveSandbox } from '../src/types.js';
+
+const agent: AgentSpec = { tokenSha256: 'ab'.repeat(32) };
 
 const config: ArmadaConfig = readConfig({
 	ARMADA_URL: 'http://armada.example.com/',
 	ARMADA_QUEUE: 'marimohub',
 	ARMADA_NAMESPACE: 'kernels',
 	MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
+	ARMADA_AGENT_IMAGE: 'ghcr.io/example/kernel-agent:1',
 	ARMADA_AUTH_TOKEN: 'secret',
 });
 
@@ -71,7 +75,7 @@ describe('submit', () => {
 
 		const job: SubmittedJob = await new ArmadaClient(config).submit(
 			'sandbox-7',
-			buildPodSpec(config),
+			buildPodSpec(config, agent),
 		);
 
 		expect(job).toEqual({ jobId: 'job-1', jobSetId: 'sandbox-7' });
@@ -88,7 +92,8 @@ describe('submit', () => {
 					namespace: 'kernels',
 					// A retried kernel would be an empty process wearing the session's name.
 					annotations: { 'armadaproject.io/failFast': 'true' },
-					services: [{ type: 'NodePort', ports: [config.port] }],
+					// The kernel's port and the agent's, so the address event carries both.
+					services: [{ type: 'NodePort', ports: [config.port, config.agentPort] }],
 				},
 			],
 		});
@@ -98,7 +103,7 @@ describe('submit', () => {
 		stubFetch(Response.json({ jobResponseItems: [{ error: 'queue does not exist' }] }));
 
 		const message: string = await rejection(
-			new ArmadaClient(config).submit('s', buildPodSpec(config)),
+			new ArmadaClient(config).submit('s', buildPodSpec(config, agent)),
 		);
 		expect(message).toContain('queue does not exist');
 	});
@@ -107,7 +112,7 @@ describe('submit', () => {
 		stubFetch(new Response('no such queue', { status: 404 }));
 
 		const message: string = await rejection(
-			new ArmadaClient(config).submit('s', buildPodSpec(config)),
+			new ArmadaClient(config).submit('s', buildPodSpec(config, agent)),
 		);
 		expect(message).toContain('(404): no such queue');
 	});
@@ -305,6 +310,7 @@ const lookoutConfig: ArmadaConfig = readConfig({
 	ARMADA_QUEUE: 'marimohub',
 	ARMADA_LOOKOUT_URL: 'http://lookout.example.com',
 	MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
+	ARMADA_AGENT_IMAGE: 'ghcr.io/example/kernel-agent:1',
 });
 
 /** A full-or-partial Lookout page of jobs, for the pagination test. */

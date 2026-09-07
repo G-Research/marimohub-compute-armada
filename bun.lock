@@ -4,10 +4,8 @@
   "workspaces": {
     "": {
       "name": "marimohub-compute-armada",
-      "dependencies": {
-        "@kubernetes/client-node": "^2.0.0",
-      },
       "devDependencies": {
+        "@kubernetes/client-node": "^2.0.0",
         "@nojaf/oxlint-plugin-annotate-non-primitives": "^0.1.1",
         "@types/bun": "^1.4.0",
         "@types/node": "^24",

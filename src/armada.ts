@@ -25,6 +25,7 @@ import type {
 import { authorizationHeader } from './auth.js';
 import type { ArmadaConfig } from './config.js';
 import { readNdjson } from './ndjson.js';
+import { exposedPorts } from './podspec.js';
 import type { ActiveSandbox, SandboxId } from './types.js';
 
 /** Where a running job's pod lives, from `JobRunningEvent`. */
@@ -113,7 +114,7 @@ export class ArmadaClient {
 					// that are not marimohub's, and enumeration feeds a reconciler that
 					// destroys what it does not recognise, so only marked jobs may appear.
 					annotations: { 'armadaproject.io/failFast': 'true', [SANDBOX_MARK]: 'true' },
-					services: [{ type: 'NodePort', ports: [this.config.port] }],
+					services: [{ type: 'NodePort', ports: exposedPorts(podSpec) }],
 				},
 			],
 		};

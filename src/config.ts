@@ -23,11 +23,13 @@ export interface ArmadaConfig {
 	/** Port marimo serves on inside the pod. */
 	port: number;
 	/**
-	 * Where to find Kubernetes credentials for the cluster a job landed on, with
-	 * `{CLUSTER_ID}` replaced by the id Armada reports. Unset means the ambient
-	 * config: the in-cluster service account, or `~/.kube/config` outside one.
+	 * Image of the kernel agent, which an init container copies into the kernel
+	 * container (AGENT-DESIGN.md). Required: there is no public default yet, and
+	 * a wrong guess would fail at the first session rather than at startup.
 	 */
-	kubeconfigPattern?: string | undefined;
+	agentImage: string;
+	/** Port the agent listens on inside the pod, exposed next to the kernel's. */
+	agentPort: number;
 	/**
 	 * Hard cap on one session, submitted as `activeDeadlineSeconds`. Armada gives
 	 * any pod without one the server default, 72 hours as shipped, so a kernel must
@@ -191,7 +193,7 @@ export function readConfig(
 	const image: string | undefined = required(env, 'MARIMOHUB_COMPUTE_IMAGE').split(',')[0]?.trim();
 	if (!image) throw new Error('MARIMOHUB_COMPUTE_IMAGE must contain at least one image');
 
-	return {
+	const config: ArmadaConfig = {
 		url: requiredUrl(env, 'ARMADA_URL'),
 		queue: required(env, 'ARMADA_QUEUE'),
 		namespace: env.ARMADA_NAMESPACE ?? 'default',
@@ -199,7 +201,8 @@ export function readConfig(
 		image,
 		sandboxHostname: env.MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME,
 		port: optionalPort(env, 'ARMADA_KERNEL_PORT', 2718),
-		kubeconfigPattern: env.ARMADA_KUBECONFIG_PATTERN,
+		agentImage: required(env, 'ARMADA_AGENT_IMAGE'),
+		agentPort: optionalPort(env, 'ARMADA_AGENT_PORT', 8718),
 		lookoutUrl: optionalUrl(env, 'ARMADA_LOOKOUT_URL'),
 		maxLifetimeSeconds:
 			compute?.sessionMaxLifetimeSeconds ??
@@ -218,4 +221,10 @@ export function readConfig(
 		),
 		auth: readAuth(env),
 	};
+	if (config.agentPort === config.port) {
+		throw new Error(
+			`ARMADA_AGENT_PORT and ARMADA_KERNEL_PORT are both ${String(config.port)}; the agent and the kernel each need a port`,
+		);
+	}
+	return config;
 }

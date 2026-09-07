@@ -201,15 +201,17 @@ const FILE_TYPES: Record<string, FileInfo['type']> = {
 };
 
 /**
- * Argv that runs `script` in a login shell in its own process group, recording
- * that group's id in `groupFile`.
+ * Argv that runs `script` in a login shell, recording its process group's id in
+ * `groupFile`.
  *
- * This exists because **closing an exec websocket does not stop the command it
- * started**, measured against a real pod: a loop kept ticking after the socket
- * closed, whether or not it was still writing to stdout. So anything we might
- * have to abandon (a stream the consumer cancels, an `exec` that outruns its
- * timeout) has to be killable, and a process group is what makes a shell die
- * along with the `sleep` it was waiting on.
+ * The agent starts every command as the leader of a new session, so the shell
+ * here is its own group leader and `$$` is the group id: the one the agent
+ * kills when a deadline passes or the request drops, and the one the sweep
+ * kills when neither happened (a kill that raced this prologue, or a marimohub
+ * that restarted and left the pod's commands behind). It must not start a
+ * session of its own: `setsid` here would move the command out of the group
+ * the agent addresses, and a timed-out loop would outlive its kill. The live
+ * run showed exactly that.
  *
  * The pieces are separate argv entries, so nothing here needs quoting, and the
  * prologue redirects to the file rather than to stdout, which belongs to the
@@ -221,21 +223,14 @@ const FILE_TYPES: Record<string, FileInfo['type']> = {
  * on that path.
  */
 export function processGroupCommand(groupFile: string, script: string): string[] {
-	return [
-		'setsid',
-		'--wait',
-		'sh',
-		'-lc',
-		`trap 'rm -f ${groupFile}' EXIT; echo $$ > ${groupFile}; ${script}`,
-	];
+	return ['sh', '-lc', `trap 'rm -f ${groupFile}' EXIT; echo $$ > ${groupFile}; ${script}`];
 }
 
 /**
  * Kill the process group whose id `groupFile` holds, and clean the file up.
  *
- * `execStream` needs this because closing an exec websocket does not stop the
- * command it started. The negative argument is what makes `kill` address the
- * whole group, so a shell loop dies along with the `sleep` it was waiting on.
+ * The negative argument is what makes `kill` address the whole group, so a
+ * shell loop dies along with the `sleep` it was waiting on.
  * Silent when the file is missing or the group is already gone: this runs while
  * a stream is being torn down and has nobody to report to.
  */

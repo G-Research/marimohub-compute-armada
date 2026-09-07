@@ -10,8 +10,10 @@ mostly idle interactive jobs, one job set per session, a single queue today. Our
 that it is sensible, and the evidence exists to earn that position rather than assume it. If
 you read nothing else, read [The central bet](#the-central-bet) and
 [Still open](#still-open): the five judgement calls there are the ones we cannot settle
-without you, and the twenty-seven decisions exist to support them. They are written to be
-checked, not taken on faith.
+without you, and the twenty-eight decisions exist to support them. They are written to be
+checked, not taken on faith. The first of the five has since been answered, and the answer
+replaced the control channel: see the note at the head of decision 11, decision 28, and
+`AGENT-DESIGN.md`.
 
 Marimohub questions will come up, and they are out of scope here: this document explains the
 Armada side of the seam and only summarizes what marimohub needs from it. marimohub is open
@@ -74,7 +76,8 @@ Armada's own answer to "reach into an executor cluster" is a per-cluster service
 binoculars, which exposes exactly two RPCs, `Logs` and `Cordon`
 (`pkg/api/binoculars/binoculars.proto:36`). There is no exec anywhere. So stepping outside
 Armada for the control channel is not us ignoring a supported path; there is no supported
-path. See decision 11 for how we make that respectable rather than ad hoc.
+path. Decision 11 records how we made that respectable rather than ad hoc, and the note at
+its head records that the reviewer rejected it anyway, and what replaces it.
 
 ## Decisions
 
@@ -182,6 +185,24 @@ maximum, and ships with a 1s minimum and a 5m maximum (`config/server/config.yam
 preempted or cancelled kernel gets a chance to flush.
 
 ### 11. Reach the cluster the way Lookout does
+
+**Superseded on 2026-09-07.** The reviewer's answer to open question 1 is no. A central
+service holding a kubeconfig for every worker cluster bypasses Armada and has direct power
+over every cluster, which is what Armada exists to prevent. The replacement is a small agent
+that runs as PID 1 of the kernel container in place of `sleep infinity`, listens on a
+second port, and runs commands over HTTP. The job exposes that port next to the kernel's, and
+the adapter reads both addresses from the same `JobIngressInfoEvent` it reads today (decision
+20): the executor reports one address per service port for NodePort and one host per rule
+for an ingress (`internal/executor/reporter/event.go:148`). Under this design marimohub
+holds no Kubernetes credential of any shape, and the cluster id is never used. The design,
+its pod spec and its order of work are in `AGENT-DESIGN.md`.
+
+Steps 1 and 2 of that plan are done: the agent exists (`agent/`), the adapter talks to it
+(`src/channel.ts`), the kubeconfig channel and its configuration are gone, and a notebook
+session runs end to end on the local cluster through it. Decision 28 records what was
+built and where it departs from the design. Everything above the seam, decisions 18
+through 26, carried over unchanged apart from the one wrapper decision 28 names. The rest
+of this decision is kept as written, for the record.
 
 The control channel needs the API server of whichever cluster Armada placed the job on, known
 only by the `clusterId` string in the event. There is no discovery API for that.
@@ -438,8 +459,8 @@ not found in $PATH", wrapped with the pod, cluster and command by `execFailure`
 (`src/exec.ts`), so the diagnosis is immediate rather than mysterious.
 
 The narrower assumptions are the ones to watch. Most are GNU or util-linux specifics that
-busybox lacks: `find -printf` (decision 21), `setsid` and its `--wait` flag (decisions 19
-and 23). `base64` (decision 21) exists in both coreutils and busybox, and `python3`
+busybox lacks: `find -printf` (decision 21) and `setsid` (decision 19; its `--wait` flag is
+no longer needed since decision 28). `base64` (decision 21) exists in both coreutils and busybox, and `python3`
 (decision 19) is definitional for a Python kernel image. `git` (decision 26) is the one
 that is a whole package rather than a flag: `python:*-slim` does not ship it, so a kernel
 image built from scratch must install it or sessions that load from a repository fail at
@@ -464,6 +485,13 @@ what a path is right now, and a path becomes a directory or stops being one whil
 runs.
 
 ### 23. `execStream` really streams, and `exec` gets a login shell
+
+_Since decision 28 the channel underneath is the agent, not a websocket through the API
+server. Closing the request now does stop the command, because the agent kills its process
+group, and the `setsid --wait` wrapper described below is gone: the agent already starts
+every command as a session leader, and a second session would have escaped its kill. The
+group file, the `onStop` kill and the sweep remain as belt and braces; see decision 28 for
+what stays and why. The text below is kept as written._
 
 marimohub's kubernetes adapter implements `execStream` by running the command through its
 ordinary `exec` and emitting the buffered stdout as a single chunk, because its internal exec
@@ -532,6 +560,11 @@ output lands in `ExecResult.stdout`; upstream accepts that for `exec`, and the p
 commands that cannot tolerate it are exempt by construction.
 
 ### 24. A timeout kills what it abandoned, and the smoke run looks for ghosts
+
+_Since decision 28 the deadline is enforced by the agent, which kills the process group
+itself and reports the command as timed out; the adapter's own kill is a second line. The
+smoke run now also expects no zombies at all, because PID 1 reaps. The text below is
+kept as written._
 
 Decision 23 found that closing an exec websocket does not stop the command. That finding is
 not specific to streaming, and following it through turned up a live bug: `PodExec.run`'s
@@ -708,6 +741,79 @@ asserts that the twelve tokens we depend on still exist in that swagger at the p
 release, which is coarser than the structural check above and deliberately so. Whether
 depending on Lookout at all is right is [still open](#still-open).
 
+### 28. The control channel is an agent in the pod, reached like the kernel is
+
+The answer to open question 1 (decision 11), built. The design is `AGENT-DESIGN.md`; this
+records what was implemented and the places it departs from that text.
+
+**What runs in the pod.** The kernel container's command is `/mh-agent/agent --port 8718`
+in place of `sleep infinity`: a static Go binary with no dependencies (`agent/`), so the
+same file runs in any Linux image. An init container from the agent's own image runs
+`/agent install /mh-agent/agent` into an `emptyDir` both containers mount, which is how the
+operator's kernel image stays untouched (`src/podspec.ts`). Two departures from the design's
+example: the agent copies itself rather than relying on a `cp`, so its image is `FROM
+scratch`; and the mount is `/mh-agent`, not `/shared`, because a user's notebook may
+reasonably create `/shared`. The init container carries `100m` CPU and `64Mi` memory,
+requests equal to limits, because Armada validates init containers exactly like main ones
+(`internal/server/submit/validation/submit_request.go:255`) and may insist the CPU is
+fractional (`:413`).
+
+**How it is reached.** The pod declares the kernel port and the agent port, the submit
+exposes every declared port through the one NodePort service (`exposedPorts` in
+`src/podspec.ts`), and the executor reports one address per service port in the same
+`JobIngressInfoEvent` decision 20 already read (`internal/executor/reporter/event.go:148`).
+`ready()` waits for the pod, reads the agent's address, and polls its `/healthz` until it
+answers (`src/sandbox.ts`, `src/channel.ts`). No cluster id, no kubeconfig: `ClusterAccess`
+and `ARMADA_KUBECONFIG_PATTERN` are gone, and so is `@kubernetes/client-node` from the
+bundle, which fell from megabytes to 40 KB.
+
+**The protocol.** One request type, `POST /exec` with `{cmd, stdin?, timeoutMs?}`, and a
+streaming NDJSON response: `{pid}`, then `{stdout}` and `{stderr}` chunks as base64, then
+`{exit, timedOut}` (`agent/server.go`). Streaming rather than the design's request and
+response for one reason: cancellation. When the request's context ends, because the caller
+closed it or the deadline passed, the agent sends `SIGTERM` to the command's process group
+and `SIGKILL` five seconds later. That is the thing a Kubernetes exec could never do
+(decision 23 measured it), and it is what makes both `run` and `stream` one endpoint.
+`stream` in `src/channel.ts` forwards stdout chunks as they come and aborts the request on
+cancel; `run` collects everything and rejects on `timedOut` with the same message the old
+channel used, so the sandbox above it did not change.
+
+**The token.** The adapter mints 32 random bytes per sandbox and puts only their SHA-256
+in the pod spec as `MH_AGENT_TOKEN_SHA256`; every request carries the token as a bearer
+and the agent compares hashes in constant time. This departs from the design, which put
+the token itself in the spec. The spec is not secret: `GetJobDetails` returns it with
+`expandJobSpec` (`pkg/api/job.proto:47`), Lookout renders it, and an env var is inherited by
+every process the agent starts, `os.environ` in a notebook included. The hash leaks nothing.
+
+**PID 1.** The agent reaps orphaned zombies, by reading `/proc` for state `Z` with
+itself as parent and waiting on those it did not start itself (`agent/reaper_linux.go`),
+so a crashed detached kernel is collected rather than left looking alive. It forwards
+`SIGTERM` to every process in the container and waits up to 25 seconds for them, inside
+the 30-second grace period from decision 10. If the agent itself dies, the container ends
+and Armada fails the job, which is the right outcome.
+
+**What changed above the seam.** One thing. `processGroupCommand` no longer wraps the
+command in `setsid --wait` (`src/shell.ts`). The agent starts every command as the leader
+of a new session, so the shell's `$$` is already the group id, and a second `setsid`
+moved the command out of the group the agent kills: the first live run showed a timed-out
+loop surviving its kill for exactly that reason. The group file, the `onStop` kill and the
+sweep (decisions 24 and 25) are kept for now. They are redundant when the agent's kill
+lands and still useful when it cannot, for a marimohub that restarted and left the pod's
+commands behind. Deleting them is step 3 of the design's order of work, along with raw
+file endpoints that would retire the base64 and quoting of decisions 21 and 22.
+
+**Exposure.** The agent port is exposed exactly as the kernel port is. Over a NodePort
+that is plaintext HTTP on the cluster network, guarded by the token; over an ingress it is
+a public HTTPS hostname to a shell, guarded by the token and whatever the ingress adds.
+The production answer is the per-job ingress annotations from decision 13 with an
+allowlist for marimohub's egress address. Open question 6 asks how you want this.
+
+**Operational.** `ARMADA_AGENT_IMAGE` is required configuration with no default, since no
+image is published yet, and `ARMADA_AGENT_PORT` defaults to 8718. The image is built for
+the worker nodes' architecture, not marimohub's, which on an Apple Silicon laptop means
+arm64 for the node and amd64 for marimohub. CI vets, tests and builds the agent
+(`.github/workflows/ci.yml`); its tests drive the real protocol against real processes.
+
 ## Constraints on the first submit
 
 Collected from `internal/server/submit/validation/submit_request.go` so the first real submit
@@ -718,7 +824,10 @@ is not a guessing game. A job is rejected unless:
 - `queue`, `jobSetId` and `namespace` are set (`:112`, `:129`, `:154`). `jobSetId` and
   `clientId` are length capped (`:120`, `:209`).
 - Every container specifies resources, and **requests equal limits** unless the server allows
-  oversubscription (`:249`, `docs/creating_and_submitting_jobs.md`).
+  oversubscription (`:249`, `docs/creating_and_submitting_jobs.md`). This applies to init
+  containers too (`:255`), and a server can additionally insist that an init container's CPU
+  is fractional, `100m` rather than `1` (`:413`, `AssertInitContainersRequestFractionalCpu`).
+  The agent's install container in `AGENT-DESIGN.md` sets `100m` for that reason.
 - No `preferredDuringSchedulingIgnoredDuringExecution` node affinity, which Armada does not
   support (`:182`).
 - The termination grace period is within the configured bounds (`:390`).
@@ -747,12 +856,17 @@ From `internal/server/event/event.go:85`, since `waitForRunning` depends on them
 
 These are judgement calls, not missing homework.
 
-1. **Is exec-into-executor-pods acceptable in your deployment?** We know there is no
-   Armada-native alternative, no API that forbids it, and that the per-cluster component
-   pattern exists but exposes only logs and cordon. What we cannot know is whether an Armada
-   operator would accept a central service holding cluster credentials, or would rather see
-   exec added to binoculars upstream. This is the one answer that could change the
-   architecture.
+1. **Is exec-into-executor-pods acceptable in your deployment?** Answered on 2026-09-07:
+   no. A central service holding cluster credentials bypasses Armada. The reviewer names
+   exec in binoculars upstream as the best answer for security, and an Armada release away.
+   The answer that ships first is an agent inside the pod, reached through a second port
+   that Armada exposes and reports like the kernel's. The design is
+   `AGENT-DESIGN.md`; the note at the head of decision 11 says what it changes here. The
+   question as originally asked, kept for the record: we knew there was no Armada-native
+   alternative, no API that forbids exec from outside, and that the per-cluster component
+   pattern exists but exposes only logs and cordon. What we could not know was whether an
+   operator would accept it. This was the one answer that could change the architecture,
+   and it did.
 2. **One queue or a queue per user?** Fair share is computed per queue with a per-queue
    priority factor (`docs/scheduling_and_preempting_jobs.md`), so queue granularity _is_ the
    fairness model for a multi-tenant notebook server. We currently take a single queue from
@@ -776,6 +890,13 @@ These are judgement calls, not missing homework.
    terminal one-job sets, are operational matters we cannot see from here. Is there a scale
    at which this shape becomes an anti-pattern, and is there server-side tuning (event
    retention, expiry) an operator should set for it?
+6. **Where should the agent image live, and how should its port be exposed?** Decision 28
+   exposes the agent port exactly as the kernel port: a NodePort on the cluster network
+   locally, an ingress hostname in production. The token guards it either way, but an
+   ingress makes it a public hostname to a shell, and the sensible answers (an IP allowlist
+   annotation per job, or a private ingress class) are deployment choices. So is the
+   registry the worker clusters pull the agent image from, and whether one image for both
+   architectures is wanted.
 
 ## What has been verified
 
@@ -790,12 +911,21 @@ Verified:
   jobs submittable with `armadactl`.
 - marimohub 0.3.12 loads this adapter in library mode, and a missing environment variable
   fails startup with our own error message.
-- Exec into an executor-created pod works in practice: exit codes, stderr, piped stdin,
-  270 KB of output and a timeout all behave (the smoke script, run from the host).
-- Exec works from inside the marimohub container, which was the one assumption that could
-  have changed the architecture: the adapter bundle baked into the image, driven in the
-  running container with the container's own env, submitted a job, execed into its pod and
-  round-tripped a file, through the mounted internal kubeconfig on the `kind` network.
+- Before decision 28, exec into an executor-created pod worked in practice, from the host
+  and from inside the marimohub container through a mounted kubeconfig. Kept for the
+  record; that channel no longer exists.
+- The agent (decision 28) against the real cluster, through `bun run smoke` from a
+  container on the `kind` network: Armada accepts the pod with two ports, an init
+  container and a volume; the address event carries an address for each port; the pod
+  runs the agent as PID 1 from the volume the init container filled; a command runs
+  through it at the address Armada reported; a timed-out loop is reported as timed out
+  and is dead afterwards; a cancelled stream's command is dead afterwards; the planted
+  ghost is swept; and the stray check finds nothing, zombies included.
+- A full notebook session through the agent, from a real browser against marimohub in its
+  container with no Kubernetes credential mounted: the provision line reports reachable
+  in 12.0s, files, `uv sync`, kernel start, port wait and expose all succeeding
+  (`sandbox_provision_succeeded: true`), the marimo editor loads through the proxy,
+  reports a healthy runtime and autosaves, and Stop cancels the job.
 - `writeFiles` and `setEnvVars` round-trip against a real pod: a filename containing a
   quote and spaces, binary bytes read back exactly, a relative path landing in the
   container's working directory without a stray directory, forced-beats-default precedence,
@@ -861,17 +991,20 @@ Assumed, not verified:
 
 ## Where to look in the code
 
-| Path                          | What it is                                                                               |
-| ----------------------------- | ---------------------------------------------------------------------------------------- |
-| `src/types.ts`                | marimohub's adapter interface, transcribed by hand. Not ours to change.                  |
-| `src/armada.ts`               | Placement: submit, watch, ingress address, cancel; `listActive` via Lookout.             |
-| `src/exec.ts`                 | Control channel: exec into a located pod, buffered or streamed.                          |
-| `src/shell.ts`                | Quoting, env prefix, port waiter, read, list and clone commands, from `compute-commons`. |
-| `src/sweeper.ts`              | The provider's one ghost sweeper: registration, cap, timer.                              |
-| `src/sandbox.ts`              | One kernel session. Everything below `exec` is ordinary shell commands.                  |
-| `src/armada-types.ts`         | Hand-written Armada wire types, with the reasoning in the header.                        |
-| `scripts/check-armada-api.ts` | The contract check that keeps those types honest.                                        |
-| `README.md`                   | How to run the whole thing locally, and what failure looks like today.                   |
+| Path                           | What it is                                                                                    |
+| ------------------------------ | --------------------------------------------------------------------------------------------- |
+| `src/types.ts`                 | marimohub's adapter interface, transcribed by hand. Not ours to change.                       |
+| `src/armada.ts`                | Placement: submit, watch, ingress address, cancel; `listActive` via Lookout.                  |
+| `src/channel.ts`               | Control channel: the client for the agent in the pod, buffered or streamed.                   |
+| `agent/`                       | The agent itself: a Go program run as PID 1 of the kernel container (decision 28).            |
+| `AGENT-DESIGN.md`              | The reviewer's design for the in-pod agent; decision 28 is what was built from it.            |
+| `src/shell.ts`                 | Quoting, env prefix, port waiter, read, list and clone commands, from `compute-commons`.      |
+| `src/sweeper.ts`               | The provider's one ghost sweeper: registration, cap, timer.                                   |
+| `src/sandbox.ts`               | One kernel session. Everything below `exec` is ordinary shell commands.                       |
+| `dev/smoke.sh`, `dev/smoke.ts` | The live check, run from a container on the `kind` network so it can reach the agent.         |
+| `src/armada-types.ts`          | Hand-written Armada wire types, with the reasoning in the header.                             |
+| `scripts/check-armada-api.ts`  | The contract check that keeps those types honest.                                             |
+| `README.md`                    | Configuration and deployment; `docs/ARCHITECTURE.md` and `docs/CONTRIBUTING.md` for the rest. |
 
 One path is deliberately absent from the table: marimohub itself, cloned from the URL in the
 introduction. Its provisioner, reconciler, compute contract and kubernetes adapter

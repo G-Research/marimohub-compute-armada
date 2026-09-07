@@ -17,6 +17,26 @@ jobs:
       - run: bun test
       - run: bun run build
 
+  agent:
+    # The kernel agent is a Go program with no dependencies; its tests run the
+    # real protocol against real processes.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: agent/go.mod
+      - uses: golangci/golangci-lint-action@db9de0fc1a667e1a49d2291a1a042dff081d78f6 # v9
+        with:
+          version: v2.13.2
+          working-directory: agent
+      - name: Check Go formatting
+        run: golangci-lint fmt --diff
+        working-directory: agent
+      - run: go -C agent vet ./...
+      - run: go -C agent test ./...
+      - run: docker build agent
+
   armada-api:
     # The hand-written types in src/armada-types.ts are only as good as their last
     # check against the real spec, so verify them whenever anything Armada-related

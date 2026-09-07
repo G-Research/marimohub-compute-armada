@@ -1,14 +1,13 @@
 import { ArmadaClient } from './armada.js';
-import { ClusterAccess } from './clusters.js';
+import { AgentChannel } from './channel.js';
+import type { AgentEndpoint, ControlChannel } from './channel.js';
 import type { ArmadaConfig } from './config.js';
-import { PodExec } from './exec.js';
 import { ArmadaSandbox } from './sandbox.js';
 import { GhostSweeper } from './sweeper.js';
 import type { ActiveSandbox, CreateSandboxOptions, SandboxId, SandboxProvider } from './types.js';
 
 export class ArmadaCompute implements SandboxProvider {
 	private readonly armada: ArmadaClient;
-	private readonly podExec: PodExec;
 	/**
 	 * One sweeper for every sandbox this provider makes, rather than a timer
 	 * each: see `src/sweeper.ts`. Sandboxes join it once they have a pod and
@@ -26,7 +25,6 @@ export class ArmadaCompute implements SandboxProvider {
 
 	constructor(private readonly config: ArmadaConfig) {
 		this.armada = new ArmadaClient(config);
-		this.podExec = new PodExec(new ClusterAccess(config.kubeconfigPattern));
 		this.sweeper = new GhostSweeper(config.ghostSweepSeconds * 1000);
 		if (config.lookoutUrl !== undefined) {
 			this.listActive = async (): Promise<ActiveSandbox[]> => this.armada.listActive();
@@ -34,11 +32,16 @@ export class ArmadaCompute implements SandboxProvider {
 	}
 
 	create(id: SandboxId, options?: CreateSandboxOptions): ArmadaSandbox {
-		return new ArmadaSandbox(id, this.config, this.armada, this.podExec, options, this.sweeper);
+		return new ArmadaSandbox(id, this.config, this.armada, openAgent, options, this.sweeper);
 	}
 
 	/** Kernels are reached directly at their Armada ingress, so nothing is proxied. */
 	async proxy(_request: Request): Promise<Response | null> {
 		return null;
 	}
+}
+
+/** Each sandbox reaches its own pod's agent, at the address Armada reported for it. */
+function openAgent(endpoint: AgentEndpoint): ControlChannel {
+	return new AgentChannel(endpoint);
 }

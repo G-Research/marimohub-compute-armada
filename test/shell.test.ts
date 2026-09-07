@@ -180,9 +180,9 @@ describe('list parsing', () => {
 
 describe('process groups', () => {
 	it("records the group id before the command and keeps the command's status", () => {
+		// No setsid: the agent already made this shell a session leader, and a
+		// second session would escape the group the agent kills.
 		expect(processGroupCommand('/tmp/g.pgid', 'make build')).toEqual([
-			'setsid',
-			'--wait',
 			'sh',
 			'-lc',
 			"trap 'rm -f /tmp/g.pgid' EXIT; echo $$ > /tmp/g.pgid; make build",

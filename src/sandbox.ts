@@ -1,6 +1,7 @@
+import { createHash, randomBytes } from 'node:crypto';
 import type { ArmadaClient, PodLocation, SubmittedJob } from './armada.js';
 import type { ArmadaConfig } from './config.js';
-import type { PodExec, PodExecResult } from './exec.js';
+import type { AgentEndpoint, CommandResult, ControlChannel } from './channel.js';
 import { buildPodSpec } from './podspec.js';
 import type { GhostSweeper } from './sweeper.js';
 import {
@@ -55,8 +56,11 @@ function decodeUtf8(bytes: Uint8Array): string | undefined {
 	}
 }
 
-/** Each write is one exec, so one websocket; cap how many are in flight. */
+/** Each write is one request to the agent; cap how many are in flight. */
 const WRITE_CONCURRENCY = 8;
+
+/** How long a running pod gets to answer on the agent port before `ready` gives up. */
+const AGENT_READY_TIMEOUT_MS = 30_000;
 
 /** Port waits run in-pod in chunks; each boundary is where a dead kernel gets noticed. */
 const PORT_WAIT_CHUNK_MS = 30_000;
@@ -79,7 +83,7 @@ interface TrackedCommand {
 }
 
 /** A non-zero exit is the command's business; marimohub wants it as a result. */
-export function toExecResult(result: PodExecResult): ExecResult {
+export function toExecResult(result: CommandResult): ExecResult {
 	if (result.exitCode === 0) {
 		return { success: true, stdout: result.stdout, stderr: result.stderr };
 	}
@@ -104,6 +108,10 @@ export class ArmadaSandbox implements SandboxInstance {
 
 	private job?: SubmittedJob;
 	private pod?: PodLocation | undefined;
+	/** The agent in the pod, once `ready` has reached it. */
+	private channel?: ControlChannel | undefined;
+	/** The bearer token this sandbox's agent expects. The pod carries only its hash. */
+	private token?: string;
 
 	/**
 	 * The pod's environment is fixed at submission, so `setEnvVars` accumulates
@@ -132,24 +140,43 @@ export class ArmadaSandbox implements SandboxInstance {
 		private readonly id: SandboxId,
 		private readonly config: ArmadaConfig,
 		private readonly armada: ArmadaClient,
-		private readonly podExec: PodExec,
+		private readonly openChannel: (endpoint: AgentEndpoint) => ControlChannel,
 		private readonly options?: CreateSandboxOptions,
 		private readonly sweeper?: GhostSweeper,
 	) {}
 
 	/**
-	 * Submit the job and block until its pod is running.
+	 * Submit the job, block until its pod is running, and reach the agent in it.
 	 *
 	 * Idempotent: marimohub calls this before each use, and the submission dedupes
 	 * on `clientId` anyway, so a second call on a started sandbox does nothing.
+	 *
+	 * The token is minted here and never leaves this process except in request
+	 * headers to the one pod that knows its hash. The pod spec, which anyone with
+	 * read access to the job can fetch, carries the hash alone.
 	 */
 	async ready(): Promise<void> {
-		if (this.pod !== undefined) return;
-		this.job ??= await this.armada.submit(this.id, buildPodSpec(this.config, this.options));
+		if (this.channel !== undefined) return;
+		this.token ??= randomBytes(32).toString('hex');
+		const tokenSha256: string = createHash('sha256').update(this.token).digest('hex');
+		this.job ??= await this.armada.submit(
+			this.id,
+			buildPodSpec(this.config, { tokenSha256 }, this.options),
+		);
 		this.pod = await this.armada.waitForRunning(this.job);
+		// The agent's address comes from the same event as the kernel's.
+		const address: string = await this.armada.ingressAddress(this.job, this.config.agentPort);
+		const channel: ControlChannel = this.openChannel({ address, token: this.token, pod: this.pod });
+		await channel.ready(AGENT_READY_TIMEOUT_MS);
+		this.channel = channel;
 		// Swept from here until `destroy`, by the provider's one sweeper rather
 		// than a timer of our own: see `src/sweeper.ts` for why that matters.
 		this.sweeper?.add(this);
+	}
+
+	/** Where the pod landed, once it has. For reporting, not for reaching it. */
+	get placement(): PodLocation | undefined {
+		return this.pod;
 	}
 
 	/**
@@ -174,18 +201,15 @@ export class ArmadaSandbox implements SandboxInstance {
 	async sweep(): Promise<number> {
 		// Nothing to sweep before there is a pod, and never two at once: the second
 		// would see the first's work as unowned.
-		if (this.pod === undefined || this.sweeping) return 0;
+		const channel: ControlChannel | undefined = this.channel;
+		if (channel === undefined || this.sweeping) return 0;
 		this.sweeping = true;
 		try {
 			this.expireLongRunning();
 			const awaited: string[] = [...this.groups]
 				.filter(([, tracked]: [string, TrackedCommand]) => tracked.awaiting)
 				.map(([groupFile]: [string, TrackedCommand]) => groupFile);
-			const result: PodExecResult = await this.podExec.run(this.pod, [
-				'sh',
-				'-c',
-				sweepGroupsCommand(awaited),
-			]);
+			const result: CommandResult = await channel.run(['sh', '-c', sweepGroupsCommand(awaited)]);
 
 			const swept: SweptGroup[] = parseSweptGroups(result.stdout);
 			const killed: SweptGroup[] = swept.filter((group: SweptGroup) => group.outcome === 'killed');
@@ -201,7 +225,7 @@ export class ArmadaSandbox implements SandboxInstance {
 				// The one place this is visible while a session runs, and it means a
 				// kill that should have happened earlier did not.
 				console.warn(
-					`[armada] sandbox ${this.id}: killed abandoned process group ${group.group} in ${this.pod.podName} (${what})`,
+					`[armada] sandbox ${this.id}: killed abandoned process group ${group.group} in ${this.pod?.podName ?? 'its pod'} (${what})`,
 				);
 			}
 			this.ghostsKilled += killed.length;
@@ -239,26 +263,22 @@ export class ArmadaSandbox implements SandboxInstance {
 	async exec(cmd: string, options?: ExecOptions): Promise<ExecResult> {
 		const command: string = withEnvPrefix(cmd, this.env, this.envDefaults);
 
-		let result: PodExecResult;
+		let result: CommandResult;
 		try {
-			const pod: PodLocation = await this.location();
-			// A command with no deadline runs plainly. One with a deadline has to be
-			// killable, because a timeout closes the websocket and the command in the
-			// pod does not notice: it would keep running, and the caller would have
-			// been told it failed.
-			// Every exec runs in its own process group, not only the ones with a
-			// deadline. Most of marimohub's exec calls carry no timeout, and without
-			// a group file a command whose socket drops (or whose caller restarts)
-			// keeps running with nothing left that can name it, let alone kill it.
+			const channel: ControlChannel = await this.open();
+			// Every exec runs in its own process group and records it in a file.
+			// The agent kills the group itself when a deadline passes or the
+			// request drops, so the file is the sweep's handle for what that could
+			// not reach: a kill that raced the prologue, or a marimohub that
+			// restarted and left the pod's commands behind (decisions 24 and 25).
 			const timeout: number | undefined = options?.timeout;
 			const groupFile: string = this.track('exec', cmd);
 			try {
-				result = await this.podExec.run(
-					pod,
+				result = await channel.run(
 					processGroupCommand(groupFile, command),
 					timeout === undefined
 						? {}
-						: { timeoutMs: timeout, onStop: async () => this.killGroup(pod, groupFile) },
+						: { timeoutMs: timeout, onStop: async () => this.killGroup(channel, groupFile) },
 				);
 				// It returned, so its trap has run and there is no file to sweep.
 				this.groups.delete(groupFile);
@@ -327,15 +347,16 @@ export class ArmadaSandbox implements SandboxInstance {
 	}
 
 	/** Kill the process group `groupFile` names, for a command we abandoned. */
-	private async killGroup(pod: PodLocation, groupFile: string): Promise<void> {
-		await this.podExec.run(pod, ['sh', '-c', killGroupCommand(groupFile)]);
+	private async killGroup(channel: ControlChannel, groupFile: string): Promise<void> {
+		await channel.run(['sh', '-c', killGroupCommand(groupFile)]);
 	}
 
-	/** The pod, submitting and waiting for it first if nobody has yet. */
-	private async location(): Promise<PodLocation> {
-		if (this.pod === undefined) await this.ready();
-		if (this.pod === undefined) throw new Error(`Sandbox ${this.id} has no pod after ready()`);
-		return this.pod;
+	/** The agent, submitting the job and waiting for its pod first if nobody has yet. */
+	private async open(): Promise<ControlChannel> {
+		if (this.channel === undefined) await this.ready();
+		if (this.channel === undefined)
+			throw new Error(`Sandbox ${this.id} has no agent after ready()`);
+		return this.channel;
 	}
 
 	/**
@@ -347,24 +368,22 @@ export class ArmadaSandbox implements SandboxInstance {
 	 * rather than resolving to a `BACKEND_ERROR` stream.
 	 *
 	 * The command runs under `setsid` in its own process group, and the shell
-	 * writes that group's id to a file before starting it. That is what makes
-	 * cancelling work: closing the websocket leaves the command running (verified
-	 * against a real pod), so stopping it means killing the group, which one more
-	 * exec does. Without it every abandoned stream would leave a process spinning
-	 * in the kernel's pod for the rest of the session.
+	 * writes that group's id to a file before starting it. Cancelling closes the
+	 * request and the agent kills the group; the file is what the sweep uses for
+	 * the cases that kill could not reach (decision 25).
 	 */
 	async execStream(cmd: string, options?: ExecStreamOptions): Promise<ReadableStream> {
-		const pod: PodLocation = await this.location();
+		const channel: ControlChannel = await this.open();
 		const command: string = withEnvPrefix(cmd, this.env, this.envDefaults);
 		const groupFile: string = this.track('stream', cmd);
 
-		return this.podExec.stream(pod, processGroupCommand(groupFile, command), {
+		return channel.stream(processGroupCommand(groupFile, command), {
 			...(options?.timeout === undefined ? {} : { timeoutMs: options.timeout }),
 			// Best effort: a cancel in the instant before the prologue wrote the file
 			// finds nothing to kill. The sweep is what repairs that.
 			onStop: async () => {
 				this.abandon(groupFile);
-				await this.killGroup(pod, groupFile);
+				await this.killGroup(channel, groupFile);
 			},
 			// Reached however the command ended, so an abandoned one keeps its record
 			// and one that ended on its own drops it.
@@ -391,11 +410,11 @@ export class ArmadaSandbox implements SandboxInstance {
 	 * from "could not be read".
 	 */
 	async readFile(path: string): Promise<ReadFileResult> {
-		let result: PodExecResult;
+		let result: CommandResult;
 		try {
 			// No login shell and no env prefix: this stdout is a protocol value we
 			// parse, and profile scripts print to stdout.
-			result = await this.podExec.run(await this.location(), ['sh', '-c', readFileCommand(path)]);
+			result = await (await this.open()).run(['sh', '-c', readFileCommand(path)]);
 		} catch {
 			return { success: false, content: '', error: { code: 'BACKEND_ERROR' } };
 		}
@@ -424,13 +443,9 @@ export class ArmadaSandbox implements SandboxInstance {
 	 * path, where a profile script that prints anything corrupts the listing.
 	 */
 	async listFiles(path: string, options?: ListFilesOptions): Promise<ListFilesResult> {
-		let result: PodExecResult;
+		let result: CommandResult;
 		try {
-			result = await this.podExec.run(await this.location(), [
-				'sh',
-				'-c',
-				listFilesCommand(path, options),
-			]);
+			result = await (await this.open()).run(['sh', '-c', listFilesCommand(path, options)]);
 		} catch {
 			return { success: false, files: [], error: { code: 'BACKEND_ERROR' } };
 		}
@@ -444,13 +459,12 @@ export class ArmadaSandbox implements SandboxInstance {
 	}
 
 	/**
-	 * Pod exec has no multi-file write, so this is one exec per file. Content
-	 * goes over stdin, never into the command line, so bytes arrive verbatim
-	 * and nothing needs escaping beyond the path.
+	 * One command per file. Content goes over stdin, never into the command
+	 * line, so bytes arrive verbatim and nothing needs escaping beyond the path.
 	 */
 	async writeFiles(files: readonly SandboxFileWrite[]): Promise<void> {
 		if (files.length === 0) return;
-		const pod: PodLocation = await this.location();
+		const channel: ControlChannel = await this.open();
 
 		const write: (file: SandboxFileWrite) => Promise<void> = async (
 			file: SandboxFileWrite,
@@ -460,8 +474,7 @@ export class ArmadaSandbox implements SandboxInstance {
 			const slash: number = file.path.lastIndexOf('/');
 			const mkdir: string =
 				slash > 0 ? `mkdir -p -- ${shellQuote(file.path.slice(0, slash))} && ` : '';
-			const result: PodExecResult = await this.podExec.run(
-				pod,
+			const result: CommandResult = await channel.run(
 				['sh', '-c', `${mkdir}cat > ${shellQuote(file.path)}`],
 				{ stdin: file.content },
 			);
@@ -510,15 +523,15 @@ export class ArmadaSandbox implements SandboxInstance {
 	}
 
 	/**
-	 * Launch a long-lived process (the kernel) detached, so it outlives the exec
-	 * session that started it: setsid, output to a log file, stdin closed, PID
+	 * Launch a long-lived process (the kernel) detached, so it outlives the
+	 * request that started it: setsid, output to a log file, stdin closed, PID
 	 * echoed back. The outer shell is non-login because its stdout is the PID we
 	 * parse; the detached inner shell is a login shell so profile-provided env
 	 * (a PATH with uv and python on it) reaches the kernel, its output going to
 	 * the log file where profile noise is harmless.
 	 */
 	async startProcess(cmd: string, options?: StartProcessOptions): Promise<SandboxProcess> {
-		const pod: PodLocation = await this.location();
+		const channel: ControlChannel = await this.open();
 		const logFile = `/tmp/mh-proc-${String(++processSequence)}.log`;
 		const cd: string = options?.cwd === undefined ? '' : `cd ${shellQuote(options.cwd)}; `;
 
@@ -534,7 +547,7 @@ export class ArmadaSandbox implements SandboxInstance {
 		);
 
 		const launch = `${cd}setsid sh -lc ${shellQuote(command)} >${logFile} 2>&1 </dev/null & echo $!`;
-		const started: PodExecResult = await this.podExec.run(pod, ['sh', '-c', launch]);
+		const started: CommandResult = await channel.run(['sh', '-c', launch]);
 		if (started.exitCode !== 0) {
 			throw new Error(`Starting "${cmd}" failed: ${started.stderr}`);
 		}
@@ -543,8 +556,8 @@ export class ArmadaSandbox implements SandboxInstance {
 		return new ArmadaProcess(
 			options?.processId ?? `armada-proc-${pid === '' ? String(processSequence) : pid}`,
 			cmd,
-			this.podExec,
-			pod,
+			channel,
+			this.pod === undefined ? this.id : `${this.pod.podNamespace}/${this.pod.podName}`,
 			pid,
 			logFile,
 		);
@@ -577,6 +590,7 @@ export class ArmadaSandbox implements SandboxInstance {
 		if (this.job === undefined) await this.armada.cancelSet(this.id);
 		else await this.armada.cancel(this.job);
 		this.pod = undefined;
+		this.channel = undefined;
 	}
 }
 
@@ -585,14 +599,15 @@ class ArmadaProcess implements SandboxProcess {
 	constructor(
 		readonly id: string,
 		readonly command: string,
-		private readonly podExec: PodExec,
-		private readonly pod: PodLocation,
+		private readonly channel: ControlChannel,
+		/** The pod, for messages. */
+		private readonly where: string,
 		private readonly pid: string,
 		private readonly logFile: string,
 	) {}
 
-	private async run(cmd: string): Promise<PodExecResult> {
-		return this.podExec.run(this.pod, ['sh', '-c', cmd]);
+	private async run(cmd: string): Promise<CommandResult> {
+		return this.channel.run(['sh', '-c', cmd]);
 	}
 
 	private async log(): Promise<string> {
@@ -600,11 +615,11 @@ class ArmadaProcess implements SandboxProcess {
 	}
 
 	/**
-	 * Exit 0 if the process is alive. Not `kill -0`: this pod's PID 1 is
-	 * `sleep infinity`, which never reaps orphans, so a crashed process stays a
-	 * zombie that `kill -0` still counts as alive and every crash would read as
-	 * a timeout. The state field sits after the last `)` because the comm field
-	 * before it may itself contain spaces.
+	 * Exit 0 if the process is alive. Not `kill -0`: a process that has exited
+	 * but not been collected is a zombie that `kill -0` still counts as alive.
+	 * The agent, as PID 1, collects orphans, so today the two agree, but the
+	 * probe reads the state field and is right either way. The field sits after
+	 * the last `)` because the comm field before it may itself contain spaces.
 	 */
 	private aliveCommand(): string {
 		return `state=$(sed 's/^.*) //' /proc/${this.pid}/stat 2>/dev/null | cut -d' ' -f1); [ -n "$state" ] && [ "$state" != Z ]`;
@@ -625,8 +640,8 @@ class ArmadaProcess implements SandboxProcess {
 	 */
 	async waitForPort(port: number, options?: WaitForPortOptions): Promise<void> {
 		const timeout: number = options?.timeout ?? 30_000;
-		// The waiter loops in-pod rather than being probed from here: every exec
-		// is a fresh websocket through the API server, so an external poll would
+		// The waiter loops in-pod rather than being probed from here: every probe
+		// would be a fresh request to the agent, so an external poll would
 		// quantize the wait to that round-trip grid. Chunked so each boundary is
 		// where a dead kernel gets noticed, with the first chunk short so a launch
 		// that fails outright reports fast. `attempts` bounds the loop if the
@@ -643,7 +658,7 @@ class ArmadaProcess implements SandboxProcess {
 			const seconds: number = Number((Math.min(chunkMs, remainingMs) / 1000).toFixed(2));
 			chunkMs = PORT_WAIT_CHUNK_MS;
 			// A login shell, so a python3 that a profile script put on PATH is found.
-			const waited: PodExecResult = await this.podExec.run(this.pod, [
+			const waited: CommandResult = await this.channel.run([
 				'sh',
 				'-lc',
 				portWaitCommand(port, seconds),
@@ -660,7 +675,7 @@ class ArmadaProcess implements SandboxProcess {
 		}
 		// oxlint-enable no-await-in-loop
 		throw new Error(
-			`timed out waiting for port ${String(port)} in ${this.pod.podNamespace}/${this.pod.podName} after ${String(timeout)}ms.\n${await this.log()}`,
+			`timed out waiting for port ${String(port)} in ${this.where} after ${String(timeout)}ms.\n${await this.log()}`,
 		);
 	}
 
