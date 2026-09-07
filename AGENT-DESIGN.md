@@ -340,10 +340,10 @@ That is still a Kubernetes credential, and it works for one cluster only.
 ## Order of work
 
 1. [x] Submit one test job with two ports, an init container, and the shared volume.
-   Confirm two addresses come back in the address event.
+       Confirm two addresses come back in the address event.
 2. [x] Build the agent with the single request type and replace the Kubernetes channel in the adapter.
-   Run a full notebook session on a local cluster.
-3. [ ] Add the process and file requests and delete the workarounds.
+       Run a full notebook session on a local cluster.
+3. [x] Add the process and file requests and delete the workarounds.
 4. [ ] Test the ingress with a real ingress controller.
 5. [ ] Make the marimohub change for queues, then add the queue map.
 

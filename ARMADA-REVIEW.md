@@ -10,7 +10,7 @@ mostly idle interactive jobs, one job set per session, a single queue today. Our
 that it is sensible, and the evidence exists to earn that position rather than assume it. If
 you read nothing else, read [The central bet](#the-central-bet) and
 [Still open](#still-open): the five judgement calls there are the ones we cannot settle
-without you, and the twenty-eight decisions exist to support them. They are written to be
+without you, and the twenty-nine decisions exist to support them. They are written to be
 checked, not taken on faith. The first of the five has since been answered, and the answer
 replaced the control channel: see the note at the head of decision 11, decision 28, and
 `AGENT-DESIGN.md`.
@@ -26,10 +26,12 @@ reach and let it read the source, the same way this document's Armada claims wer
 by reading Armada's.
 
 The adapter covers marimohub's whole interface. The provision sequence is implemented and
-verified against a real local Armada: placement (submit, wait for running, cancel), exec
-into the placed pod, file writes, env vars, detached process launch, the exposed-port URL
-from Armada's ingress event, reading files and directories back out, streaming a command's
-output, and cloning a repository. `listActive`, the last stub, now asks Lookout
+verified against a real local Armada: placement (submit, wait for running, cancel),
+commands run through the agent, file writes, env vars, detached process launch, the
+exposed-port URL from Armada's ingress event, reading files and directories back out,
+streaming a command's output, and cloning a repository. Since decision 29 the agent
+answers file and process requests directly, so those operations no longer build a shell
+command at all. `listActive`, the last stub, now asks Lookout
 (decision 27) and is covered by tests against stubbed responses; it has not yet been
 exercised against the local cluster's own Lookout.
 
@@ -310,6 +312,14 @@ that will drift silently.
 
 ### 18. File writes and env vars mirror marimohub's kubernetes adapter
 
+_Since decision 29 a file write is one `PUT /files` to the agent, bytes raw in
+the body, and no shell is involved: the quoting, the `mkdir -p && cat` command
+and the stdin transport below are gone. What carries over: one request per
+file, eight in flight, content never entering a command line, and the
+divergence that a bare filename creates no spurious directory (the agent skips
+the parent when there is none). The env-var half is unchanged. The text below
+is kept as written._
+
 marimohub ships its own pod-exec backend (`packages/compute-kubernetes`), which is the same
 control channel we use, so its semantics are the reference rather than something to invent.
 A local marimohub checkout is assumed (the introduction says where it lives); `src/shell.ts` transcribes
@@ -335,6 +345,18 @@ pod. Upstream has the same property, and the provisioner sets env immediately be
 starting the kernel, so nothing observes the gap today.
 
 ### 19. Launch the kernel detached, wait for its port in-pod
+
+_Since decision 29 the agent does all of this itself. `startProcess` is one
+`POST /process/start`: the agent parents the process in its own session, so
+the `setsid … & echo $!` launch, the log-file redirection and the `/proc`
+liveness probe are gone, and the exit status comes from a real `wait`.
+`waitForPort` is one request the agent answers by dialling `127.0.0.1` in-pod
+while watching the process, so the chunking and the `python3` one-liner are
+gone too, and a crash is reported the moment it happens rather than at a chunk
+boundary. What carries over: the launch still runs `sh -lc`, so
+profile-provided env reaches the kernel, and a crash is still worded
+`process exited before port N opened` with the log appended, which is what the
+provisioner classifies on. The text below is kept as written._
 
 `startProcess`, like decision 18, transcribes marimohub's kubernetes adapter. The launch is
 `setsid sh -lc '<cmd>' >/tmp/mh-proc-N.log 2>&1 </dev/null & echo $!`: setsid detaches the
@@ -386,6 +408,17 @@ proxy exposure, and a full session works end to end through it.
 
 ### 21. Read files back as base64, and let the bytes choose the encoding
 
+_Since decision 29 the bytes cross raw: `readFile` is a `GET /files` whose
+response body is the file, and `listFiles` is a `GET /files/list` answered as
+JSON, so the base64 transport, the wrapped-line rejoining and the `find`
+parsing are gone. Everything decided here about meaning survives unchanged:
+the encoding reported to marimohub is still chosen from the bytes (its two
+consumers still disagree), an absent path is still `NOT_FOUND` with dangling
+symlinks still counting as present, listing a file is still `NOT_A_DIRECTORY`,
+and hidden entries are still filtered on their own name after a walk that
+descends into dot directories. The agent's probe order in `agent/files.go`
+preserves each of those answers. The text below is kept as written._
+
 `readFile` and `listFiles` are the read side of decision 18, and like it they transcribe
 marimohub's kubernetes adapter. Both run in a non-login `sh -c` with no env prefix, because
 their stdout is a protocol value we parse and a profile script that prints anything would
@@ -436,6 +469,15 @@ class of assumption as `setsid` and `python3` in decision 19, and holds for any
 Debian-family kernel image. `base64` is coreutils and present in busybox too.
 
 ### 22. Every command goes through `sh`
+
+_Since decision 29 this is true of commands and of nothing else: files travel
+as bytes and detached processes are the agent's own children, so the reasons
+below that concern redirection for reads, `[ -e ]` probes and the port waiter
+no longer apply. `/bin/sh` remains the dependency of `exec`, `execStream`,
+`startProcess` and `gitCheckout`; GNU `find`, util-linux `setsid` and the
+`python3` waiter are no longer required of a kernel image at all. `git`
+(decision 26) remains the one whole-package assumption. The text below is kept
+as written._
 
 The Pod exec subresource takes an argv, not a command line, so the interpreter is our
 choice and not something the API imposes. We could exec binaries directly, `['find', path,
@@ -490,8 +532,9 @@ _Since decision 28 the channel underneath is the agent, not a websocket through 
 server. Closing the request now does stop the command, because the agent kills its process
 group, and the `setsid --wait` wrapper described below is gone: the agent already starts
 every command as a session leader, and a second session would have escaped its kill. The
-group file, the `onStop` kill and the sweep remain as belt and braces; see decision 28 for
-what stays and why. The text below is kept as written._
+group file, the `onStop` kill and the sweep were kept as belt and braces for a while and
+are deleted since decision 29, which says why that became safe. The text below is kept as
+written._
 
 marimohub's kubernetes adapter implements `execStream` by running the command through its
 ordinary `exec` and emitting the buffered stdout as a single chunk, because its internal exec
@@ -562,9 +605,9 @@ commands that cannot tolerate it are exempt by construction.
 ### 24. A timeout kills what it abandoned, and the smoke run looks for ghosts
 
 _Since decision 28 the deadline is enforced by the agent, which kills the process group
-itself and reports the command as timed out; the adapter's own kill is a second line. The
-smoke run now also expects no zombies at all, because PID 1 reaps. The text below is
-kept as written._
+itself and reports the command as timed out; the adapter's own kill was a second line
+until decision 29 deleted it. The smoke run now also expects no zombies at all, because
+PID 1 reaps. The text below is kept as written._
 
 Decision 23 found that closing an exec websocket does not stop the command. That finding is
 not specific to streaming, and following it through turned up a live bug: `PodExec.run`'s
@@ -599,6 +642,17 @@ at all. Decision 25 is what repairs those. We also send `TERM` without escalatin
 so a process that ignores it survives, which nothing currently repairs.
 
 ### 25. Sweep the marks, never the processes
+
+**Deleted on 2026-09-07, with decision 29.** The sweep existed to repair kills that the
+adapter's own `onStop` could miss, and above all the marimohub restart, which abandoned
+every open exec websocket without stopping anything. The agent closed that class whole: a
+command dies when its request does, a restart is precisely every request dying at once,
+and there is no prologue left for a kill to race. `src/sweeper.ts`, the group files,
+`ARMADA_GHOST_SWEEP_SECONDS` and the `ghosts_killed` counter are gone; the backstop that
+rode the sweep (`ARMADA_COMMAND_MAX_SECONDS`) moved into the agent's own deadline, as
+decision 29 records. The design rule this decision defended, never kill by heuristic,
+still stands and is now enforced by construction: the agent only ever kills the process
+groups of requests it is serving. The text below is kept as written, for the record.
 
 The kills in decision 24 are the normal path, and they all have the same weakness: they are
 code that has to run at the moment something goes wrong. A sweep on a timer covers what that
@@ -797,10 +851,10 @@ command in `setsid --wait` (`src/shell.ts`). The agent starts every command as t
 of a new session, so the shell's `$$` is already the group id, and a second `setsid`
 moved the command out of the group the agent kills: the first live run showed a timed-out
 loop surviving its kill for exactly that reason. The group file, the `onStop` kill and the
-sweep (decisions 24 and 25) are kept for now. They are redundant when the agent's kill
-lands and still useful when it cannot, for a marimohub that restarted and left the pod's
-commands behind. Deleting them is step 3 of the design's order of work, along with raw
-file endpoints that would retire the base64 and quoting of decisions 21 and 22.
+sweep (decisions 24 and 25) were kept for a while, redundant when the agent's kill landed
+and still useful when it could not. Step 3 of the design's order of work has since deleted
+them and added the process and file endpoints that retire the rest of the shell layer:
+decision 29.
 
 **Exposure.** The agent port is exposed exactly as the kernel port is. Over a NodePort
 that is plaintext HTTP on the cluster network, guarded by the token; over an ingress it is
@@ -813,6 +867,72 @@ image is published yet, and `ARMADA_AGENT_PORT` defaults to 8718. The image is b
 the worker nodes' architecture, not marimohub's, which on an Apple Silicon laptop means
 arm64 for the node and amd64 for marimohub. CI vets, tests and builds the agent
 (`.github/workflows/ci.yml`); its tests drive the real protocol against real processes.
+
+### 29. The agent grows process and file requests, and the shell workarounds go
+
+Step 3 of `AGENT-DESIGN.md`'s order of work, built. Decision 28 kept the whole
+group-file-and-sweep apparatus (decisions 24 and 25) as belt and braces and left every
+adapter operation as a shell command reached through `/exec`. Both were provisional, and
+this decision retires them: the agent now answers what a shell answered badly, and the
+things that only existed to repair the shell channel are deleted.
+
+**Detached processes are the agent's own children.** `startProcess` is `POST
+/process/start`, and `waitForPort`, `getLogs` and `kill` are `/process/{waitport,logs,signal}`
+(`agent/process.go`, `src/channel.ts`). Because the agent forks the process itself, three
+things that were shell workarounds become exact. Liveness and the exit code come from a
+real `wait`, not from reading `/proc` state and guessing, so the `/proc` `Z` probe of
+decision 19 is gone. `waitForPort` is one request the agent answers by dialling
+`127.0.0.1` in-pod while watching the process, so the chunked wait, the per-chunk liveness
+check and the inline `python3` connect loop of decision 19 are all gone, and a kernel that
+dies is reported the instant it does rather than at a chunk boundary. The launch still
+runs `sh -lc`, so profile-provided env reaches the kernel, and a crash is still worded
+`process exited before port N opened` with the log appended.
+
+One correction the first live run forced: `/process/signal` signals the **group**, the
+negated pid, not the one process. The `sh -lc` wrapper the adapter launches can fork the
+real command rather than exec it, so signalling only the leader left the kernel, and
+anything a notebook spawned, orphaned and running in the pod. Every started process is a
+session leader (the agent sets `Setsid`), so its pid is its group id, and a group signal
+takes the whole tree. This closes by construction the orphan leak that decision 25's sweep
+existed to chase after the fact.
+
+**Files cross as bytes, not through a shell.** `writeFile`, `readFile` and `listFiles` are
+`PUT /files`, `GET /files` and `GET /files/list` (`agent/files.go`). Content travels raw
+in the request or response body and the path travels as a query parameter, so the base64
+transport of decision 21, the `'\''` quoting of decision 22, the `mkdir -p && cat`
+command, the wrapped-line rejoining and the `find -printf` parsing are all gone, along with
+their assumptions on GNU `find` and coreutils `base64`. Every behaviour those commands were
+carefully built to produce is preserved in `agent/files.go` and checked by its tests: the
+encoding reported to marimohub is still chosen from the bytes, an absent path is still
+`not_found` (dangling symlinks counted as present, per the old `[ -L ]`), listing a file is
+still `not_a_directory` rather than an empty success, and a byte order mark still
+round-trips. The hidden-file filter stays in the adapter (`toFileInfos` in `src/sandbox.ts`)
+so a recursive listing still descends into dot directories and reports their non-dot
+children, which is what `readSessionArtifacts` relies on.
+
+**What was deleted.** `src/sweeper.ts` and its test, the `/tmp/mh-*.pgid` group files, the
+`processGroupCommand`/`killGroupCommand`/`sweepGroupsCommand` builders and their parsers,
+`ARMADA_GHOST_SWEEP_SECONDS`, and the `ghosts_killed` counter. The reasoning is that the
+agent closed the one gap the sweep could not otherwise reach. The sweep's hardest case was
+a marimohub restart, which abandoned every open exec websocket without stopping anything;
+under the agent a restart is every request's context ending at once, and the agent kills
+each command's group when its request ends, so there is nothing left to sweep. The design
+rule the sweep defended, never kill by heuristic, is unchanged and now holds by
+construction: the agent only ever kills the groups of requests it is serving, never a
+process it merely found.
+
+**The backstop moved into the deadline.** `ARMADA_COMMAND_MAX_SECONDS` (decision 25) is
+kept, but it is no longer a mark the sweep acts on later. An `exec` with no caller timeout
+is now sent to the agent with the backstop as its `timeoutMs`, so the agent enforces it the
+same way it enforces a real timeout, and the adapter reports it with a message naming the
+backstop rather than a timeout nobody set (`src/sandbox.ts`). Streams stay exempt, as
+before. `0` still turns it off, which sends no deadline at all.
+
+**Verified live** through `bun run smoke`: files written, read back byte for byte and
+listed with their sizes, an absent path as `NOT_FOUND`, a detached server whose port the
+agent waits for and whose `kill()` (a group signal) leaves nothing behind, a process that
+dies at once reported as a crash with its log, and the timed-out exec and cancelled stream
+leaving no strays, zombies included.
 
 ## Constraints on the first submit
 
@@ -914,13 +1034,15 @@ Verified:
 - Before decision 28, exec into an executor-created pod worked in practice, from the host
   and from inside the marimohub container through a mounted kubeconfig. Kept for the
   record; that channel no longer exists.
-- The agent (decision 28) against the real cluster, through `bun run smoke` from a
+- The agent (decisions 28 and 29) against the real cluster, through `bun run smoke` from a
   container on the `kind` network: Armada accepts the pod with two ports, an init
   container and a volume; the address event carries an address for each port; the pod
   runs the agent as PID 1 from the volume the init container filled; a command runs
-  through it at the address Armada reported; a timed-out loop is reported as timed out
-  and is dead afterwards; a cancelled stream's command is dead afterwards; the planted
-  ghost is swept; and the stray check finds nothing, zombies included.
+  through it at the address Armada reported; a file is written, read back byte for byte
+  and listed with its size, and an absent path is `NOT_FOUND`; a detached server's port
+  is waited for and its `kill()` (a group signal) leaves nothing behind; a process that
+  dies at once is reported as a crash with its log; and a timed-out loop and a cancelled
+  stream are dead afterwards, the stray check finding nothing, zombies included.
 - A full notebook session through the agent, from a real browser against marimohub in its
   container with no Kubernetes credential mounted: the provision line reports reachable
   in 12.0s, files, `uv sync`, kernel start, port wait and expose all succeeding
@@ -930,40 +1052,36 @@ Verified:
   quote and spaces, binary bytes read back exactly, a relative path landing in the
   container's working directory without a stray directory, forced-beats-default precedence,
   and a pre-existing `HOME` surviving an `onlyIfUnset` attempt.
-- `startProcess` against a real pod: a detached `http.server` stays up after the launch exec
-  ends, `waitForPort` sees its port, sandbox and per-process env reach it, `getLogs` reads
-  its output, `kill` really terminates it, and a command that exits at once is reported as
-  a crash carrying its log, not as a timeout (which is what the `kill -0` probe produced
-  before the `/proc` liveness check replaced it).
+- `startProcess` against a real pod: a detached `http.server` stays up after the launch
+  returns, `waitForPort` sees its port, sandbox and per-process env reach it, `getLogs`
+  reads its output, `kill` really terminates it and leaves no orphaned child (the signal
+  goes to the group), and a command that exits at once is reported as a crash carrying its
+  log, not as a timeout. Since decision 29 the agent parents the process, so liveness and
+  the crash come from a real `wait`, not the `/proc` probe the shell channel needed.
 - `exposePort` against a real pod: the URL comes back as `http://<node-ip>:<nodePort>` in
   single-digit milliseconds (the ingress event replays from the stream), and an HTTP
   request through that NodePort reaches a server listening on the kernel port.
-- `readFile` and `listFiles` against a real pod: text read back byte for byte (including
-  a non-ASCII character), binary content returned as base64 that decodes to the exact
-  bytes written, a 500-byte file whose wrapped base64 rejoins, an empty file as an empty
-  success, a quoted path, an absent path as `NOT_FOUND` and a directory as `READ_FAILED`;
-  a flat listing that hides dotfiles and does not descend, a recursive one that reaches
-  `__marimo__/session/notebook.py.json` and shows `.env`, a file listed as
-  `NOT_A_DIRECTORY`, an absent directory as `LIST_FAILED`, and a read that is unchanged
-  after `setEnvVars`.
-- `execStream` against a real pod: three chunks a second apart arrive at 40ms, 1042ms and
-  2044ms rather than together at the end, sandbox env and a login shell reach the command,
-  stderr stays out of the stream, a timeout truncates an endless command instead of failing
-  it, and cancelling stops the command in the pod (measured by a loop that keeps ticking
-  into a file: it stops on cancel and on timeout, and it did _not_ before the process-group
-  kill was added).
-- The timeout kill (decision 24) against a real pod: a command with a deadline keeps its
-  stdout, stderr and exit status through the `setsid` wrapper, a timed-out loop is dead
-  three seconds later rather than still ticking, no group files are left behind, and the
-  ghost check reports an empty pod.
+- `readFile` and `listFiles` (since decision 29, the agent's `/files` endpoints) against
+  the unit suite and a real pod: text decoded and reported as `utf-8`, binary bytes
+  returned as base64 that decodes to the exact bytes, a byte order mark preserved, an empty
+  file as an empty success, a path with a quote and spaces crossing intact, an absent path
+  as `NOT_FOUND` and a directory as `READ_FAILED`; a flat listing that hides dotfiles and
+  does not descend, a recursive one that descends into a dot directory and reports its
+  non-dot children, a file listed as `NOT_A_DIRECTORY`, and an absent directory as
+  `LIST_FAILED`. The agent's own Go tests cover the same probe order on the pod side.
+- `execStream` against a real pod: stdout chunks arrive as produced rather than at the end,
+  sandbox env and a login shell reach the command, stderr stays out of the stream, a
+  timeout truncates an endless command instead of failing it, and cancelling stops the
+  command in the pod (the agent kills its process group when the request drops).
 - `gitCheckout` against a real pod: a public repo cloned with a branch and target
   directory, the cloned README read back through `readFile` and the checked-out branch
   confirmed in-pod, and a nonexistent repo surfacing as a thrown
   `git checkout failed: fatal: ...`. The local kernel image ships git 2.47.3.
-- The sweep (decision 25) against a real pod, through `bun run smoke`: a timed-out command
-  and a cancelled stream leave nothing behind, a deliberately planted group that nothing is
-  waiting on is killed by the sweep and reported (`killed 1 abandoned process group(s)`),
-  and the stray listing afterwards shows only zombies, no live process.
+- Abandoned commands leave nothing behind (decision 29's smoke run): a timed-out `exec` and
+  a cancelled stream are both dead afterwards, and the stray listing over `/proc` finds no
+  live process and no zombie, because the agent kills each command's group when its request
+  ends and reaps orphans as PID 1. The agent's Go tests cover the kill on deadline, on
+  caller disconnect, and its reach into a forked child.
 - `listActive` against stubbed Lookout responses: the request body (queue and annotation
   filters, the four active states, ordering, page size), pagination until a page comes back
   short, `jobSet` mapping with `createdAt` only when `submitted` is present, the missing
@@ -978,8 +1096,10 @@ Verified:
 
 Assumed, not verified:
 
-- That the kernel image provides `/bin/sh`, GNU `find`, `git` and `setsid` with `--wait`. Verified
-  only against the local `marimo-sandbox:local` image, which is Debian-family; see decision 22.
+- That the kernel image provides `/bin/sh` and `git`. Verified only against the local
+  `marimo-sandbox:local` image, which is Debian-family; see decision 22. Since decision 29
+  these are the only two: the file and process endpoints moved off `find`, `base64`,
+  `setsid` and the `python3` waiter, so a kernel image no longer needs any of those.
 - That an interactive session survives normal scheduling behaviour once decisions 7 to 9 are
   applied.
 - That the generated Ingress carries WebSocket traffic with a real ingress controller.
@@ -995,12 +1115,11 @@ Assumed, not verified:
 | ------------------------------ | --------------------------------------------------------------------------------------------- |
 | `src/types.ts`                 | marimohub's adapter interface, transcribed by hand. Not ours to change.                       |
 | `src/armada.ts`                | Placement: submit, watch, ingress address, cancel; `listActive` via Lookout.                  |
-| `src/channel.ts`               | Control channel: the client for the agent in the pod, buffered or streamed.                   |
-| `agent/`                       | The agent itself: a Go program run as PID 1 of the kernel container (decision 28).            |
-| `AGENT-DESIGN.md`              | The reviewer's design for the in-pod agent; decision 28 is what was built from it.            |
-| `src/shell.ts`                 | Quoting, env prefix, port waiter, read, list and clone commands, from `compute-commons`.      |
-| `src/sweeper.ts`               | The provider's one ghost sweeper: registration, cap, timer.                                   |
-| `src/sandbox.ts`               | One kernel session. Everything below `exec` is ordinary shell commands.                       |
+| `src/channel.ts`               | Control channel: the client for the agent's exec, process and file endpoints.                 |
+| `agent/`                       | The agent itself: a Go program run as PID 1, with the exec, process and file endpoints.       |
+| `AGENT-DESIGN.md`              | The reviewer's design for the in-pod agent; decisions 28 and 29 are what was built from it.   |
+| `src/shell.ts`                 | Env prefix, quoting and the clone command that `exec` still needs, from `compute-commons`.    |
+| `src/sandbox.ts`               | One kernel session: `exec` on the agent, everything else on its typed endpoints.              |
 | `dev/smoke.sh`, `dev/smoke.ts` | The live check, run from a container on the `kind` network so it can reach the agent.         |
 | `src/armada-types.ts`          | Hand-written Armada wire types, with the reasoning in the header.                             |
 | `scripts/check-armada-api.ts`  | The contract check that keeps those types honest.                                             |

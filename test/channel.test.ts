@@ -1,6 +1,13 @@
 import { afterAll, afterEach, describe, expect, it } from 'bun:test';
-import { AgentChannel } from '../src/channel.js';
-import type { AgentEndpoint, CommandResult } from '../src/channel.js';
+import { AgentChannel, CommandTimeoutError } from '../src/channel.js';
+import type {
+	AgentEndpoint,
+	CommandResult,
+	ListFilesOutcome,
+	PortWait,
+	ProcessStatus,
+	ReadFileOutcome,
+} from '../src/channel.js';
 import { toExecResult } from '../src/sandbox.js';
 
 /** The rejection reason as a string, so failures assert on the message plainly. */
@@ -27,15 +34,36 @@ interface Received {
 	aborted: boolean;
 }
 
+/** One request to any other endpoint, as the fake agent saw it. */
+interface ApiRequest {
+	method: string;
+	path: string;
+	query: Record<string, string>;
+	body: Uint8Array<ArrayBuffer>;
+}
+
 /** Lines the fake agent sends next; `WAIT` holds the response open from there. */
 const WAIT = '<wait>';
 let script: string[] = [];
 let healthy = true;
 const received: Received[] = [];
+const requests: ApiRequest[] = [];
+/** In-memory files behind `/files`, path to bytes. */
+const files: Map<string, Uint8Array<ArrayBuffer>> = new Map();
+/** Scripted JSON answer for the next process/list request, by path. */
+let answers: Record<string, { status: number; body: unknown }> = {};
 
 const encoder: TextEncoder = new TextEncoder();
 const b64: (text: string) => string = (text: string): string =>
 	Buffer.from(text).toString('base64');
+
+function scripted(path: string): Response | undefined {
+	const answer: { status: number; body: unknown } | undefined = answers[path];
+	if (answer === undefined) return undefined;
+	// A string body is served as text, the way the log endpoint answers.
+	if (typeof answer.body === 'string') return new Response(answer.body, { status: answer.status });
+	return Response.json(answer.body, { status: answer.status });
+}
 
 /**
  * A fake agent speaking the protocol `agent/server.go` speaks, so the client is
@@ -44,38 +72,68 @@ const b64: (text: string) => string = (text: string): string =>
 const server: ReturnType<typeof Bun.serve> = Bun.serve({
 	port: 0,
 	async fetch(request: Request): Promise<Response> {
-		const path: string = new URL(request.url).pathname;
+		const url: URL = new URL(request.url);
+		const path: string = url.pathname;
 		if (path === '/healthz') {
 			return healthy ? new Response('ok\n') : new Response('starting', { status: 503 });
 		}
-		if (path !== '/exec') return new Response('not found', { status: 404 });
-		// oxlint-disable-next-line no-unsafe-type-assertion -- the fake trusts the client it tests
-		const body: ExecBody = (await request.json()) as ExecBody;
-		const record: Received = {
-			authorization: request.headers.get('authorization'),
-			body,
-			aborted: false,
-		};
-		received.push(record);
-		if (record.authorization !== 'Bearer token-1') {
+		if (path === '/exec') {
+			// oxlint-disable-next-line no-unsafe-type-assertion -- the fake trusts the client it tests
+			const body: ExecBody = (await request.json()) as ExecBody;
+			const record: Received = {
+				authorization: request.headers.get('authorization'),
+				body,
+				aborted: false,
+			};
+			received.push(record);
+			if (record.authorization !== 'Bearer token-1') {
+				return Response.json({ error: 'wrong token' }, { status: 401 });
+			}
+			const lines: string[] = script;
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller: ReadableStreamDefaultController<Uint8Array>): void {
+						for (const line of lines) {
+							if (line === WAIT) return;
+							controller.enqueue(encoder.encode(`${line}\n`));
+						}
+						controller.close();
+					},
+					cancel(): void {
+						record.aborted = true;
+					},
+				}),
+				{ headers: { 'content-type': 'application/x-ndjson' } },
+			);
+		}
+
+		if (request.headers.get('authorization') !== 'Bearer token-1') {
 			return Response.json({ error: 'wrong token' }, { status: 401 });
 		}
-		const lines: string[] = script;
-		return new Response(
-			new ReadableStream<Uint8Array>({
-				start(controller: ReadableStreamDefaultController<Uint8Array>): void {
-					for (const line of lines) {
-						if (line === WAIT) return;
-						controller.enqueue(encoder.encode(`${line}\n`));
-					}
-					controller.close();
-				},
-				cancel(): void {
-					record.aborted = true;
-				},
-			}),
-			{ headers: { 'content-type': 'application/x-ndjson' } },
-		);
+		requests.push({
+			method: request.method,
+			path,
+			query: Object.fromEntries(url.searchParams),
+			body: new Uint8Array(await request.arrayBuffer()),
+		});
+		const filePath: string = url.searchParams.get('path') ?? '';
+		if (path === '/files' && request.method === 'PUT') {
+			files.set(filePath, requests.at(-1)?.body ?? new Uint8Array());
+			return Response.json({});
+		}
+		if (path === '/files' && request.method === 'GET') {
+			const bytes: Uint8Array<ArrayBuffer> | undefined = files.get(filePath);
+			if (bytes === undefined) {
+				return Response.json(
+					{ error: `no such file: ${filePath}`, code: 'not_found' },
+					{
+						status: 404,
+					},
+				);
+			}
+			return new Response(bytes, { headers: { 'content-type': 'application/octet-stream' } });
+		}
+		return scripted(path) ?? Response.json({ error: `unscripted path ${path}` }, { status: 500 });
 	},
 });
 
@@ -87,6 +145,9 @@ afterEach(() => {
 	script = [];
 	healthy = true;
 	received.length = 0;
+	requests.length = 0;
+	files.clear();
+	answers = {};
 });
 
 function endpoint(token = 'token-1'): AgentEndpoint {
@@ -95,6 +156,10 @@ function endpoint(token = 'token-1'): AgentEndpoint {
 		token,
 		pod: { clusterId: 'Cluster1', podName: 'armada-job-0', podNamespace: 'default' },
 	};
+}
+
+function channel(token = 'token-1'): AgentChannel {
+	return new AgentChannel(endpoint(token));
 }
 
 async function until(condition: () => boolean, ms = 2_000): Promise<boolean> {
@@ -113,7 +178,7 @@ describe('run', () => {
 			JSON.stringify({ stdout: b64('there\n') }),
 			JSON.stringify({ exit: 3 }),
 		];
-		const result: CommandResult = await new AgentChannel(endpoint()).run(['sh', '-c', 'x'], {
+		const result: CommandResult = await channel().run(['sh', '-c', 'x'], {
 			stdin: 'data',
 			timeoutMs: 5_000,
 		});
@@ -129,29 +194,30 @@ describe('run', () => {
 
 	it('sends binary stdin as its own bytes', async () => {
 		script = [JSON.stringify({ exit: 0 })];
-		await new AgentChannel(endpoint()).run(['cat'], { stdin: new Uint8Array([0, 255, 10]) });
+		await channel().run(['cat'], { stdin: new Uint8Array([0, 255, 10]) });
 
 		expect(received[0]?.body.stdin).toBe(Buffer.from([0, 255, 10]).toString('base64'));
 	});
 
-	it('rejects a timed-out command the way the old channel did, and calls onStop', async () => {
+	it('rejects a timed-out command with its own error type', async () => {
 		script = [JSON.stringify({ pid: 41 }), JSON.stringify({ exit: -1, timedOut: true })];
-		let stopped = false;
-		const message: string = await rejection(
-			new AgentChannel(endpoint()).run(['sleep', '30'], {
-				timeoutMs: 100,
-				onStop: async () => {
-					stopped = true;
-				},
-			}),
-		);
+		let caught: unknown;
+		try {
+			await channel().run(['sleep', '30'], { timeoutMs: 100 });
+		} catch (error) {
+			caught = error;
+		}
 
-		expect(message).toContain('Command timed out after 100ms in default/armada-job-0: sleep 30');
-		expect(stopped).toBe(true);
+		// The type is what lets a caller tell "the deadline it set" from "the
+		// backstop it did not".
+		expect(caught).toBeInstanceOf(CommandTimeoutError);
+		expect(String(caught)).toContain(
+			'Command timed out after 100ms in default/armada-job-0: sleep 30',
+		);
 	});
 
 	it('names the pod, the command and the agent error when refused', async () => {
-		const message: string = await rejection(new AgentChannel(endpoint('nope')).run(['true']));
+		const message: string = await rejection(channel('nope').run(['true']));
 
 		expect(message).toContain('The agent in default/armada-job-0 could not run "true"');
 		expect(message).toContain('HTTP 401: wrong token');
@@ -159,23 +225,19 @@ describe('run', () => {
 
 	it('rejects when the agent reports an error line, or ends without an exit', async () => {
 		script = [JSON.stringify({ error: 'cannot start sh: not found' })];
-		expect(await rejection(new AgentChannel(endpoint()).run(['sh']))).toContain(
-			'cannot start sh: not found',
-		);
+		expect(await rejection(channel().run(['sh']))).toContain('cannot start sh: not found');
 
 		script = [JSON.stringify({ stdout: b64('partial') })];
-		expect(await rejection(new AgentChannel(endpoint()).run(['sh']))).toContain(
-			'ended without an exit status',
-		);
+		expect(await rejection(channel().run(['sh']))).toContain('ended without an exit status');
 	});
 
 	it('keeps a scheme the address already has', async () => {
 		script = [JSON.stringify({ exit: 0 })];
-		const channel: AgentChannel = new AgentChannel({
+		const prefixed: AgentChannel = new AgentChannel({
 			...endpoint(),
 			address: `http://127.0.0.1:${String(server.port)}`,
 		});
-		expect((await channel.run(['true'])).exitCode).toBe(0);
+		expect((await prefixed.run(['true'])).exitCode).toBe(0);
 	});
 });
 
@@ -193,7 +255,7 @@ async function readAll(stream: ReadableStream<Uint8Array>): Promise<string> {
 }
 
 describe('stream', () => {
-	it('yields stdout chunks as they come, skips stderr, and reports the end', async () => {
+	it('yields stdout chunks as they come, skips stderr, and ends cleanly', async () => {
 		script = [
 			JSON.stringify({ pid: 41 }),
 			JSON.stringify({ stdout: b64('one') }),
@@ -201,55 +263,169 @@ describe('stream', () => {
 			JSON.stringify({ stdout: b64('two') }),
 			JSON.stringify({ exit: 0 }),
 		];
-		let finished = 0;
-		const stream: ReadableStream<Uint8Array> = await new AgentChannel(endpoint()).stream(
-			['sh', '-c', 'x'],
-			{
-				onFinished: () => {
-					finished += 1;
-				},
-			},
-		);
+		const stream: ReadableStream<Uint8Array> = await channel().stream(['sh', '-c', 'x']);
 
 		expect(await readAll(stream)).toBe('one|two');
-		expect(finished).toBe(1);
 		// No deadline goes to the agent: a stream's timeout ends it, not fails it.
 		expect(received[0]?.body).toEqual({ cmd: ['sh', '-c', 'x'] });
 	});
 
 	it('closes the request on cancel, which is what kills the command', async () => {
 		script = [JSON.stringify({ pid: 41 }), JSON.stringify({ stdout: b64('first') }), WAIT];
-		let stopped = false;
-		const stream: ReadableStream<Uint8Array> = await new AgentChannel(endpoint()).stream(['x'], {
-			onStop: async () => {
-				stopped = true;
-			},
-		});
+		const stream: ReadableStream<Uint8Array> = await channel().stream(['x']);
 		const reader: ReadableStreamDefaultReader<Uint8Array> = stream.getReader();
 		expect(new TextDecoder().decode((await reader.read()).value)).toBe('first');
 		await reader.cancel();
 
-		expect(stopped).toBe(true);
 		expect(await until(() => received[0]?.aborted === true)).toBe(true);
 	});
 
 	it('ends, rather than fails, when its timeout passes', async () => {
 		script = [JSON.stringify({ stdout: b64('first') }), WAIT];
-		let stopped = false;
-		const stream: ReadableStream<Uint8Array> = await new AgentChannel(endpoint()).stream(['x'], {
+		const stream: ReadableStream<Uint8Array> = await channel().stream(['x'], {
 			timeoutMs: 100,
-			onStop: async () => {
-				stopped = true;
-			},
 		});
 
 		expect(await readAll(stream)).toBe('first');
-		expect(stopped).toBe(true);
 		expect(await until(() => received[0]?.aborted === true)).toBe(true);
 	});
 
 	it('fails the stream when the agent refuses the command', async () => {
-		expect(await rejection(new AgentChannel(endpoint('nope')).stream(['x']))).toContain('HTTP 401');
+		expect(await rejection(channel('nope').stream(['x']))).toContain('HTTP 401');
+	});
+});
+
+describe('files', () => {
+	it('writes bytes raw, with the path in the query and nothing quoted', async () => {
+		const bytes: Uint8Array<ArrayBuffer> = new Uint8Array([0, 159, 146, 150]);
+		await channel().writeFile("/work/it's file.bin", bytes);
+
+		expect(requests[0]?.method).toBe('PUT');
+		expect(requests[0]?.query).toEqual({ path: "/work/it's file.bin" });
+		expect(requests[0]?.body).toEqual(bytes);
+	});
+
+	it('reads back the bytes it wrote, byte for byte', async () => {
+		const bytes: Uint8Array = new Uint8Array([0, 159, 146, 150]);
+		await channel().writeFile('/work/blob.bin', bytes);
+		const read: ReadFileOutcome = await channel().readFile('/work/blob.bin');
+
+		expect(read).toEqual({ outcome: 'ok', bytes });
+	});
+
+	it('maps the agent refusal codes to outcomes a sandbox can answer with', async () => {
+		expect(await channel().readFile('/work/missing.py')).toEqual({ outcome: 'not-found' });
+
+		answers['/files/list'] = {
+			status: 409,
+			body: { error: '/work/notebook.py is not a directory', code: 'not_a_directory' },
+		};
+		expect(await channel().listFiles('/work/notebook.py', false)).toEqual({
+			outcome: 'not-a-directory',
+		});
+
+		answers['/files/list'] = {
+			status: 404,
+			body: { error: 'no such directory: /gone', code: 'not_found' },
+		};
+		const failed: ListFilesOutcome = await channel().listFiles('/gone', false);
+		expect(failed.outcome).toBe('failed');
+	});
+
+	it('throws on a refusal without a known code, such as a wrong token', async () => {
+		expect(await rejection(channel('nope').readFile('/x'))).toContain('HTTP 401: wrong token');
+		expect(await rejection(channel('nope').writeFile('/x', 'y'))).toContain('could not write /x');
+	});
+
+	it('lists entries as the agent walked them, sending the recursive flag', async () => {
+		answers['/files/list'] = {
+			status: 200,
+			body: {
+				entries: [
+					{ path: '/work/notebook.py', type: 'file', size: 12 },
+					{ path: '/work/data', type: 'directory', size: 4096 },
+				],
+			},
+		};
+		const listed: ListFilesOutcome = await channel().listFiles('/work', true);
+
+		expect(listed).toEqual({
+			outcome: 'ok',
+			entries: [
+				{ path: '/work/notebook.py', type: 'file', size: 12 },
+				{ path: '/work/data', type: 'directory', size: 4096 },
+			],
+		});
+		expect(requests[0]?.query).toEqual({ path: '/work', recursive: 'true' });
+
+		await channel().listFiles('/work', false);
+		expect(requests[1]?.query).toEqual({ path: '/work' });
+	});
+});
+
+describe('processes', () => {
+	it('starts a process with its cwd and returns the pid the agent named', async () => {
+		answers['/process/start'] = { status: 200, body: { pid: 77 } };
+		const pid: number = await channel().startProcess(['sh', '-lc', 'marimo run'], '/work');
+
+		expect(pid).toBe(77);
+		expect(JSON.parse(new TextDecoder().decode(requests[0]?.body))).toEqual({
+			cmd: ['sh', '-lc', 'marimo run'],
+			cwd: '/work',
+		});
+	});
+
+	it('rejects with the agent message when the start is refused', async () => {
+		answers['/process/start'] = {
+			status: 500,
+			body: { error: 'cannot start sh: not found' },
+		};
+		const message: string = await rejection(channel().startProcess(['sh']));
+
+		expect(message).toContain('could not start');
+		expect(message).toContain('cannot start sh: not found');
+	});
+
+	it('reads a status back, running or exited', async () => {
+		answers['/process/status'] = { status: 200, body: { running: true } };
+		expect(await channel().processStatus(77)).toEqual({ running: true });
+
+		answers['/process/status'] = { status: 200, body: { running: false, exitCode: 3 } };
+		const done: ProcessStatus = await channel().processStatus(77);
+		expect(done).toEqual({ running: false, exitCode: 3 });
+		expect(requests[0]?.query).toEqual({ pid: '77' });
+	});
+
+	it('signals by pid and name', async () => {
+		answers['/process/signal'] = { status: 200, body: {} };
+		await channel().signalProcess(77, 'KILL');
+
+		expect(JSON.parse(new TextDecoder().decode(requests[0]?.body))).toEqual({
+			pid: 77,
+			signal: 'KILL',
+		});
+	});
+
+	it('reads the log as plain text', async () => {
+		answers['/process/logs'] = { status: 200, body: 'kernel output\n' };
+		expect(await channel().processLogs(77)).toBe('kernel output\n');
+	});
+
+	it('asks the agent to wait for a port, watching a pid', async () => {
+		answers['/process/waitport'] = { status: 200, body: { open: true } };
+		expect(await channel().waitForPort(2718, 30_000, 77)).toEqual({ open: true });
+		expect(JSON.parse(new TextDecoder().decode(requests[0]?.body))).toEqual({
+			port: 2718,
+			timeoutMs: 30_000,
+			pid: 77,
+		});
+
+		answers['/process/waitport'] = {
+			status: 200,
+			body: { open: false, exited: true, exitCode: 7 },
+		};
+		const crashed: PortWait = await channel().waitForPort(2718, 30_000, 77);
+		expect(crashed).toEqual({ open: false, exited: true, exitCode: 7 });
 	});
 });
 
@@ -259,18 +435,18 @@ describe('ready', () => {
 		setTimeout(() => {
 			healthy = true;
 		}, 300);
-		await new AgentChannel(endpoint()).ready(3_000);
+		await channel().ready(3_000);
 	});
 
 	it('rejects with the last reason when the agent never answers', async () => {
 		healthy = false;
-		const message: string = await rejection(new AgentChannel(endpoint()).ready(400));
+		const message: string = await rejection(channel().ready(400));
 		expect(message).toContain('did not answer within 400ms: HTTP 503');
 	});
 
 	it('reports a connection that cannot be made', async () => {
-		const channel: AgentChannel = new AgentChannel({ ...endpoint(), address: '127.0.0.1:1' });
-		expect(await rejection(channel.ready(300))).toContain('The agent in default/armada-job-0');
+		const unreachable: AgentChannel = new AgentChannel({ ...endpoint(), address: '127.0.0.1:1' });
+		expect(await rejection(unreachable.ready(300))).toContain('The agent in default/armada-job-0');
 	});
 });
 

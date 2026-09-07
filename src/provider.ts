@@ -3,17 +3,10 @@ import { AgentChannel } from './channel.js';
 import type { AgentEndpoint, ControlChannel } from './channel.js';
 import type { ArmadaConfig } from './config.js';
 import { ArmadaSandbox } from './sandbox.js';
-import { GhostSweeper } from './sweeper.js';
 import type { ActiveSandbox, CreateSandboxOptions, SandboxId, SandboxProvider } from './types.js';
 
 export class ArmadaCompute implements SandboxProvider {
 	private readonly armada: ArmadaClient;
-	/**
-	 * One sweeper for every sandbox this provider makes, rather than a timer
-	 * each: see `src/sweeper.ts`. Sandboxes join it once they have a pod and
-	 * leave on destroy, so it runs only while there is something to sweep.
-	 */
-	private readonly sweeper: GhostSweeper;
 
 	/**
 	 * Present only when `ARMADA_LOOKOUT_URL` is configured, because marimohub
@@ -25,14 +18,13 @@ export class ArmadaCompute implements SandboxProvider {
 
 	constructor(private readonly config: ArmadaConfig) {
 		this.armada = new ArmadaClient(config);
-		this.sweeper = new GhostSweeper(config.ghostSweepSeconds * 1000);
 		if (config.lookoutUrl !== undefined) {
 			this.listActive = async (): Promise<ActiveSandbox[]> => this.armada.listActive();
 		}
 	}
 
 	create(id: SandboxId, options?: CreateSandboxOptions): ArmadaSandbox {
-		return new ArmadaSandbox(id, this.config, this.armada, openAgent, options, this.sweeper);
+		return new ArmadaSandbox(id, this.config, this.armada, openAgent, options);
 	}
 
 	/** Kernels are reached directly at their Armada ingress, so nothing is proxied. */

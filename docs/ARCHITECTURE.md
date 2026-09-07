@@ -62,17 +62,19 @@ job on destroy. The job's ids are all the sandbox id: `clientId` so a resubmit d
 `jobSetId` so the session has its own event stream, and `externalJobUri` so the job
 can be found again. `listActive`, when Lookout is configured, asks Lookout.
 
-**Control channel** (`src/channel.ts`) is the client for the agent. It has three
-operations: `ready`, which polls the agent's health endpoint until the route to the
-pod works; `run`, which sends a command and collects its output and exit code; and
-`stream`, which forwards stdout as it is produced. It is the only thing that reaches
-into a pod.
+**Control channel** (`src/channel.ts`) is the client for the agent, and the only thing
+that reaches into a pod. It has `ready`, which polls the agent's health endpoint until
+the route to the pod works; `run` and `stream`, which execute a shell command and
+collect or forward its output; and typed operations for the rest: `writeFile`,
+`readFile` and `listFiles` carry bytes to and from the agent's `/files` endpoints, and
+`startProcess`, `waitForPort`, `processLogs` and `signalProcess` drive a detached
+process the agent parents.
 
-Everything above those two, in `src/sandbox.ts`, is shell commands: write files
-through `cat`, read them back as base64, list with `find`, launch the kernel with
-`setsid`, wait for its port with a `python3` one-liner, clone with `git`. The quoting
-and command builders are in `src/shell.ts`, transcribed from marimohub's own
-Kubernetes adapter so behaviour matches upstream.
+`src/sandbox.ts` sits above the channel. Running user code is still a shell command
+(`exec`, `execStream`, and the quoted `git clone`), so `src/shell.ts` keeps the env
+prefix and quoting for that, transcribed from marimohub's own Kubernetes adapter.
+Everything else, files and the kernel's lifecycle, goes to the agent's typed endpoints
+rather than through a shell, so no path is quoted and no content is wrapped in base64.
 
 ## The agent
 
@@ -93,19 +95,24 @@ flowchart LR
 ```
 
 The agent is a Go program with no dependencies, built as one static binary (`agent/`).
-It does four things:
+It does five things:
 
-- **Runs commands.** One endpoint, `POST /exec`, takes `{cmd, stdin, timeoutMs}` and
-  streams NDJSON back: the pid, then stdout and stderr chunks as base64, then the exit
-  status. Every command starts as the leader of a new session.
-- **Kills what its caller abandoned.** When the request ends, because the caller
-  disconnected or the deadline passed, the agent sends `SIGTERM` to the command's
-  process group and `SIGKILL` five seconds later. A Kubernetes exec could never do
-  this, and it is why the response streams rather than buffers.
-- **Checks the caller.** Every request carries a bearer token. The adapter mints one
-  per sandbox and puts only its SHA-256 in the pod spec, as `MH_AGENT_TOKEN_SHA256`.
-  The spec is readable through Armada's API and Lookout, and an environment variable is
-  inherited by every process in the pod, so the token itself never goes there.
+- **Runs commands.** `POST /exec` takes `{cmd, stdin, timeoutMs}` and streams NDJSON
+  back: the pid, then stdout and stderr chunks as base64, then the exit status. Every
+  command starts as the leader of a new session.
+- **Runs detached processes.** `/process/{start,status,logs,signal,waitport}` starts a
+  process the agent parents, so its liveness and exit code come from a real `wait` and
+  its port can be waited for in-pod. This is the kernel's lifecycle. A signal goes to
+  the process group, so stopping the kernel takes whatever it spawned with it.
+- **Reads and writes files.** `/files` carries bytes raw in the request or response
+  body and takes the path as a query parameter, so nothing is quoted for a shell or
+  wrapped in base64.
+- **Kills what its caller abandoned and checks the caller.** When a request ends,
+  because the caller disconnected or the deadline passed, the agent `SIGTERM`s the
+  command's process group and `SIGKILL`s it five seconds later; a Kubernetes exec could
+  never do this, and it is why `/exec` streams. Every request carries a bearer token,
+  and the pod spec holds only its SHA-256 (`MH_AGENT_TOKEN_SHA256`), because the spec is
+  readable through Armada's API and an env var is inherited by every process in the pod.
 - **Is PID 1.** It reaps orphaned zombies, so a crashed kernel is collected rather
   than left looking alive, and it forwards `SIGTERM` to every process when Kubernetes
   stops the container, inside the pod's grace period.
@@ -126,17 +133,17 @@ sequenceDiagram
   R-->>A: event: address for 2718, address for 8718
   A->>G: GET /healthz until it answers
   H->>A: write notebook files
-  A->>G: POST /exec: cat > file, content on stdin
+  A->>G: PUT /files: bytes in the body
   H->>A: run uv sync, start the kernel, wait for the port
   A->>G: POST /exec: uv sync
-  A->>G: POST /exec: setsid sh -lc marimo edit ... &
-  G->>K: starts, detached from the request
-  A->>G: POST /exec: wait for 2718 in-pod
+  A->>G: POST /process/start: sh -lc marimo edit ...
+  G->>K: agent parents it, detached from the request
+  A->>G: POST /process/waitport: 2718, watching the kernel
   H->>A: exposePort(2718)
   A-->>H: the address Armada reported
   H->>K: kernel traffic while the user works
   H->>A: read files back, destroy
-  A->>G: POST /exec: base64 file
+  A->>G: GET /files: bytes in the body
   A->>R: cancel job
 ```
 
@@ -158,24 +165,23 @@ service, the rule host for an ingress.
 ## Abandoned commands
 
 Most of marimohub's calls carry no timeout, and a marimohub restart abandons every
-command it had open. Three layers deal with that, from the one that normally acts to the
-one that repairs the rest:
+command it had open. The agent handles both: a command dies when its request's context
+ends, and a restart is precisely every request ending at once. So an abandoned command
+is stopped by the agent killing its process group, with nothing for the adapter to clean
+up afterwards.
 
-1. The agent kills a command's process group when its request ends.
-2. Each command records its group id in a file in the pod before it starts, and the
-   adapter kills that group when it abandons a command itself.
-3. A sweep, one timer per marimohub process, kills any group whose file exists and that
-   no sandbox is waiting on. Only files the adapter created are candidates, so the
-   kernel and whatever a notebook spawned are never touched.
-
-Layers 2 and 3 predate the agent and are kept as belt and braces; removing them is
-the next step in [AGENT-DESIGN.md](../AGENT-DESIGN.md).
+A command with no caller timeout is sent with `ARMADA_COMMAND_MAX_SECONDS` as its
+deadline (default 6 hours, `0` off), so a command nobody is waiting on any more cannot
+hold a process for the rest of the session. It is a backstop, not a timeout: the value
+is far past anything marimohub's own commands take. Streams are exempt, since how long
+one stays open is its reader's decision.
 
 ## What the kernel image must provide
 
-`/bin/sh`, `python3`, `git`, GNU `find` and util-linux `setsid`. The adapter never
-probes for them; a missing one surfaces as that command's own failure. marimohub's
-example sandbox image has all five. The agent itself needs nothing from the image.
+`/bin/sh`, so `exec` can run a command, and `git`, for a session that loads from a
+repository. That is all: the file and process endpoints are the agent's own code. The
+adapter never probes for either; a missing `sh` or `git` surfaces as that command's own
+failure. The agent itself needs nothing from the image.
 
 ## How the adapter is loaded
 
@@ -188,14 +194,13 @@ error, and the adapter runs with the server's full privileges.
 
 ## Where to look
 
-| Path                  | What it is                                                        |
-| --------------------- | ----------------------------------------------------------------- |
-| `src/types.ts`        | marimohub's adapter interface, transcribed by hand. Not ours.     |
-| `src/armada.ts`       | Placement: submit, watch, addresses, cancel, `listActive`.        |
-| `src/channel.ts`      | Control channel: the client for the agent.                        |
-| `src/sandbox.ts`      | One kernel session. Everything below `exec` is shell commands.    |
-| `src/shell.ts`        | Quoting and command builders, from marimohub's `compute-commons`. |
-| `src/podspec.ts`      | The pod spec: both containers, both ports, the volume, the hash.  |
-| `src/sweeper.ts`      | The one ghost sweeper per provider.                               |
-| `src/armada-types.ts` | Hand-written Armada wire types, checked against the pinned spec.  |
-| `agent/`              | The agent: a Go program run as PID 1 of the kernel container.     |
+| Path                  | What it is                                                                     |
+| --------------------- | ------------------------------------------------------------------------------ |
+| `src/types.ts`        | marimohub's adapter interface, transcribed by hand. Not ours.                  |
+| `src/armada.ts`       | Placement: submit, watch, addresses, cancel, `listActive`.                     |
+| `src/channel.ts`      | Control channel: the client for the agent's exec, process and file endpoints.  |
+| `src/sandbox.ts`      | One kernel session: `exec` on the agent, files and processes on its endpoints. |
+| `src/shell.ts`        | Env prefix, quoting and the clone command, from marimohub's `compute-commons`. |
+| `src/podspec.ts`      | The pod spec: both containers, both ports, the volume, the hash.               |
+| `src/armada-types.ts` | Hand-written Armada wire types, checked against the pinned spec.               |
+| `agent/`              | The agent: a Go program run as PID 1 of the kernel container.                  |

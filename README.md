@@ -27,24 +27,23 @@ in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Configuration
 
-| Variable                             | Required | Description                                              |
-| ------------------------------------ | -------- | -------------------------------------------------------- |
-| `ARMADA_URL`                         | yes      | Armada REST API base URL                                 |
-| `ARMADA_QUEUE`                       | yes      | Queue jobs are submitted to                              |
-| `ARMADA_AGENT_IMAGE`                 | yes      | Kernel agent image, run as the init container            |
-| `MARIMOHUB_COMPUTE_IMAGE`            | yes      | Kernel image (first entry of the list)                   |
-| `ARMADA_NAMESPACE`                   | no       | Pod namespace (default `default`)                        |
-| `ARMADA_LOOKOUT_URL`                 | no       | Lookout base URL; enables `listActive` reconciliation    |
-| `ARMADA_PRIORITY_CLASS`              | no       | Use a non-preemptible class for interactive sessions     |
-| `ARMADA_KERNEL_PORT`                 | no       | Port marimo serves on (default `2718`)                   |
-| `ARMADA_AGENT_PORT`                  | no       | Port the agent listens on (default `8718`)               |
-| `ARMADA_GHOST_SWEEP_SECONDS`         | no       | Abandoned-process sweep interval (default `60`, `0` off) |
-| `ARMADA_COMMAND_MAX_SECONDS`         | no       | Backstop for one exec (default `21600`, `0` off)         |
-| `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` | no       | Public kernel hostname                                   |
-| `ARMADA_AUTH_USERNAME`               | no       | Basic auth, set with the password                        |
-| `ARMADA_AUTH_PASSWORD`               | no       | Basic auth, set with the username                        |
-| `ARMADA_AUTH_TOKEN`                  | no       | Bearer token, for example from OIDC                      |
-| `ARMADA_AUTH_TOKEN_FILE`             | no       | Bearer token file, re-read on every request              |
+| Variable                             | Required | Description                                           |
+| ------------------------------------ | -------- | ----------------------------------------------------- |
+| `ARMADA_URL`                         | yes      | Armada REST API base URL                              |
+| `ARMADA_QUEUE`                       | yes      | Queue jobs are submitted to                           |
+| `ARMADA_AGENT_IMAGE`                 | yes      | Kernel agent image, run as the init container         |
+| `MARIMOHUB_COMPUTE_IMAGE`            | yes      | Kernel image (first entry of the list)                |
+| `ARMADA_NAMESPACE`                   | no       | Pod namespace (default `default`)                     |
+| `ARMADA_LOOKOUT_URL`                 | no       | Lookout base URL; enables `listActive` reconciliation |
+| `ARMADA_PRIORITY_CLASS`              | no       | Use a non-preemptible class for interactive sessions  |
+| `ARMADA_KERNEL_PORT`                 | no       | Port marimo serves on (default `2718`)                |
+| `ARMADA_AGENT_PORT`                  | no       | Port the agent listens on (default `8718`)            |
+| `ARMADA_COMMAND_MAX_SECONDS`         | no       | Backstop for one exec (default `21600`, `0` off)      |
+| `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` | no       | Public kernel hostname                                |
+| `ARMADA_AUTH_USERNAME`               | no       | Basic auth, set with the password                     |
+| `ARMADA_AUTH_PASSWORD`               | no       | Basic auth, set with the username                     |
+| `ARMADA_AUTH_TOKEN`                  | no       | Bearer token, for example from OIDC                   |
+| `ARMADA_AUTH_TOKEN_FILE`             | no       | Bearer token file, re-read on every request           |
 
 Configuration is validated at startup, so a missing variable stops marimohub from
 booting rather than failing at the first session.

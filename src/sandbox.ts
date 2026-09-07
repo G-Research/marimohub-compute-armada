@@ -1,26 +1,18 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { ArmadaClient, PodLocation, SubmittedJob } from './armada.js';
 import type { ArmadaConfig } from './config.js';
-import type { AgentEndpoint, CommandResult, ControlChannel } from './channel.js';
+import type {
+	AgentEndpoint,
+	AgentFileEntry,
+	CommandResult,
+	ControlChannel,
+	ListFilesOutcome,
+	PortWait,
+	ReadFileOutcome,
+} from './channel.js';
+import { CommandTimeoutError } from './channel.js';
 import { buildPodSpec } from './podspec.js';
-import type { GhostSweeper } from './sweeper.js';
-import {
-	assertEnvName,
-	gitCloneCommand,
-	killGroupCommand,
-	listFilesCommand,
-	parseSweptGroups,
-	processGroupCommand,
-	NOT_A_DIRECTORY_EXIT,
-	parseListFilesOutput,
-	portWaitCommand,
-	READ_FILE_NOT_FOUND_EXIT,
-	readFileCommand,
-	shellQuote,
-	sweepGroupsCommand,
-	withEnvPrefix,
-} from './shell.js';
-import type { SweptGroup } from './shell.js';
+import { assertEnvName, gitCloneCommand, withEnvPrefix } from './shell.js';
 import type {
 	CreateSandboxOptions,
 	ExecOptions,
@@ -28,6 +20,7 @@ import type {
 	ExecStreamOptions,
 	ExposePortOptions,
 	ExposePortResult,
+	FileInfo,
 	GitCheckoutOptions,
 	ListFilesOptions,
 	ListFilesResult,
@@ -56,31 +49,15 @@ function decodeUtf8(bytes: Uint8Array): string | undefined {
 	}
 }
 
+function reason(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
 /** Each write is one request to the agent; cap how many are in flight. */
 const WRITE_CONCURRENCY = 8;
 
 /** How long a running pod gets to answer on the agent port before `ready` gives up. */
 const AGENT_READY_TIMEOUT_MS = 30_000;
-
-/** Port waits run in-pod in chunks; each boundary is where a dead kernel gets noticed. */
-const PORT_WAIT_CHUNK_MS = 30_000;
-/** First chunk, kept short so a launch that fails outright reports fast. */
-const PORT_WAIT_FIRST_CHUNK_MS = 2_000;
-
-/** Distinguishes the log files of processes started in the same pod. */
-let processSequence = 0;
-
-/** Distinguishes the process-group files of execs and streams in the same pod. */
-let groupSequence = 0;
-
-/** A command started in its own process group, and whether anyone still wants it. */
-interface TrackedCommand {
-	/** Only an `exec` is subject to the backstop; a stream's life is its reader's. */
-	kind: 'exec' | 'stream';
-	command: string;
-	startedAt: number;
-	awaiting: boolean;
-}
 
 /** A non-zero exit is the command's business; marimohub wants it as a result. */
 export function toExecResult(result: CommandResult): ExecResult {
@@ -96,11 +73,42 @@ export function toExecResult(result: CommandResult): ExecResult {
 }
 
 /**
+ * The agent's listing as marimohub's `FileInfo` records.
+ *
+ * Hiding is done here rather than in the agent's walk, so a recursive listing
+ * still descends into a dot directory and reports its non-dot children, which
+ * is what upstream does and what `readSessionArtifacts` needs for `__marimo__`
+ * trees: each entry is judged on its own name alone.
+ */
+export function toFileInfos(
+	entries: readonly AgentFileEntry[],
+	rootPath: string,
+	options?: ListFilesOptions,
+): FileInfo[] {
+	const files: FileInfo[] = [];
+	for (const entry of entries) {
+		const name: string = entry.path.slice(entry.path.lastIndexOf('/') + 1);
+		if (options?.includeHidden !== true && name.startsWith('.')) continue;
+		files.push({
+			name,
+			absolutePath: entry.path,
+			relativePath: entry.path.startsWith(rootPath)
+				? entry.path.slice(rootPath.length).replace(/^\//, '')
+				: entry.path,
+			type: entry.type,
+			size: entry.size,
+		});
+	}
+	return files;
+}
+
+/**
  * One kernel session, backed by one Armada job.
  *
  * Resolution is lazy: `create()` is synchronous and id-addressed, so the job is
- * submitted on first use. Everything below `exec` is built out of ordinary shell
- * commands, so implementing `exec` well is most of the work.
+ * submitted on first use. Commands run through the agent's `/exec`; detached
+ * processes and files go through its own endpoints, so nothing here builds a
+ * shell command beyond the env prefix and the quoted `git clone`.
  */
 export class ArmadaSandbox implements SandboxInstance {
 	/** Armada cannot mount a bucket; the provisioner falls back to copying files. */
@@ -122,27 +130,12 @@ export class ArmadaSandbox implements SandboxInstance {
 	private env: Record<string, string> = {};
 	private envDefaults: Record<string, string> = {};
 
-	/**
-	 * Every command this sandbox started in a process group, by group file.
-	 *
-	 * Registered before the command is sent, so the record is never missing
-	 * something the pod has already started, and `awaiting` says whether anyone is
-	 * still waiting for it. {@link sweep} leaves the awaited ones alone and kills
-	 * the rest; a command that finished normally is dropped outright, since its
-	 * own trap removed the file.
-	 */
-	private readonly groups: Map<string, TrackedCommand> = new Map();
-
-	private sweeping = false;
-	private ghostsKilled = 0;
-
 	constructor(
 		private readonly id: SandboxId,
 		private readonly config: ArmadaConfig,
 		private readonly armada: ArmadaClient,
 		private readonly openChannel: (endpoint: AgentEndpoint) => ControlChannel,
 		private readonly options?: CreateSandboxOptions,
-		private readonly sweeper?: GhostSweeper,
 	) {}
 
 	/**
@@ -169,9 +162,6 @@ export class ArmadaSandbox implements SandboxInstance {
 		const channel: ControlChannel = this.openChannel({ address, token: this.token, pod: this.pod });
 		await channel.ready(AGENT_READY_TIMEOUT_MS);
 		this.channel = channel;
-		// Swept from here until `destroy`, by the provider's one sweeper rather
-		// than a timer of our own: see `src/sweeper.ts` for why that matters.
-		this.sweeper?.add(this);
 	}
 
 	/** Where the pod landed, once it has. For reporting, not for reaching it. */
@@ -180,175 +170,48 @@ export class ArmadaSandbox implements SandboxInstance {
 	}
 
 	/**
-	 * Kill the process groups this sandbox started and is no longer waiting on.
-	 *
-	 * Every abandonable command records its group id in a file and removes it on
-	 * the way out, so a file that survives a command nobody is waiting on is a
-	 * ghost by construction. That is what makes an automatic kill safe here: the
-	 * kernel and whatever the user's notebook spawned have no such file, so they
-	 * are never candidates. A sweep that guessed from process state could not
-	 * tell them apart.
-	 *
-	 * The kill in `onStop` is what normally stops an abandoned command; this
-	 * repairs the cases where it could not. A cancel can beat the command to
-	 * recording its group, the `onStop` exec can fail on a channel having a bad
-	 * minute, and a marimohub restart abandons every stream it had open without
-	 * running one at all.
-	 *
-	 * Best effort throughout: a sweep that cannot reach the pod is a sweep that
-	 * happens a minute later instead.
-	 */
-	async sweep(): Promise<number> {
-		// Nothing to sweep before there is a pod, and never two at once: the second
-		// would see the first's work as unowned.
-		const channel: ControlChannel | undefined = this.channel;
-		if (channel === undefined || this.sweeping) return 0;
-		this.sweeping = true;
-		try {
-			this.expireLongRunning();
-			const awaited: string[] = [...this.groups]
-				.filter(([, tracked]: [string, TrackedCommand]) => tracked.awaiting)
-				.map(([groupFile]: [string, TrackedCommand]) => groupFile);
-			const result: CommandResult = await channel.run(['sh', '-c', sweepGroupsCommand(awaited)]);
-
-			const swept: SweptGroup[] = parseSweptGroups(result.stdout);
-			const killed: SweptGroup[] = swept.filter((group: SweptGroup) => group.outcome === 'killed');
-			for (const group of killed) {
-				// Naming the command is the difference between a report you can act on
-				// and a bare process id. A file we have no record of is a leftover from
-				// a previous marimohub, which is exactly the case nothing else repairs.
-				const tracked: TrackedCommand | undefined = this.groups.get(group.groupFile);
-				const what: string =
-					tracked === undefined
-						? 'from a previous marimohub process'
-						: `${JSON.stringify(tracked.command)}, started ${String(Math.round((Date.now() - tracked.startedAt) / 1000))}s ago`;
-				// The one place this is visible while a session runs, and it means a
-				// kill that should have happened earlier did not.
-				console.warn(
-					`[armada] sandbox ${this.id}: killed abandoned process group ${group.group} in ${this.pod?.podName ?? 'its pod'} (${what})`,
-				);
-			}
-			this.ghostsKilled += killed.length;
-			// Every file it reported is gone from the pod, and the rest were never
-			// there, so nothing not still awaited is worth remembering.
-			for (const [groupFile, tracked] of this.groups) {
-				if (!tracked.awaiting) this.groups.delete(groupFile);
-			}
-			return killed.length;
-		} catch {
-			return 0;
-		} finally {
-			this.sweeping = false;
-		}
-	}
-
-	/** Ghosts found since marimohub last asked, which it logs per session. */
-	drainCounters(): Record<string, number> {
-		const counters: Record<string, number> = { ghosts_killed: this.ghostsKilled };
-		this.ghostsKilled = 0;
-		return counters;
-	}
-
-	/**
-	 * Everything above this method is built out of `exec`, so this is the one that
-	 * has to be right. A command that fails is a normal result, not an exception;
-	 * only the channel itself failing is a `BACKEND_ERROR`.
+	 * Everything above this method is built on the channel, so this is the one
+	 * that has to be right. A command that fails is a normal result, not an
+	 * exception; only the channel itself failing is a `BACKEND_ERROR`.
 	 *
 	 * A login shell, matching marimohub's kubernetes adapter: what arrives here is
 	 * user and provisioner code, and an image that puts `uv` or `python3` on the
-	 * PATH through a profile script has to keep working. Our own protocol commands
-	 * never come through here; they run non-login so nothing a profile prints can
-	 * reach output we parse.
+	 * PATH through a profile script has to keep working.
+	 *
+	 * The caller's timeout goes to the agent, which kills the command's process
+	 * group at the deadline. A command with no timeout gets
+	 * `ARMADA_COMMAND_MAX_SECONDS` instead: most of marimohub's exec calls carry
+	 * none because the work legitimately takes minutes, and this is the
+	 * hours-later answer to "nobody expected this to still be running", which
+	 * would otherwise hold a request and a process for the rest of the session.
 	 */
 	async exec(cmd: string, options?: ExecOptions): Promise<ExecResult> {
 		const command: string = withEnvPrefix(cmd, this.env, this.envDefaults);
-
-		let result: CommandResult;
+		const timeout: number | undefined = options?.timeout;
+		const backstopMs: number | undefined =
+			timeout === undefined && this.config.commandMaxSeconds > 0
+				? this.config.commandMaxSeconds * 1000
+				: undefined;
+		const deadline: number | undefined = timeout ?? backstopMs;
 		try {
 			const channel: ControlChannel = await this.open();
-			// Every exec runs in its own process group and records it in a file.
-			// The agent kills the group itself when a deadline passes or the
-			// request drops, so the file is the sweep's handle for what that could
-			// not reach: a kill that raced the prologue, or a marimohub that
-			// restarted and left the pod's commands behind (decisions 24 and 25).
-			const timeout: number | undefined = options?.timeout;
-			const groupFile: string = this.track('exec', cmd);
-			try {
-				result = await channel.run(
-					processGroupCommand(groupFile, command),
-					timeout === undefined
-						? {}
-						: { timeoutMs: timeout, onStop: async () => this.killGroup(channel, groupFile) },
-				);
-				// It returned, so its trap has run and there is no file to sweep.
-				this.groups.delete(groupFile);
-			} catch (failure) {
-				// It did not return, so the command may well still be running: keep the
-				// record, and let the sweep deal with what the timeout kill could not.
-				this.abandon(groupFile);
-				throw failure;
-			}
+			const result: CommandResult = await channel.run(
+				['sh', '-lc', command],
+				deadline === undefined ? {} : { timeoutMs: deadline },
+			);
+			return toExecResult(result);
 		} catch (error) {
+			const stderr: string =
+				error instanceof CommandTimeoutError && backstopMs !== undefined
+					? `Command ran past ARMADA_COMMAND_MAX_SECONDS (${String(this.config.commandMaxSeconds)}s) and was killed: ${cmd}`
+					: reason(error);
 			return {
 				success: false,
 				stdout: '',
-				stderr: error instanceof Error ? error.message : String(error),
+				stderr,
 				error: { code: 'BACKEND_ERROR' },
 			};
 		}
-		return toExecResult(result);
-	}
-
-	/**
-	 * Start tracking a command, returning the group file it should record itself
-	 * in. The record exists before the command does, so a sweep can never mistake
-	 * a command being started for one nobody wants.
-	 */
-	private track(kind: TrackedCommand['kind'], command: string): string {
-		const groupFile = `/tmp/mh-${kind}-${String(++groupSequence)}.pgid`;
-		this.groups.set(groupFile, { kind, command, startedAt: Date.now(), awaiting: true });
-		return groupFile;
-	}
-
-	/**
-	 * Give up on an `exec` that has run past `ARMADA_COMMAND_MAX_SECONDS`.
-	 *
-	 * This is the backstop, not a timeout: the caller's `ExecOptions.timeout` is
-	 * the timeout, and most of marimohub's exec calls carry none because the work
-	 * legitimately takes minutes. Hours is the point at which nobody expected it
-	 * to still be running, and the alternative is a websocket and a process held
-	 * for the rest of the session while its caller waits forever.
-	 *
-	 * It only marks the command as no longer awaited; the sweep it runs inside
-	 * then kills it like any other abandoned group, and the caller's `exec` sees
-	 * the command die rather than hanging on.
-	 *
-	 * Streams are exempt. A `tail -f` open for hours is a consumer's decision, not
-	 * a stuck command.
-	 */
-	private expireLongRunning(): void {
-		const cap: number = this.config.commandMaxSeconds;
-		if (cap === 0) return;
-		for (const tracked of this.groups.values()) {
-			if (!tracked.awaiting || tracked.kind !== 'exec') continue;
-			const seconds: number = Math.round((Date.now() - tracked.startedAt) / 1000);
-			if (seconds < cap) continue;
-			tracked.awaiting = false;
-			console.warn(
-				`[armada] sandbox ${this.id}: ${JSON.stringify(tracked.command)} has run for ${String(seconds)}s, past ARMADA_COMMAND_MAX_SECONDS (${String(cap)}s); killing it`,
-			);
-		}
-	}
-
-	/** Stop waiting for a command, without forgetting that we started it. */
-	private abandon(groupFile: string): void {
-		const tracked: TrackedCommand | undefined = this.groups.get(groupFile);
-		if (tracked !== undefined) tracked.awaiting = false;
-	}
-
-	/** Kill the process group `groupFile` names, for a command we abandoned. */
-	private async killGroup(channel: ControlChannel, groupFile: string): Promise<void> {
-		await channel.run(['sh', '-c', killGroupCommand(groupFile)]);
 	}
 
 	/** The agent, submitting the job and waiting for its pod first if nobody has yet. */
@@ -362,105 +225,81 @@ export class ArmadaSandbox implements SandboxInstance {
 	/**
 	 * The same command as `exec`, with its stdout arriving as it is produced.
 	 *
-	 * A login shell, like `exec`: this runs whatever the caller asked for, not a
-	 * protocol command whose output we parse. Unlike `exec` there is no typed
-	 * failure to return, so a control channel that cannot be reached throws here
-	 * rather than resolving to a `BACKEND_ERROR` stream.
-	 *
-	 * The command runs under `setsid` in its own process group, and the shell
-	 * writes that group's id to a file before starting it. Cancelling closes the
-	 * request and the agent kills the group; the file is what the sweep uses for
-	 * the cases that kill could not reach (decision 25).
+	 * A login shell, like `exec`: this runs whatever the caller asked for. Unlike
+	 * `exec` there is no typed failure to return, so a control channel that
+	 * cannot be reached throws here rather than resolving to a `BACKEND_ERROR`
+	 * stream. Cancelling, or the timeout passing, closes the request, and the
+	 * agent kills the command's process group when it sees that.
 	 */
 	async execStream(cmd: string, options?: ExecStreamOptions): Promise<ReadableStream> {
 		const channel: ControlChannel = await this.open();
 		const command: string = withEnvPrefix(cmd, this.env, this.envDefaults);
-		const groupFile: string = this.track('stream', cmd);
-
-		return channel.stream(processGroupCommand(groupFile, command), {
-			...(options?.timeout === undefined ? {} : { timeoutMs: options.timeout }),
-			// Best effort: a cancel in the instant before the prologue wrote the file
-			// finds nothing to kill. The sweep is what repairs that.
-			onStop: async () => {
-				this.abandon(groupFile);
-				await this.killGroup(channel, groupFile);
-			},
-			// Reached however the command ended, so an abandoned one keeps its record
-			// and one that ended on its own drops it.
-			onFinished: () => {
-				if (this.groups.get(groupFile)?.awaiting === true) this.groups.delete(groupFile);
-			},
-		});
+		return channel.stream(
+			['sh', '-lc', command],
+			options?.timeout === undefined ? {} : { timeoutMs: options.timeout },
+		);
 	}
 
 	/**
 	 * Read one file back out of the pod.
 	 *
-	 * The bytes cross as base64 ({@link readFileCommand} says why) and the
-	 * encoding we report is decided from them: text is returned decoded, because
-	 * marimohub's `readSessionArtifacts` takes `content` and never looks at
-	 * `encoding`, and anything that is not valid UTF-8 is returned as base64,
-	 * which is what `proposalCapture` decodes. Reporting base64 unconditionally
-	 * would store base64 as the notebook source; reporting UTF-8 unconditionally
-	 * would corrupt an image the user changed.
+	 * The bytes cross raw, and the encoding we report is decided from them: text
+	 * is returned decoded, because marimohub's `readSessionArtifacts` takes
+	 * `content` and never looks at `encoding`, and anything that is not valid
+	 * UTF-8 is returned as base64, which is what `proposalCapture` decodes.
+	 * Reporting base64 unconditionally would store base64 as the notebook
+	 * source; reporting UTF-8 unconditionally would corrupt an image the user
+	 * changed.
 	 *
 	 * Unlike upstream, an absent path is `NOT_FOUND` rather than `READ_FAILED`.
 	 * Session capture reads four fixed paths of which some routinely do not
 	 * exist, so "never written" is the common answer and worth distinguishing
-	 * from "could not be read".
+	 * from "could not be read". The agent's `not_found` carries it.
 	 */
 	async readFile(path: string): Promise<ReadFileResult> {
-		let result: CommandResult;
+		let read: ReadFileOutcome;
 		try {
-			// No login shell and no env prefix: this stdout is a protocol value we
-			// parse, and profile scripts print to stdout.
-			result = await (await this.open()).run(['sh', '-c', readFileCommand(path)]);
+			read = await (await this.open()).readFile(path);
 		} catch {
 			return { success: false, content: '', error: { code: 'BACKEND_ERROR' } };
 		}
-		if (result.exitCode === READ_FILE_NOT_FOUND_EXIT) {
+		if (read.outcome === 'not-found') {
 			return { success: false, content: '', error: { code: 'NOT_FOUND' } };
 		}
-		if (result.exitCode !== 0) {
+		if (read.outcome === 'failed') {
 			return { success: false, content: '', error: { code: 'READ_FAILED' } };
 		}
-		// Re-encoded rather than passed through, because GNU base64 wraps its
-		// output at 76 columns and the decoders downstream take one line.
-		const bytes: Buffer = Buffer.from(result.stdout, 'base64');
-		const text: string | undefined = decodeUtf8(bytes);
+		const text: string | undefined = decodeUtf8(read.bytes);
 		return text === undefined
-			? { success: true, content: bytes.toString('base64'), encoding: 'base64' }
+			? { success: true, content: Buffer.from(read.bytes).toString('base64'), encoding: 'base64' }
 			: { success: true, content: text, encoding: 'utf-8' };
 	}
 
 	/**
 	 * List a directory, which session capture uses to size the files it is about
-	 * to read and to enumerate a workspace.
-	 *
-	 * Also a non-login shell without the env prefix, for the reason `readFile`
-	 * has: the records are NUL-separated protocol output. This is where upstream
-	 * diverges from its own rule, running its `find` through the ordinary `exec`
-	 * path, where a profile script that prints anything corrupts the listing.
+	 * to read and to enumerate a workspace. The agent walks the tree itself and
+	 * answers structured records; only the hidden-file filter and the relative
+	 * paths are decided here ({@link toFileInfos}).
 	 */
 	async listFiles(path: string, options?: ListFilesOptions): Promise<ListFilesResult> {
-		let result: CommandResult;
+		let listed: ListFilesOutcome;
 		try {
-			result = await (await this.open()).run(['sh', '-c', listFilesCommand(path, options)]);
+			listed = await (await this.open()).listFiles(path, options?.recursive === true);
 		} catch {
 			return { success: false, files: [], error: { code: 'BACKEND_ERROR' } };
 		}
-		if (result.exitCode === NOT_A_DIRECTORY_EXIT) {
+		if (listed.outcome === 'not-a-directory') {
 			return { success: false, files: [], error: { code: 'NOT_A_DIRECTORY' } };
 		}
-		if (result.exitCode !== 0) {
+		if (listed.outcome === 'failed') {
 			return { success: false, files: [], error: { code: 'LIST_FAILED' } };
 		}
-		return { success: true, files: parseListFilesOutput(result.stdout, path, options) };
+		return { success: true, files: toFileInfos(listed.entries, path, options) };
 	}
 
 	/**
-	 * One command per file. Content goes over stdin, never into the command
-	 * line, so bytes arrive verbatim and nothing needs escaping beyond the path.
+	 * One request per file, bytes in the body: nothing is quoted, nothing passes
+	 * through a shell, and `Uint8Array` content arrives verbatim.
 	 */
 	async writeFiles(files: readonly SandboxFileWrite[]): Promise<void> {
 		if (files.length === 0) return;
@@ -469,17 +308,10 @@ export class ArmadaSandbox implements SandboxInstance {
 		const write: (file: SandboxFileWrite) => Promise<void> = async (
 			file: SandboxFileWrite,
 		): Promise<void> => {
-			// No slash means the pod's working directory; a slash at 0 means `/`,
-			// which exists. Only a real parent needs creating.
-			const slash: number = file.path.lastIndexOf('/');
-			const mkdir: string =
-				slash > 0 ? `mkdir -p -- ${shellQuote(file.path.slice(0, slash))} && ` : '';
-			const result: CommandResult = await channel.run(
-				['sh', '-c', `${mkdir}cat > ${shellQuote(file.path)}`],
-				{ stdin: file.content },
-			);
-			if (result.exitCode !== 0) {
-				throw new Error(`Writing ${file.path} failed: ${result.stderr}`);
+			try {
+				await channel.writeFile(file.path, file.content);
+			} catch (error) {
+				throw new Error(`Writing ${file.path} failed: ${reason(error)}`, { cause: error });
 			}
 		};
 
@@ -492,9 +324,9 @@ export class ArmadaSandbox implements SandboxInstance {
 	/**
 	 * Clone a repository, upstream's one-liner: build a quoted `git clone` and
 	 * run it through the ordinary `exec` path. That path is what gives it a login
-	 * shell (a `git` a profile script put on PATH is found), the accumulated env
-	 * (credential helpers read variables), and a process group the sweep can kill
-	 * if the clone is abandoned mid-transfer.
+	 * shell (a `git` a profile script put on PATH is found) and the accumulated
+	 * env (credential helpers read variables), and the agent kills the clone if
+	 * it is abandoned mid-transfer.
 	 */
 	async gitCheckout(repo: string, options?: GitCheckoutOptions): Promise<void> {
 		const result: ExecResult = await this.exec(gitCloneCommand(repo, options));
@@ -523,17 +355,15 @@ export class ArmadaSandbox implements SandboxInstance {
 	}
 
 	/**
-	 * Launch a long-lived process (the kernel) detached, so it outlives the
-	 * request that started it: setsid, output to a log file, stdin closed, PID
-	 * echoed back. The outer shell is non-login because its stdout is the PID we
-	 * parse; the detached inner shell is a login shell so profile-provided env
-	 * (a PATH with uv and python on it) reaches the kernel, its output going to
-	 * the log file where profile noise is harmless.
+	 * Launch a long-lived process (the kernel) through the agent, which parents
+	 * it: it survives this request because the agent lives for the pod's life,
+	 * its exit status is collected by a real `wait`, and its output goes to a
+	 * log the agent owns. A login shell, so profile-provided env (a PATH with
+	 * uv and python on it) reaches the kernel; its stdout is a log, not a
+	 * protocol value, so profile noise is harmless.
 	 */
 	async startProcess(cmd: string, options?: StartProcessOptions): Promise<SandboxProcess> {
 		const channel: ControlChannel = await this.open();
-		const logFile = `/tmp/mh-proc-${String(++processSequence)}.log`;
-		const cd: string = options?.cwd === undefined ? '' : `cd ${shellQuote(options.cwd)}; `;
 
 		const processEnv: Record<string, string> = {};
 		for (const [name, value] of Object.entries(options?.env ?? {})) {
@@ -546,20 +376,18 @@ export class ArmadaSandbox implements SandboxInstance {
 			this.envDefaults,
 		);
 
-		const launch = `${cd}setsid sh -lc ${shellQuote(command)} >${logFile} 2>&1 </dev/null & echo $!`;
-		const started: CommandResult = await channel.run(['sh', '-c', launch]);
-		if (started.exitCode !== 0) {
-			throw new Error(`Starting "${cmd}" failed: ${started.stderr}`);
+		let pid: number;
+		try {
+			pid = await channel.startProcess(['sh', '-lc', command], options?.cwd);
+		} catch (error) {
+			throw new Error(`Starting "${cmd}" failed: ${reason(error)}`, { cause: error });
 		}
-
-		const pid: string = started.stdout.trim();
 		return new ArmadaProcess(
-			options?.processId ?? `armada-proc-${pid === '' ? String(processSequence) : pid}`,
+			options?.processId ?? `armada-proc-${String(pid)}`,
 			cmd,
 			channel,
 			this.pod === undefined ? this.id : `${this.pod.podNamespace}/${this.pod.podName}`,
 			pid,
-			logFile,
 		);
 	}
 
@@ -586,7 +414,6 @@ export class ArmadaSandbox implements SandboxInstance {
 	 * never submitted at all: cancelling an empty set is a no-op.
 	 */
 	async destroy(): Promise<void> {
-		this.sweeper?.remove(this);
 		if (this.job === undefined) await this.armada.cancelSet(this.id);
 		else await this.armada.cancel(this.job);
 		this.pod = undefined;
@@ -594,7 +421,7 @@ export class ArmadaSandbox implements SandboxInstance {
 	}
 }
 
-/** A detached process in the pod, addressed by the PID its launch echoed back. */
+/** A detached process in the pod, addressed by the pid the agent returned. */
 class ArmadaProcess implements SandboxProcess {
 	constructor(
 		readonly id: string,
@@ -602,84 +429,48 @@ class ArmadaProcess implements SandboxProcess {
 		private readonly channel: ControlChannel,
 		/** The pod, for messages. */
 		private readonly where: string,
-		private readonly pid: string,
-		private readonly logFile: string,
+		private readonly pid: number,
 	) {}
 
-	private async run(cmd: string): Promise<CommandResult> {
-		return this.channel.run(['sh', '-c', cmd]);
-	}
-
-	private async log(): Promise<string> {
-		return (await this.run(`cat ${this.logFile} 2>/dev/null || true`)).stdout;
-	}
-
-	/**
-	 * Exit 0 if the process is alive. Not `kill -0`: a process that has exited
-	 * but not been collected is a zombie that `kill -0` still counts as alive.
-	 * The agent, as PID 1, collects orphans, so today the two agree, but the
-	 * probe reads the state field and is right either way. The field sits after
-	 * the last `)` because the comm field before it may itself contain spaces.
-	 */
-	private aliveCommand(): string {
-		return `state=$(sed 's/^.*) //' /proc/${this.pid}/stat 2>/dev/null | cut -d' ' -f1); [ -n "$state" ] && [ "$state" != Z ]`;
-	}
-
 	async kill(signal?: string): Promise<void> {
-		if (this.pid === '') return;
 		try {
-			await this.run(`kill -${signal ?? 'TERM'} ${this.pid} 2>/dev/null || true`);
+			await this.channel.signalProcess(this.pid, signal ?? 'TERM');
 		} catch {
-			// Already gone; killing is best effort.
+			// Killing is best effort; a process already gone is the goal reached.
 		}
 	}
 
 	/**
 	 * `mode`/`path` are accepted but a TCP accept is all that is checked, the
 	 * same as marimohub's kubernetes adapter.
+	 *
+	 * One request: the agent loops in-pod against `127.0.0.1` and watches this
+	 * process at the same time, so a kernel that dies is reported the moment it
+	 * does, worded so the provisioner classifies it as a crash, not a timeout.
 	 */
 	async waitForPort(port: number, options?: WaitForPortOptions): Promise<void> {
 		const timeout: number = options?.timeout ?? 30_000;
-		// The waiter loops in-pod rather than being probed from here: every probe
-		// would be a fresh request to the agent, so an external poll would
-		// quantize the wait to that round-trip grid. Chunked so each boundary is
-		// where a dead kernel gets noticed, with the first chunk short so a launch
-		// that fails outright reports fast. `attempts` bounds the loop if the
-		// in-pod waiter itself returns instantly (say, python3 missing).
-		const deadline: number = Date.now() + timeout;
-		const attempts: number = 1 + Math.ceil(timeout / PORT_WAIT_CHUNK_MS);
-		let chunkMs: number = PORT_WAIT_FIRST_CHUNK_MS;
-		// oxlint-disable no-await-in-loop -- each chunk must finish before the next is sized
-		for (let attempt = 0; attempt < attempts; attempt++) {
-			const remainingMs: number = deadline - Date.now();
-			if (remainingMs <= 0) break;
-			// Fractional seconds: the waiter runs a monotonic ms-precision deadline,
-			// so the chunks sum to the full timeout without whole-second rounding.
-			const seconds: number = Number((Math.min(chunkMs, remainingMs) / 1000).toFixed(2));
-			chunkMs = PORT_WAIT_CHUNK_MS;
-			// A login shell, so a python3 that a profile script put on PATH is found.
-			const waited: CommandResult = await this.channel.run([
-				'sh',
-				'-lc',
-				portWaitCommand(port, seconds),
-			]);
-			if (waited.exitCode === 0) return;
-			// The chunk elapsed with the port closed. A dead kernel never opens it,
-			// so check liveness before spending another chunk, and word the error so
-			// the provisioner classifies it as a crash, not a timeout.
-			if (this.pid !== '' && (await this.run(this.aliveCommand())).exitCode !== 0) {
-				throw new Error(
-					`process exited before port ${String(port)} opened.\n${await this.log()}`.trim(),
-				);
-			}
+		const wait: PortWait = await this.channel.waitForPort(port, timeout, this.pid);
+		if (wait.open) return;
+		const log: string = await this.logsQuietly();
+		if (wait.exited === true) {
+			throw new Error(`process exited before port ${String(port)} opened.\n${log}`.trim());
 		}
-		// oxlint-enable no-await-in-loop
 		throw new Error(
-			`timed out waiting for port ${String(port)} in ${this.where} after ${String(timeout)}ms.\n${await this.log()}`,
+			`timed out waiting for port ${String(port)} in ${this.where} after ${String(timeout)}ms.\n${log}`,
 		);
 	}
 
 	async getLogs(): Promise<{ stdout: string; stderr: string }> {
-		return { stdout: await this.log(), stderr: '' };
+		return { stdout: await this.channel.processLogs(this.pid), stderr: '' };
+	}
+
+	/** The log, for a failure message that is already being thrown. */
+	private async logsQuietly(): Promise<string> {
+		try {
+			return await this.channel.processLogs(this.pid);
+		} catch {
+			return '';
+		}
 	}
 }

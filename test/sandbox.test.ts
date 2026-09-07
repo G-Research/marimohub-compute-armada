@@ -1,18 +1,24 @@
-import { beforeAll, describe, expect, it } from 'bun:test';
+import { describe, expect, it } from 'bun:test';
 import type { ArmadaClient, PodLocation } from '../src/armada.js';
 import { readConfig } from '../src/config.js';
 import type { ArmadaConfig } from '../src/config.js';
+import { CommandTimeoutError } from '../src/channel.js';
 import type { CommandResult, ControlChannel, RunOptions, StreamOptions } from '../src/channel.js';
 import { ArmadaSandbox } from '../src/sandbox.js';
-import { shellQuote } from '../src/shell.js';
-import type { FileInfo, ListFilesResult, ReadFileResult, SandboxProcess } from '../src/types.js';
+import type {
+	ExecResult,
+	FileInfo,
+	ListFilesResult,
+	ReadFileResult,
+	SandboxProcess,
+} from '../src/types.js';
 
-const config: ArmadaConfig = readConfig({
+const baseEnv: Record<string, string> = {
 	ARMADA_URL: 'http://armada.example.com/',
 	ARMADA_QUEUE: 'marimohub',
 	MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
 	ARMADA_AGENT_IMAGE: 'ghcr.io/example/kernel-agent:1',
-});
+};
 
 const pod: PodLocation = {
 	clusterId: 'Cluster1',
@@ -38,82 +44,106 @@ interface ExecCall {
 
 const ok: CommandResult = { stdout: '', stderr: '', exitCode: 0 };
 
-/**
- * The command inside the process-group wrapper, as the pod's shell runs it.
- * Every exec is wrapped now, so the prologue is noise for most assertions.
- */
+/** The script of a recorded exec, which is always the argv's last entry. */
 function scriptOf(call: ExecCall | undefined): string {
-	return (call?.command.at(-1) ?? '').replace(/^trap 'rm -f \S+' EXIT; echo \$\$ > \S+; /, '');
+	return call?.command.at(-1) ?? '';
 }
 
-/** A sandbox whose job is "already placed" and whose execs are recorded. */
+/** Everything the stub channel recorded, one array per capability. */
+interface Recorded {
+	calls: ExecCall[];
+	cancelled: string[];
+	writes: { path: string; content: string | Uint8Array }[];
+	reads: string[];
+	lists: { path: string; recursive: boolean }[];
+	starts: { command: readonly string[]; cwd: string | undefined }[];
+	signals: { pid: number; signal: string }[];
+	waits: { port: number; timeoutMs: number; pid: number | undefined }[];
+}
+
+/** A sandbox whose job is "already placed" and whose channel calls are recorded. */
 function stubSandbox(
 	respond:
 		| CommandResult
 		| ((call: ExecCall) => CommandResult)
 		| ((call: ExecCall) => Promise<CommandResult>) = ok,
-	env: Record<string, string> = {},
-): {
-	sandbox: ArmadaSandbox;
-	calls: ExecCall[];
-	cancelled: string[];
-} {
-	const settings: ArmadaConfig =
-		Object.keys(env).length === 0
-			? config
-			: readConfig({
-					ARMADA_URL: 'http://armada.example.com/',
-					ARMADA_QUEUE: 'marimohub',
-					MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
-					ARMADA_AGENT_IMAGE: 'ghcr.io/example/kernel-agent:1',
-					...env,
-				});
-	const calls: ExecCall[] = [];
-	const cancelled: string[] = [];
+	options: { env?: Record<string, string>; channel?: Partial<ControlChannel> } = {},
+): Recorded & { sandbox: ArmadaSandbox } {
+	const settings: ArmadaConfig = readConfig({ ...baseEnv, ...options.env });
+	const recorded: Recorded = {
+		calls: [],
+		cancelled: [],
+		writes: [],
+		reads: [],
+		lists: [],
+		starts: [],
+		signals: [],
+		waits: [],
+	};
 	// oxlint-disable-next-line no-unsafe-type-assertion -- a stub of a class with private fields; structural typing cannot satisfy it
 	const armada: ArmadaClient = {
 		submit: async () => ({ jobId: 'job-1', jobSetId: 'set-1' }),
 		waitForRunning: async () => pod,
 		ingressAddress: async (_job: unknown, port: number) => `172.18.0.3:${String(30000 + port)}`,
 		cancel: async (job: { jobId: string }) => {
-			cancelled.push(`job:${job.jobId}`);
+			recorded.cancelled.push(`job:${job.jobId}`);
 		},
 		cancelSet: async (jobSetId: string) => {
-			cancelled.push(`set:${jobSetId}`);
+			recorded.cancelled.push(`set:${jobSetId}`);
 		},
 	} as unknown as ArmadaClient;
 	const channel: ControlChannel = {
 		ready: async (): Promise<void> => {},
-		run: async (command: readonly string[], options?: RunOptions): Promise<CommandResult> => {
-			const call: ExecCall = { command, stdin: options?.stdin, timeoutMs: options?.timeoutMs };
-			calls.push(call);
-			// What AgentChannel.run does when the deadline passes.
-			if (options?.timeoutMs !== undefined && options.onStop !== undefined) {
-				await options.onStop();
-			}
+		run: async (command: readonly string[], runOptions?: RunOptions): Promise<CommandResult> => {
+			const call: ExecCall = {
+				command,
+				stdin: runOptions?.stdin,
+				timeoutMs: runOptions?.timeoutMs,
+			};
+			recorded.calls.push(call);
 			return typeof respond === 'function' ? respond(call) : respond;
 		},
 		stream: async (
 			command: readonly string[],
-			options?: StreamOptions,
+			streamOptions?: StreamOptions,
 		): Promise<ReadableStream<Uint8Array>> => {
-			calls.push({ command, stdin: undefined, timeoutMs: options?.timeoutMs });
+			recorded.calls.push({ command, stdin: undefined, timeoutMs: streamOptions?.timeoutMs });
 			return new ReadableStream<Uint8Array>({
 				start(controller: ReadableStreamDefaultController<Uint8Array>) {
 					controller.enqueue(new TextEncoder().encode('streamed'));
 					controller.close();
 				},
-				// What AgentChannel.stream does with a cancel.
-				async cancel() {
-					await options?.onStop?.();
-				},
 			});
 		},
+		writeFile: async (path: string, content: string | Uint8Array): Promise<void> => {
+			recorded.writes.push({ path, content });
+		},
+		readFile: async (path: string) => {
+			recorded.reads.push(path);
+			return { outcome: 'ok', bytes: new Uint8Array() };
+		},
+		listFiles: async (path: string, recursive: boolean) => {
+			recorded.lists.push({ path, recursive });
+			return { outcome: 'ok', entries: [] };
+		},
+		startProcess: async (command: readonly string[], cwd?: string): Promise<number> => {
+			recorded.starts.push({ command, cwd });
+			return 4242;
+		},
+		processStatus: async () => ({ running: true }),
+		signalProcess: async (pid: number, signal: string): Promise<void> => {
+			recorded.signals.push({ pid, signal });
+		},
+		processLogs: async () => '',
+		waitForPort: async (port: number, timeoutMs: number, pid?: number) => {
+			recorded.waits.push({ port, timeoutMs, pid });
+			return { open: true };
+		},
+		...options.channel,
 	};
 	return {
 		sandbox: new ArmadaSandbox('sandbox-1', settings, armada, () => channel),
-		calls,
-		cancelled,
+		...recorded,
 	};
 }
 
@@ -136,43 +166,37 @@ describe('destroy', () => {
 });
 
 describe('writeFiles', () => {
-	it('creates the parent and streams content over stdin, never the command line', async () => {
-		const { sandbox, calls } = stubSandbox();
-		await sandbox.writeFiles([{ path: "/work/it's.py", content: 'print(1)\n' }]);
-
-		expect(calls).toHaveLength(1);
-		expect(calls[0]?.command).toEqual([
-			'sh',
-			'-c',
-			"mkdir -p -- '/work' && cat > '/work/it'\\''s.py'",
-		]);
-		expect(calls[0]?.stdin).toBe('print(1)\n');
-	});
-
-	it('passes bytes through without stringifying them', async () => {
+	it('hands the path and the bytes to the agent, with no shell in between', async () => {
 		const bytes: Uint8Array = new Uint8Array([0, 159, 146, 150]);
-		const { sandbox, calls } = stubSandbox();
-		await sandbox.writeFiles([{ path: '/work/blob.bin', content: bytes }]);
+		const { sandbox, writes, calls } = stubSandbox();
+		await sandbox.writeFiles([
+			{ path: "/work/it's.py", content: 'print(1)\n' },
+			{ path: '/work/blob.bin', content: bytes },
+		]);
 
-		expect(calls[0]?.stdin).toBe(bytes);
-	});
-
-	it('skips mkdir when there is no parent to create', async () => {
-		const { sandbox, calls } = stubSandbox();
-		await sandbox.writeFiles([{ path: 'notebook.py', content: '' }]);
-
-		expect(calls[0]?.command).toEqual(['sh', '-c', "cat > 'notebook.py'"]);
-	});
-
-	it('does nothing for an empty set, not even submit the job', async () => {
-		const { sandbox, calls } = stubSandbox();
-		await sandbox.writeFiles([]);
-
+		// A quote in the path and raw bytes travel as-is: nothing to escape.
+		expect(writes).toEqual([
+			{ path: "/work/it's.py", content: 'print(1)\n' },
+			{ path: '/work/blob.bin', content: bytes },
+		]);
 		expect(calls).toHaveLength(0);
 	});
 
-	it('names the file and keeps stderr when a write fails', async () => {
-		const { sandbox } = stubSandbox({ stdout: '', stderr: 'No space left', exitCode: 1 });
+	it('does nothing for an empty set, not even submit the job', async () => {
+		const { sandbox, writes } = stubSandbox();
+		await sandbox.writeFiles([]);
+
+		expect(writes).toHaveLength(0);
+	});
+
+	it('names the file and keeps the cause when a write fails', async () => {
+		const { sandbox } = stubSandbox(ok, {
+			channel: {
+				writeFile: async () => {
+					throw new Error('No space left');
+				},
+			},
+		});
 		expect(
 			await rejection(sandbox.writeFiles([{ path: '/work/big.bin', content: 'x' }])),
 		).toContain('Writing /work/big.bin failed: No space left');
@@ -226,27 +250,20 @@ describe('exposePort', () => {
 	});
 });
 
-/** Result whose stdout is the echoed PID of the detached process. */
-const pidEcho: CommandResult = { stdout: '4242\n', stderr: '', exitCode: 0 };
-
 describe('startProcess', () => {
-	it('launches detached with cwd and layered env, and parses the pid', async () => {
-		const { sandbox, calls } = stubSandbox(pidEcho);
+	it('starts through the agent with cwd and layered env, in a login shell', async () => {
+		const { sandbox, starts } = stubSandbox();
 		await sandbox.setEnvVars({ SANDBOX_VAR: 'a' });
 		const started: SandboxProcess = await sandbox.startProcess('marimo run', {
 			cwd: '/work',
 			env: { PROC_VAR: 'b', DROPPED: undefined },
 		});
 
-		const launch: readonly string[] = calls[0]?.command ?? [];
-		expect(launch[0]).toBe('sh');
-		expect(launch[1]).toBe('-c');
-		const logFile: string = /\/tmp\/mh-proc-\d+\.log/.exec(launch[2] ?? '')?.[0] ?? '';
 		// Sandbox-wide vars first, per-process vars after, so the process wins.
-		const inner = "export SANDBOX_VAR='a'; export PROC_VAR='b'; marimo run";
-		expect(launch[2]).toBe(
-			`cd '/work'; setsid sh -lc ${shellQuote(inner)} >${logFile} 2>&1 </dev/null & echo $!`,
-		);
+		expect(starts[0]).toEqual({
+			command: ['sh', '-lc', "export SANDBOX_VAR='a'; export PROC_VAR='b'; marimo run"],
+			cwd: '/work',
+		});
 		expect(started.id).toBe('armada-proc-4242');
 		expect(started.command).toBe('marimo run');
 
@@ -256,49 +273,70 @@ describe('startProcess', () => {
 		expect(named.id).toBe('kernel');
 	});
 
-	it('kills the pid it parsed, defaulting to TERM', async () => {
-		const { sandbox, calls } = stubSandbox(pidEcho);
+	it('names the command when the agent cannot start it', async () => {
+		const { sandbox } = stubSandbox(ok, {
+			channel: {
+				startProcess: async () => {
+					throw new Error('cannot start sh: not found');
+				},
+			},
+		});
+		expect(await rejection(sandbox.startProcess('marimo run'))).toContain(
+			'Starting "marimo run" failed: cannot start sh: not found',
+		);
+	});
+
+	it('signals the pid the agent named, defaulting to TERM', async () => {
+		const { sandbox, signals } = stubSandbox();
 		const started: SandboxProcess = await sandbox.startProcess('sleep 1000');
 		await started.kill();
 		await started.kill('KILL');
 
-		expect(calls[1]?.command[2]).toBe('kill -TERM 4242 2>/dev/null || true');
-		expect(calls[2]?.command[2]).toBe('kill -KILL 4242 2>/dev/null || true');
+		expect(signals).toEqual([
+			{ pid: 4242, signal: 'TERM' },
+			{ pid: 4242, signal: 'KILL' },
+		]);
 	});
 
-	it('reads the process log back', async () => {
-		const { sandbox, calls } = stubSandbox((call: ExecCall) =>
-			(call.command[2] ?? '').startsWith('cat ')
-				? { stdout: 'kernel output', stderr: '', exitCode: 0 }
-				: pidEcho,
-		);
+	it('treats a kill the channel refused as done, since killing is best effort', async () => {
+		const { sandbox } = stubSandbox(ok, {
+			channel: {
+				signalProcess: async () => {
+					throw new Error('agent unreachable');
+				},
+			},
+		});
+		const started: SandboxProcess = await sandbox.startProcess('sleep 1000');
+		await started.kill();
+	});
+
+	it('reads the process log back from the agent', async () => {
+		const { sandbox } = stubSandbox(ok, {
+			channel: { processLogs: async () => 'kernel output' },
+		});
 		const started: SandboxProcess = await sandbox.startProcess('marimo run');
 
 		expect(await started.getLogs()).toEqual({ stdout: 'kernel output', stderr: '' });
-		expect(calls[1]?.command[2]).toMatch(/^cat \/tmp\/mh-proc-\d+\.log 2>\/dev\/null \|\| true$/);
 	});
 
-	it('waits for the port with an in-pod waiter in a login shell', async () => {
-		const { sandbox, calls } = stubSandbox((call: ExecCall) =>
-			(call.command[2] ?? '').startsWith('python3 -c') ? ok : pidEcho,
-		);
+	it('waits for the port in one request that also watches the process', async () => {
+		const { sandbox, waits } = stubSandbox();
 		const started: SandboxProcess = await sandbox.startProcess('marimo run');
 		await started.waitForPort(2718);
+		await started.waitForPort(8080, { timeout: 5_000 });
 
-		const wait: ExecCall | undefined = calls.at(-1);
-		expect(wait?.command[1]).toBe('-lc');
-		expect(wait?.command[2]).toContain('("127.0.0.1",2718)');
+		expect(waits).toEqual([
+			{ port: 2718, timeoutMs: 30_000, pid: 4242 },
+			{ port: 8080, timeoutMs: 5_000, pid: 4242 },
+		]);
 	});
 
 	it('reports a dead process as a crash carrying its log, not a timeout', async () => {
-		const { sandbox } = stubSandbox((call: ExecCall) => {
-			const cmd: string = call.command[2] ?? '';
-			// The waiter fails its chunk and the /proc liveness check reports dead.
-			if (cmd.startsWith('python3 -c') || cmd.includes('/proc/4242/stat')) {
-				return { stdout: '', stderr: '', exitCode: 1 };
-			}
-			if (cmd.startsWith('cat ')) return { stdout: 'Traceback: boom', stderr: '', exitCode: 0 };
-			return pidEcho;
+		const { sandbox } = stubSandbox(ok, {
+			channel: {
+				waitForPort: async () => ({ open: false, exited: true, exitCode: 1 }),
+				processLogs: async () => 'Traceback: boom',
+			},
 		});
 		const started: SandboxProcess = await sandbox.startProcess('marimo run');
 
@@ -308,11 +346,11 @@ describe('startProcess', () => {
 	});
 
 	it('times out with the log when the process lives but the port never opens', async () => {
-		const { sandbox } = stubSandbox((call: ExecCall) => {
-			const cmd: string = call.command[2] ?? '';
-			if (cmd.startsWith('python3 -c')) return { stdout: '', stderr: '', exitCode: 1 };
-			if (cmd.startsWith('cat ')) return { stdout: 'still starting', stderr: '', exitCode: 0 };
-			return pidEcho;
+		const { sandbox } = stubSandbox(ok, {
+			channel: {
+				waitForPort: async () => ({ open: false }),
+				processLogs: async () => 'still starting',
+			},
 		});
 		const started: SandboxProcess = await sandbox.startProcess('marimo run');
 
@@ -322,39 +360,26 @@ describe('startProcess', () => {
 	});
 });
 
-/** What the pod's `base64` prints for `content`, wrapped at 76 columns as GNU does. */
-function base64Of(content: string | Uint8Array): string {
-	const encoded: string = Buffer.from(content).toString('base64');
-	return `${encoded.replace(/(.{76})/g, '$1\n')}\n`;
-}
-
 describe('readFile', () => {
-	it('decodes the base64 the pod printed and reports it as text', async () => {
-		const { sandbox, calls } = stubSandbox({
-			stdout: base64Of('print(1)\n'),
-			stderr: '',
-			exitCode: 0,
+	it('reports bytes that decode as text with the utf-8 encoding', async () => {
+		const { sandbox } = stubSandbox(ok, {
+			channel: {
+				readFile: async () => ({
+					outcome: 'ok',
+					bytes: new TextEncoder().encode('print(1)\n'),
+				}),
+			},
 		});
-		const result: ReadFileResult = await sandbox.readFile('/work/notebook.py');
+		const result: ReadFileResult = await sandbox.readFile("/work/it's.py");
 
 		expect(result).toEqual({ success: true, content: 'print(1)\n', encoding: 'utf-8' });
-		expect(calls[0]?.command[0]).toBe('sh');
-		// Not `sh -lc`: profile output on stdout would corrupt the base64.
-		expect(calls[0]?.command[1]).toBe('-c');
-		expect(calls[0]?.command[2]).toContain(`base64 < ${shellQuote('/work/notebook.py')}`);
-	});
-
-	it('joins the lines GNU base64 wrapped, for a file past 57 bytes', async () => {
-		const long: string = 'x'.repeat(200);
-		const { sandbox } = stubSandbox({ stdout: base64Of(long), stderr: '', exitCode: 0 });
-		const result: ReadFileResult = await sandbox.readFile('/work/long.txt');
-
-		expect(result.success && result.content).toBe(long);
 	});
 
 	it('returns bytes that are not UTF-8 as base64, so nothing is corrupted', async () => {
 		const bytes: Uint8Array = new Uint8Array([0, 159, 146, 150]);
-		const { sandbox } = stubSandbox({ stdout: base64Of(bytes), stderr: '', exitCode: 0 });
+		const { sandbox } = stubSandbox(ok, {
+			channel: { readFile: async () => ({ outcome: 'ok', bytes }) },
+		});
 		const result: ReadFileResult = await sandbox.readFile('/work/blob.bin');
 
 		expect(result).toEqual({
@@ -367,31 +392,35 @@ describe('readFile', () => {
 
 	it('keeps a byte order mark rather than swallowing it', async () => {
 		const withBom: Uint8Array = new Uint8Array([0xef, 0xbb, 0xbf, 0x61]);
-		const { sandbox } = stubSandbox({ stdout: base64Of(withBom), stderr: '', exitCode: 0 });
+		const { sandbox } = stubSandbox(ok, {
+			channel: { readFile: async () => ({ outcome: 'ok', bytes: withBom }) },
+		});
 		const result: ReadFileResult = await sandbox.readFile('/work/bom.txt');
 
-		expect(result.success && result.content).toBe('\ufeffa');
+		expect(result.success && result.content).toBe('﻿a');
 	});
 
-	it('reads an empty file as empty text, not as a failure', async () => {
-		const { sandbox } = stubSandbox({ stdout: '', stderr: '', exitCode: 0 });
-		const result: ReadFileResult = await sandbox.readFile('/work/empty.py');
+	it('reads an empty file as empty text, and sends the path as-is', async () => {
+		const { sandbox, reads } = stubSandbox();
+		const result: ReadFileResult = await sandbox.readFile("/work/it's empty.py");
 
 		expect(result).toEqual({ success: true, content: '', encoding: 'utf-8' });
+		// The path went to the agent verbatim; there is no quoting to get wrong.
+		expect(reads).toEqual(["/work/it's empty.py"]);
 	});
 
 	it('separates a path that is not there from one that cannot be read', async () => {
-		const { sandbox: absent } = stubSandbox({ stdout: '', stderr: '', exitCode: 44 });
+		const { sandbox: absent } = stubSandbox(ok, {
+			channel: { readFile: async () => ({ outcome: 'not-found' }) },
+		});
 		expect(await absent.readFile('/work/missing.py')).toEqual({
 			success: false,
 			content: '',
 			error: { code: 'NOT_FOUND' },
 		});
 
-		const { sandbox: unreadable } = stubSandbox({
-			stdout: '',
-			stderr: 'Is a directory',
-			exitCode: 2,
+		const { sandbox: unreadable } = stubSandbox(ok, {
+			channel: { readFile: async () => ({ outcome: 'failed', message: 'is a directory' }) },
 		});
 		expect(await unreadable.readFile('/work')).toEqual({
 			success: false,
@@ -401,8 +430,12 @@ describe('readFile', () => {
 	});
 
 	it('reports a broken control channel as a backend error, never a throw', async () => {
-		const { sandbox } = stubSandbox(() => {
-			throw new Error('websocket closed');
+		const { sandbox } = stubSandbox(ok, {
+			channel: {
+				readFile: async () => {
+					throw new Error('agent unreachable');
+				},
+			},
 		});
 		expect(await sandbox.readFile('/work/notebook.py')).toEqual({
 			success: false,
@@ -410,50 +443,87 @@ describe('readFile', () => {
 			error: { code: 'BACKEND_ERROR' },
 		});
 	});
-
-	it('runs without the env prefix, which would print nothing but is not ours to parse', async () => {
-		const { sandbox, calls } = stubSandbox();
-		await sandbox.setEnvVars({ API_KEY: 'secret' });
-		await sandbox.readFile('/work/notebook.py');
-
-		expect(calls[0]?.command[2]?.startsWith('if [ -e ')).toBe(true);
-	});
 });
 
 describe('listFiles', () => {
-	it('parses the records find printed', async () => {
-		const { sandbox, calls } = stubSandbox({
-			stdout: 'f\t12\t/work/notebook.py\0d\t4096\t/work/data\0',
-			stderr: '',
-			exitCode: 0,
+	it('maps the agent entries to FileInfo records', async () => {
+		const { sandbox } = stubSandbox(ok, {
+			channel: {
+				listFiles: async () => ({
+					outcome: 'ok',
+					entries: [
+						{ path: '/work/notebook.py', type: 'file', size: 12 },
+						{ path: '/work/data', type: 'directory', size: 4096 },
+						{ path: '/work/link', type: 'symlink', size: 7 },
+					],
+				}),
+			},
 		});
 		const result: ListFilesResult = await sandbox.listFiles('/work');
 
 		expect(result.success).toBe(true);
-		expect(result.files.map((file: FileInfo) => file.name)).toEqual(['notebook.py', 'data']);
-		expect(calls[0]?.command[1]).toBe('-c');
+		expect(result.files[0]).toEqual({
+			name: 'notebook.py',
+			absolutePath: '/work/notebook.py',
+			relativePath: 'notebook.py',
+			type: 'file',
+			size: 12,
+		});
+		expect(result.files.map((file: FileInfo) => file.type)).toEqual([
+			'file',
+			'directory',
+			'symlink',
+		]);
 	});
 
-	it('passes recursion through to find and hiding through to the parser', async () => {
-		const { sandbox, calls } = stubSandbox({
-			stdout: 'f\t1\t/work/.env\0',
-			stderr: '',
-			exitCode: 0,
+	it('filters hidden entries by their own name alone', async () => {
+		const { sandbox } = stubSandbox(ok, {
+			channel: {
+				listFiles: async () => ({
+					outcome: 'ok',
+					entries: [
+						{ path: '/work/.env', type: 'file', size: 1 },
+						{ path: '/work/notebook.py', type: 'file', size: 2 },
+						// Inside a dot directory, but not itself hidden: reported, which
+						// is what session capture needs for `__marimo__` trees.
+						{ path: '/work/.marimo/session.json', type: 'file', size: 3 },
+					],
+				}),
+			},
 		});
-		const result: ListFilesResult = await sandbox.listFiles('/work', {
+		const hidden: ListFilesResult = await sandbox.listFiles('/work', { recursive: true });
+		expect(hidden.files.map((file: FileInfo) => file.name)).toEqual([
+			'notebook.py',
+			'session.json',
+		]);
+
+		const shown: ListFilesResult = await sandbox.listFiles('/work', {
 			recursive: true,
 			includeHidden: true,
 		});
+		expect(shown.files.map((file: FileInfo) => file.name)).toEqual([
+			'.env',
+			'notebook.py',
+			'session.json',
+		]);
+	});
 
-		expect(calls[0]?.command[2]).not.toContain('-maxdepth');
-		expect(result.files.map((file: FileInfo) => file.name)).toEqual(['.env']);
+	it('reports a path outside the root as its own relative path', async () => {
+		const { sandbox } = stubSandbox(ok, {
+			channel: {
+				listFiles: async () => ({
+					outcome: 'ok',
+					entries: [{ path: '/elsewhere/x.py', type: 'file', size: 1 }],
+				}),
+			},
+		});
+		const result: ListFilesResult = await sandbox.listFiles('/work');
+		expect(result.files[0]?.relativePath).toBe('/elsewhere/x.py');
 	});
 
 	it('reports a file as NOT_A_DIRECTORY, never as an empty directory', async () => {
-		const { sandbox } = stubSandbox({
-			stdout: '',
-			stderr: 'MARIMOHUB_NOT_A_DIRECTORY\n',
-			exitCode: 20,
+		const { sandbox } = stubSandbox(ok, {
+			channel: { listFiles: async () => ({ outcome: 'not-a-directory' }) },
 		});
 		expect(await sandbox.listFiles('/work/notebook.py')).toEqual({
 			success: false,
@@ -462,8 +532,10 @@ describe('listFiles', () => {
 		});
 	});
 
-	it('reports any other non-zero exit as a failed listing', async () => {
-		const { sandbox } = stubSandbox({ stdout: '', stderr: '', exitCode: 1 });
+	it('reports a listing the agent refused as a failed listing', async () => {
+		const { sandbox } = stubSandbox(ok, {
+			channel: { listFiles: async () => ({ outcome: 'failed', message: 'no such directory' }) },
+		});
 		expect(await sandbox.listFiles('/work/missing')).toEqual({
 			success: false,
 			files: [],
@@ -472,8 +544,12 @@ describe('listFiles', () => {
 	});
 
 	it('reports a broken control channel as a backend error, never a throw', async () => {
-		const { sandbox } = stubSandbox(() => {
-			throw new Error('websocket closed');
+		const { sandbox } = stubSandbox(ok, {
+			channel: {
+				listFiles: async () => {
+					throw new Error('agent unreachable');
+				},
+			},
 		});
 		expect(await sandbox.listFiles('/work')).toEqual({
 			success: false,
@@ -482,9 +558,15 @@ describe('listFiles', () => {
 		});
 	});
 
-	it('reads an empty directory as a success with no files', async () => {
-		const { sandbox } = stubSandbox();
+	it('reads an empty directory as a success, sending the path and recursion flag', async () => {
+		const { sandbox, lists } = stubSandbox();
 		expect(await sandbox.listFiles('/work')).toEqual({ success: true, files: [] });
+		await sandbox.listFiles('/work', { recursive: true });
+
+		expect(lists).toEqual([
+			{ path: '/work', recursive: false },
+			{ path: '/work', recursive: true },
+		]);
 	});
 });
 
@@ -493,8 +575,59 @@ describe('exec', () => {
 		const { sandbox, calls } = stubSandbox();
 		await sandbox.exec('uv run marimo --version');
 
-		expect(calls[0]?.command.slice(0, 2)).toEqual(['sh', '-lc']);
-		expect(scriptOf(calls[0])).toBe('uv run marimo --version');
+		expect(calls[0]?.command).toEqual(['sh', '-lc', 'uv run marimo --version']);
+	});
+
+	it('passes the caller timeout to the agent, which enforces it', async () => {
+		const { sandbox, calls } = stubSandbox();
+		await sandbox.exec('sleep 60', { timeout: 1_000 });
+
+		expect(calls[0]?.timeoutMs).toBe(1_000);
+	});
+
+	it('reports a timed-out command as the channel words it', async () => {
+		const { sandbox } = stubSandbox(() => {
+			throw new CommandTimeoutError('Command timed out after 1000ms in default/armada-job-0: x');
+		});
+		const result: ExecResult = await sandbox.exec('sleep 60', { timeout: 1_000 });
+
+		expect(result.success).toBe(false);
+		expect(!result.success && result.error.code).toBe('BACKEND_ERROR');
+		expect(result.stderr).toContain('Command timed out after 1000ms');
+	});
+});
+
+describe('the exec backstop', () => {
+	it('sends ARMADA_COMMAND_MAX_SECONDS as the deadline when the caller has none', async () => {
+		const { sandbox, calls } = stubSandbox();
+		await sandbox.exec('uv sync');
+
+		// Most of marimohub's exec calls carry no timeout; without this, one of
+		// them losing its caller would hold a process for the rest of the session.
+		expect(calls[0]?.timeoutMs).toBe(21_600_000);
+	});
+
+	it('sends no deadline at all when the backstop is off', async () => {
+		const { sandbox, calls } = stubSandbox(ok, {
+			env: { ARMADA_COMMAND_MAX_SECONDS: '0' },
+		});
+		await sandbox.exec('uv sync');
+
+		expect(calls[0]?.timeoutMs).toBeUndefined();
+	});
+
+	it('names the backstop, not a timeout nobody set, when it fires', async () => {
+		const { sandbox } = stubSandbox(
+			() => {
+				throw new CommandTimeoutError('Command timed out after 1000ms in default/armada-job-0: x');
+			},
+			{ env: { ARMADA_COMMAND_MAX_SECONDS: '1' } },
+		);
+		const result: ExecResult = await sandbox.exec('uv sync');
+
+		expect(result.success).toBe(false);
+		expect(result.stderr).toContain('ARMADA_COMMAND_MAX_SECONDS (1s)');
+		expect(result.stderr).toContain('uv sync');
 	});
 });
 
@@ -542,26 +675,8 @@ describe('execStream', () => {
 		await sandbox.setEnvVars({ API_KEY: 'secret' });
 		const stream: ReadableStream = await sandbox.execStream('tail -f /tmp/log');
 
-		const command: readonly string[] = calls[0]?.command ?? [];
-		// A login shell that is its own group leader, so a cancel can kill it.
-		expect(command.slice(0, 2)).toEqual(['sh', '-lc']);
-		expect(command[2]).toMatch(
-			/^trap 'rm -f (\/tmp\/mh-stream-\d+\.pgid)' EXIT; echo \$\$ > \1; export API_KEY='secret'; tail -f \/tmp\/log$/,
-		);
+		expect(calls[0]?.command).toEqual(['sh', '-lc', "export API_KEY='secret'; tail -f /tmp/log"]);
 		expect(await collect(stream)).toBe('streamed');
-	});
-
-	it('kills the process group when the consumer cancels', async () => {
-		const { sandbox, calls } = stubSandbox();
-		const stream: ReadableStream = await sandbox.execStream('tail -f /tmp/log');
-		await stream.cancel();
-
-		const groupFile: string =
-			/(\/tmp\/mh-stream-\d+\.pgid)/.exec(calls[0]?.command[2] ?? '')?.[1] ?? '';
-		expect(groupFile).not.toBe('');
-		// The kill goes to the negated group id, so the shell's children go too.
-		expect(calls[1]?.command[2]).toContain(`kill -TERM -"$group"`);
-		expect(calls[1]?.command[2]).toContain(groupFile);
 	});
 
 	it('passes a timeout down as the listening bound', async () => {
@@ -576,165 +691,5 @@ describe('execStream', () => {
 		await sandbox.execStream('cat /tmp/log');
 
 		expect(calls[0]?.timeoutMs).toBeUndefined();
-	});
-});
-
-describe('exec timeouts', () => {
-	it("tracks a command with no deadline too, since most of marimohub's have none", async () => {
-		const { sandbox, calls } = stubSandbox();
-		await sandbox.exec('echo hi');
-
-		expect(calls).toHaveLength(1);
-		// Wrapped, so a dropped socket still leaves something the sweep can kill,
-		// but with no timeout there is nothing to kill it early.
-		expect(calls[0]?.command.slice(0, 2)).toEqual(['sh', '-lc']);
-		expect(calls[0]?.timeoutMs).toBeUndefined();
-	});
-
-	it('makes a command with a deadline killable, and kills it when the deadline passes', async () => {
-		const { sandbox, calls } = stubSandbox();
-		await sandbox.exec('sleep 60', { timeout: 1_000 });
-
-		const command: readonly string[] = calls[0]?.command ?? [];
-		expect(command.slice(0, 2)).toEqual(['sh', '-lc']);
-		// The cleanup is a trap, so a command ending in `exit` still removes the
-		// file, and the command's own status is what `exec` reports.
-		expect(command[2]).toMatch(
-			/^trap 'rm -f (\/tmp\/mh-exec-\d+\.pgid)' EXIT; echo \$\$ > \1; sleep 60$/,
-		);
-		expect(calls[0]?.timeoutMs).toBe(1_000);
-
-		// The stub fires onStop, as the real timeout does: a kill must follow.
-		const groupFile: string = /(\/tmp\/mh-exec-\d+\.pgid)/.exec(command[2] ?? '')?.[1] ?? '';
-		expect(calls[1]?.command[2]).toContain('kill -TERM -"$group"');
-		expect(calls[1]?.command[2]).toContain(groupFile);
-	});
-
-	it('gives each command its own group file', async () => {
-		const { sandbox, calls } = stubSandbox();
-		await sandbox.exec('one', { timeout: 10 });
-		await sandbox.exec('two', { timeout: 10 });
-
-		expect(calls[0]?.command[2]).not.toBe(calls[2]?.command[2]);
-	});
-});
-
-describe('ghost sweep', () => {
-	it('spares the commands it is still waiting on', async () => {
-		const { sandbox, calls } = stubSandbox();
-		const stream: ReadableStream = await sandbox.execStream('tail -f /tmp/log');
-		const groupFile: string =
-			/(\/tmp\/mh-stream-\d+\.pgid)/.exec(calls[0]?.command[2] ?? '')?.[1] ?? '';
-
-		await sandbox.sweep();
-		expect(calls.at(-1)?.command[2]).toContain(`case "$file" in '${groupFile}') continue;; esac`);
-		await stream.cancel();
-	});
-
-	it('stops sparing a command once it has finished', async () => {
-		const { sandbox, calls } = stubSandbox();
-		await sandbox.exec('echo hi', { timeout: 1_000 });
-
-		await sandbox.sweep();
-		// The exec is over, so nothing is exempt and its file is fair game.
-		expect(calls.at(-1)?.command[2]).not.toContain('continue;; esac');
-	});
-
-	it('counts what it killed and reports it once', async () => {
-		const { sandbox } = stubSandbox((call: ExecCall) =>
-			(call.command[2] ?? '').startsWith('for file in')
-				? {
-						stdout:
-							'/tmp/mh-exec-1.pgid\t412\tkilled\n' +
-							'/tmp/mh-exec-2.pgid\t907\tkilled\n' +
-							// Only the file was left behind, so it is not a ghost.
-							'/tmp/mh-exec-3.pgid\t44\tgone\n',
-						stderr: '',
-						exitCode: 0,
-					}
-				: ok,
-		);
-		await sandbox.ready();
-
-		expect(await sandbox.sweep()).toBe(2);
-		expect(sandbox.drainCounters()).toEqual({ ghosts_killed: 2 });
-		// Drained, so marimohub does not see the same ghosts twice.
-		expect(sandbox.drainCounters()).toEqual({ ghosts_killed: 0 });
-	});
-
-	it('is quiet when a sweep cannot reach the pod', async () => {
-		const { sandbox } = stubSandbox(() => {
-			throw new Error('websocket closed');
-		});
-		await sandbox.ready();
-
-		expect(await sandbox.sweep()).toBe(0);
-	});
-
-	it('has nothing to sweep before the job has a pod', async () => {
-		const { sandbox, calls } = stubSandbox();
-		expect(await sandbox.sweep()).toBe(0);
-		expect(calls).toHaveLength(0);
-	});
-});
-
-/** The group file of the command a sandbox started first. */
-const groupFileOf: (calls: ExecCall[]) => string = (calls: ExecCall[]) =>
-	/(\/tmp\/mh-\w+-\d+\.pgid)/.exec(calls[0]?.command.at(-1) ?? '')?.[1] ?? '';
-
-/** Whether the last sweep spared the command that file belongs to. */
-const spared: (calls: ExecCall[], groupFile: string) => boolean = (
-	calls: ExecCall[],
-	groupFile: string,
-) => (calls.at(-1)?.command[2] ?? '').includes(`case "$file" in '${groupFile}') continue;; esac`);
-
-describe('long-running commands', () => {
-	/** A command the pod never answers, which is the case the backstop is for. */
-	const never: (call: ExecCall) => Promise<CommandResult> = (call: ExecCall) =>
-		(call.command[2] ?? '').startsWith('for file in')
-			? Promise.resolve(ok)
-			: new Promise<CommandResult>(() => {});
-
-	const capped: { sandbox: ArmadaSandbox; calls: ExecCall[] } = stubSandbox(never, {
-		ARMADA_COMMAND_MAX_SECONDS: '1',
-	});
-	const streaming: { sandbox: ArmadaSandbox; calls: ExecCall[] } = stubSandbox(never, {
-		ARMADA_COMMAND_MAX_SECONDS: '1',
-	});
-	const uncapped: { sandbox: ArmadaSandbox; calls: ExecCall[] } = stubSandbox(never, {
-		ARMADA_COMMAND_MAX_SECONDS: '0',
-	});
-
-	beforeAll(async () => {
-		await capped.sandbox.ready();
-		void capped.sandbox.exec('uv sync');
-		await streaming.sandbox.execStream('tail -f /tmp/log');
-		await uncapped.sandbox.ready();
-		void uncapped.sandbox.exec('uv sync');
-		// One wait for all three, since the shortest backstop the config accepts is
-		// a whole second.
-		await new Promise((resolve: (value: unknown) => void) => setTimeout(resolve, 1_100));
-	});
-
-	it('gives up on an exec that outlives the backstop, so its caller stops waiting', async () => {
-		await capped.sandbox.sweep();
-
-		// No longer spared, so this sweep kills it and `exec` sees it die rather
-		// than waiting on it forever.
-		expect(spared(capped.calls, groupFileOf(capped.calls))).toBe(false);
-	});
-
-	it('leaves a stream alone however long it stays open', async () => {
-		await streaming.sandbox.sweep();
-
-		// A reader keeping a stream open for hours is a decision, not a stuck
-		// command.
-		expect(spared(streaming.calls, groupFileOf(streaming.calls))).toBe(true);
-	});
-
-	it('expires nothing when the backstop is off', async () => {
-		await uncapped.sandbox.sweep();
-
-		expect(spared(uncapped.calls, groupFileOf(uncapped.calls))).toBe(true);
 	});
 });

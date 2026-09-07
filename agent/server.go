@@ -18,8 +18,8 @@ import (
 	"time"
 )
 
-// maxRequestBytes bounds one request body. Files arrive over stdin, base64
-// inside JSON, so this is the ceiling on one file write.
+// maxRequestBytes bounds one request body. Files arrive raw in a PUT body, so
+// this is the ceiling on one file write.
 const maxRequestBytes = 1 << 30
 
 // killGrace is how long a command gets between SIGTERM and SIGKILL once its
@@ -34,10 +34,14 @@ type agent struct {
 	// Direct children still to be collected by their own Wait. The orphan
 	// reaper leaves these alone, or it would steal their exit status.
 	children sync.Map
+	// Detached processes started through /process/start, by pid. Entries are
+	// kept after exit, so a dead process still answers for its status and log.
+	mu      sync.Mutex
+	started map[int]*startedProcess
 }
 
 func newAgent(tokenHash []byte) *agent {
-	return &agent{tokenHash: tokenHash}
+	return &agent{tokenHash: tokenHash, started: map[int]*startedProcess{}}
 }
 
 func (a *agent) routes() http.Handler {
@@ -46,6 +50,14 @@ func (a *agent) routes() http.Handler {
 		_, _ = io.WriteString(w, "ok\n")
 	})
 	mux.HandleFunc("POST /exec", a.authenticated(a.exec))
+	mux.HandleFunc("POST /process/start", a.authenticated(a.startProcess))
+	mux.HandleFunc("GET /process/status", a.authenticated(a.processStatus))
+	mux.HandleFunc("GET /process/logs", a.authenticated(a.processLogs))
+	mux.HandleFunc("POST /process/signal", a.authenticated(a.signalProcess))
+	mux.HandleFunc("POST /process/waitport", a.authenticated(a.waitPort))
+	mux.HandleFunc("PUT /files", a.authenticated(a.writeFile))
+	mux.HandleFunc("GET /files", a.authenticated(a.readFile))
+	mux.HandleFunc("GET /files/list", a.authenticated(a.listFiles))
 	return mux
 }
 
@@ -241,10 +253,27 @@ func (e *eventWriter) send(event execEvent) {
 	}
 }
 
+// apiError is the body of every refused request. `code` names the refusal for
+// a caller that must tell them apart, such as `not_found` against a file that
+// was never written; the message is for a human reading a log.
+type apiError struct {
+	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
+}
+
 func writeError(w http.ResponseWriter, status int, message string) {
+	writeCodedError(w, status, "", message)
+}
+
+func writeCodedError(w http.ResponseWriter, status int, code string, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(execEvent{Error: message})
+	_ = json.NewEncoder(w).Encode(apiError{Error: message, Code: code})
+}
+
+func writeJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(value)
 }
 
 // shutdown forwards SIGTERM to everything and waits for it to take.

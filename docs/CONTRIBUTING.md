@@ -149,8 +149,8 @@ docker save marimohub-kernel-agent:local |
 The import goes straight into the node's containerd because `kind load` trips over
 multi-platform manifests from Docker Desktop's containerd image store.
 
-If you bring your own kernel image, it must provide `/bin/sh`, `python3`, `git`, GNU
-`find` and util-linux `setsid` (ARMADA-REVIEW.md, decision 22).
+If you bring your own kernel image, it must provide `/bin/sh` and `git`
+(ARMADA-REVIEW.md, decision 22).
 
 ### 3. Check that placement works
 
@@ -174,15 +174,17 @@ running a command in it
   hello from armada-01m1xypqftnw12bt27vyxtwksd-0
   Python 3.13.15
   PID 1 is /mh-agent/agent--port8718
-  ok
+  ok: exec through the agent
 ```
 
 That exercises the config, the auth header, the pod spec with its init container, the
 submit, the event stream, the address event for both ports, and the agent itself. It
-then abandons a command by timing it out, cancels a stream mid-command, plants a
-process group nothing is waiting on, sweeps, and lists every process that is left. A
-healthy run shows the agent killed the two abandoned commands, the sweep killed the
-planted group, and nothing remains, zombies included. Anything else exits non-zero.
+then writes, reads and lists a file with a hostile name through the agent's `/files`
+endpoints, starts a detached server and waits for its port, kills it, starts a process
+that crashes at once, and finally abandons a command by timing it out and cancels a
+stream mid-command. A healthy run shows every check pass and lists no process left
+behind, zombies included: the agent kills what its callers abandon and reaps the rest.
+Anything else exits non-zero.
 
 `bun run smoke` runs `dev/smoke.ts` inside a bun container on the `kind` network
 (`dev/smoke.sh`). On a Linux host that can reach that network, run the script
@@ -206,8 +208,9 @@ is mounted. Override with `ARMADA_URL`, `ARMADA_QUEUE`, `ARMADA_NAMESPACE`, `POR
 marimohub comes up at <http://localhost:3000>, signed in as the dev user. Browsing and
 creating notebooks never touch compute. Opening a notebook runs the whole provision
 sequence: the job is submitted, the pod runs, the agent answers, files and environment
-go in, `uv sync` runs, the kernel starts detached and its port is waited for in-pod,
-and `exposePort` returns the NodePort address. A warm start takes about 12 seconds.
+go in, `uv sync` runs, the kernel is started as the agent's own child and its port is
+waited for in-pod, and `exposePort` returns the NodePort address. A warm start takes
+about 12 seconds.
 
 The browser reaches the kernel through marimohub's proxy at `/proxy/<token>/...`,
 because the NodePort address is on the docker network. The marimo editor loads through
@@ -220,10 +223,8 @@ available" with a Retry button; the real error is nested in the server log:
 docker logs marimohub-armada 2>&1 | grep request_error | tail -1 | jq -r '.error.cause.message'
 ```
 
-The `session_provision` log line reports each step's timing and which succeeded. The
-sweep reports what it killed with "killed abandoned process group", and the count
-reaches that line as `ghosts_killed`. marimohub compensates cleanly on a failed start,
-so Retry is safe.
+The `session_provision` log line reports each step's timing and which succeeded.
+marimohub compensates cleanly on a failed start, so Retry is safe.
 
 ### Inspecting and tearing down
 

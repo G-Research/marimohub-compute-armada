@@ -7,12 +7,17 @@
 // adapter reads the port's address from the same event it reads the kernel's
 // from, and holds no Kubernetes credential of any kind (AGENT-DESIGN.md).
 //
-// One request type, POST /exec, is enough for a full session, because every
-// adapter operation is a shell command. The response streams: stdout and
-// stderr chunks as they are produced, then the exit status. Streaming is what
-// makes cancellation work. When the caller goes away, the request context
-// ends, and the agent kills the command's process group, which is the thing a
+// POST /exec runs a shell command. The response streams: stdout and stderr
+// chunks as they are produced, then the exit status. Streaming is what makes
+// cancellation work. When the caller goes away, the request context ends, and
+// the agent kills the command's process group, which is the thing a
 // Kubernetes exec could never do for us.
+//
+// The rest of the surface answers what a shell answered badly. /process/*
+// starts a detached process (the kernel) as the agent's own child, so
+// liveness and the exit status are exact, and waits for its port in-pod.
+// /files carries bytes raw in request and response bodies, so nothing is
+// quoted for a shell or wrapped in base64 (see files.go).
 //
 // Requests carry a bearer token. The pod spec holds only its SHA-256, so a
 // pod spec read back through Armada's API reveals nothing usable.
