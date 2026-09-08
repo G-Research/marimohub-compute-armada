@@ -84,7 +84,7 @@ function stubSandbox(
 	const armada: ArmadaClient = {
 		submit: async () => ({ jobId: 'job-1', jobSetId: 'set-1' }),
 		waitForRunning: async () => pod,
-		ingressAddress: async (_job: unknown, port: number) => `172.18.0.3:${String(30000 + port)}`,
+		portUrl: async (_job: unknown, port: number) => `http://172.18.0.3:${String(30000 + port)}`,
 		cancel: async (job: { jobId: string }) => {
 			recorded.cancelled.push(`job:${job.jobId}`);
 		},
@@ -245,7 +245,7 @@ describe('exposePort', () => {
 			hostname: 'ignored.example.com',
 		});
 
-		// 32718 proves the asked-for port reached ingressAddress.
+		// 32718 proves the asked-for port reached portUrl.
 		expect(exposed).toEqual({ url: 'http://172.18.0.3:32718' });
 	});
 });

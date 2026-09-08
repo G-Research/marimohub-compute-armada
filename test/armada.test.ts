@@ -9,14 +9,16 @@ import type { ActiveSandbox } from '../src/types.js';
 
 const agent: AgentSpec = { tokenSha256: 'ab'.repeat(32) };
 
-const config: ArmadaConfig = readConfig({
+const env: Record<string, string> = {
 	ARMADA_URL: 'http://armada.example.com/',
 	ARMADA_QUEUE: 'marimohub',
 	ARMADA_NAMESPACE: 'kernels',
 	MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
 	ARMADA_AGENT_IMAGE: 'ghcr.io/example/kernel-agent:1',
 	ARMADA_AUTH_TOKEN: 'secret',
-});
+};
+
+const config: ArmadaConfig = readConfig(env);
 
 interface Call {
 	url: string;
@@ -94,6 +96,60 @@ describe('submit', () => {
 					annotations: { 'armadaproject.io/failFast': 'true' },
 					// The kernel's port and the agent's, so the address event carries both.
 					services: [{ type: 'NodePort', ports: [config.port, config.agentPort] }],
+				},
+			],
+		});
+	});
+
+	it('asks for an Ingress instead under ARMADA_EXPOSE=ingress', async () => {
+		stubFetch(Response.json({ jobResponseItems: [{ jobId: 'job-1' }] }));
+		const ingressConfig: ArmadaConfig = readConfig({
+			...env,
+			ARMADA_EXPOSE: 'ingress',
+			ARMADA_INGRESS_CERT_NAME: 'kernels-',
+			ARMADA_INGRESS_ANNOTATIONS: '{"nginx.ingress.kubernetes.io/proxy-read-timeout":"3600"}',
+		});
+
+		await new ArmadaClient(ingressConfig).submit('sandbox-7', buildPodSpec(ingressConfig, agent));
+
+		expect(JSON.stringify(calls[0]?.body)).not.toContain('"services"');
+		expect(calls[0]?.body).toMatchObject({
+			jobRequestItems: [
+				{
+					ingress: [
+						{
+							ports: [config.port, config.agentPort],
+							tlsEnabled: true,
+							certName: 'kernels-',
+							// Armada's default is headless, which leaves nothing for a rule to route to.
+							useClusterIP: true,
+							annotations: { 'nginx.ingress.kubernetes.io/proxy-read-timeout': '3600' },
+						},
+					],
+				},
+			],
+		});
+	});
+
+	it('omits the certificate name and annotations it was not given', async () => {
+		stubFetch(Response.json({ jobResponseItems: [{ jobId: 'job-1' }] }));
+		const ingressConfig: ArmadaConfig = readConfig({
+			...env,
+			ARMADA_EXPOSE: 'ingress',
+			ARMADA_INGRESS_TLS: 'false',
+		});
+
+		await new ArmadaClient(ingressConfig).submit('sandbox-7', buildPodSpec(ingressConfig, agent));
+
+		const body: string = JSON.stringify(calls[0]?.body);
+		expect(body).not.toContain('certName');
+		expect(body).not.toContain('annotations":{"nginx');
+		expect(calls[0]?.body).toMatchObject({
+			jobRequestItems: [
+				{
+					ingress: [
+						{ ports: [config.port, config.agentPort], tlsEnabled: false, useClusterIP: true },
+					],
 				},
 			],
 		});
@@ -279,6 +335,51 @@ describe('ingressAddress', () => {
 		expect(await rejection(new ArmadaClient(config).ingressAddress(job, 2718))).toContain(
 			'was cancelled',
 		);
+	});
+});
+
+describe('portUrl', () => {
+	const job: SubmittedJob = { jobId: 'job-1', jobSetId: 'sandbox-7' };
+
+	function addressEvent(address: string): void {
+		stubFetch(
+			eventStream({
+				result: {
+					id: '1',
+					message: { ingressInfo: { jobId: 'job-1', ingressAddresses: { '2718': address } } },
+				},
+			}),
+		);
+	}
+
+	it('is plain http to a NodePort address', async () => {
+		addressEvent('172.18.0.3:31234');
+		expect(await new ArmadaClient(config).portUrl(job, 2718)).toBe('http://172.18.0.3:31234');
+	});
+
+	it('is https to an Ingress hostname when its TLS is on', async () => {
+		addressEvent('kernel-2718-armada-job-1-0.kernels.example.com');
+		const ingress: ArmadaClient = new ArmadaClient(
+			readConfig({ ...env, ARMADA_EXPOSE: 'ingress' }),
+		);
+		expect(await ingress.portUrl(job, 2718)).toBe(
+			'https://kernel-2718-armada-job-1-0.kernels.example.com',
+		);
+	});
+
+	it('is http to an Ingress hostname when its TLS is off', async () => {
+		addressEvent('kernel-2718-armada-job-1-0.kernels.example.com');
+		const ingress: ArmadaClient = new ArmadaClient(
+			readConfig({ ...env, ARMADA_EXPOSE: 'ingress', ARMADA_INGRESS_TLS: 'false' }),
+		);
+		expect(await ingress.portUrl(job, 2718)).toBe(
+			'http://kernel-2718-armada-job-1-0.kernels.example.com',
+		);
+	});
+
+	it('keeps a scheme the address already carries', async () => {
+		addressEvent('https://already.example.com');
+		expect(await new ArmadaClient(config).portUrl(job, 2718)).toBe('https://already.example.com');
 	});
 });
 

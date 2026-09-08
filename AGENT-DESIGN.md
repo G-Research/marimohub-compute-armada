@@ -344,7 +344,7 @@ That is still a Kubernetes credential, and it works for one cluster only.
 2. [x] Build the agent with the single request type and replace the Kubernetes channel in the adapter.
        Run a full notebook session on a local cluster.
 3. [x] Add the process and file requests and delete the workarounds.
-4. [ ] Test the ingress with a real ingress controller.
+4. [x] Test the ingress with a real ingress controller.
 5. [ ] Make the marimohub change for queues, then add the queue map.
 
 After step 2 the system talks only to Armada.

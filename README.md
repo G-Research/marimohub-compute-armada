@@ -39,6 +39,10 @@ in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `ARMADA_KERNEL_PORT`                 | no       | Port marimo serves on (default `2718`)                |
 | `ARMADA_AGENT_PORT`                  | no       | Port the agent listens on (default `8718`)            |
 | `ARMADA_COMMAND_MAX_SECONDS`         | no       | Backstop for one exec (default `21600`, `0` off)      |
+| `ARMADA_EXPOSE`                      | no       | `nodeport` (default) or `ingress`, for both ports     |
+| `ARMADA_INGRESS_TLS`                 | no       | `true` (default) or `false`; ingress only             |
+| `ARMADA_INGRESS_CERT_NAME`           | no       | TLS secret name prefix (default `<namespace>-`)       |
+| `ARMADA_INGRESS_ANNOTATIONS`         | no       | JSON object put on every job's Ingress                |
 | `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` | no       | Public kernel hostname                                |
 | `ARMADA_AUTH_USERNAME`               | no       | Basic auth, set with the password                     |
 | `ARMADA_AUTH_PASSWORD`               | no       | Basic auth, set with the username                     |
@@ -52,6 +56,19 @@ booting rather than failing at the first session.
 public yet: build it from `agent/` for the architecture of the worker nodes (see
 Deployment). The agent port is exposed the same way as the kernel port, so whatever
 reaches one reaches the other.
+
+`ARMADA_EXPOSE` decides how those two ports are reached. `nodeport` asks Armada for a
+NodePort service: plaintext HTTP on the cluster's own network, which is what a local
+cluster offers with nothing installed and is enough when marimohub runs beside it in
+`proxy` exposure. `ingress` asks for an Ingress instead: one hostname per port, named by
+the executor's `podDefaults.ingress.hostnameSuffix`, served over HTTPS by the cluster's
+ingress controller. Armada's Ingress names no class, so the cluster needs a default
+IngressClass or an annotation naming one; the executor's suffix must be a wildcard DNS
+record for the controller; and the TLS secret, `<namespace>-` (or
+`ARMADA_INGRESS_CERT_NAME`) plus the executor's `certNameSuffix`, must hold a wildcard
+certificate for `*.<namespace>.<suffix>` that marimohub trusts (`NODE_EXTRA_CA_CERTS` for
+a private CA). `ARMADA_INGRESS_ANNOTATIONS` lands on every job's Ingress: a source
+allowlist for the agent's hostname, or a longer websocket read timeout, go there.
 
 `ARMADA_LOOKOUT_URL` gates a capability: set it and the adapter advertises
 `listActive`, which marimohub's reconciler uses to enumerate live sandboxes after a
@@ -83,7 +100,8 @@ Two images:
 The agent authenticates every request with a per-session token whose hash travels in
 the pod spec. It is exposed exactly as the kernel port is: over a NodePort that is
 plaintext HTTP on the cluster network, over an ingress it is a public HTTPS hostname.
-Restrict the ingress to marimohub's egress address in the latter case.
+Restrict the ingress to marimohub's egress address in the latter case, through
+`ARMADA_INGRESS_ANNOTATIONS` or the executor's cluster-wide ingress annotations.
 
 Verified against `ghcr.io/marimo-team/marimohub:0.3.12`.
 

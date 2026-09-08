@@ -158,8 +158,8 @@ export class ArmadaSandbox implements SandboxInstance {
 		);
 		this.pod = await this.armada.waitForRunning(this.job);
 		// The agent's address comes from the same event as the kernel's.
-		const address: string = await this.armada.ingressAddress(this.job, this.config.agentPort);
-		const channel: ControlChannel = this.openChannel({ address, token: this.token, pod: this.pod });
+		const url: string = await this.armada.portUrl(this.job, this.config.agentPort);
+		const channel: ControlChannel = this.openChannel({ url, token: this.token, pod: this.pod });
 		await channel.ready(AGENT_READY_TIMEOUT_MS);
 		this.channel = channel;
 	}
@@ -394,15 +394,14 @@ export class ArmadaSandbox implements SandboxInstance {
 	/**
 	 * The URL is the address Armada assigned, never a hostname we template, so
 	 * `options.hostname` is deliberately ignored (decision 13: Armada names the
-	 * host, we read it from the event stream). Today the submit creates a
-	 * NodePort service, so the address is `hostIP:nodePort` and plain http; the
-	 * scheme choice revisits when an Ingress config with TLS lands.
+	 * host, we read it from the event stream). The scheme follows the submit:
+	 * plain http to a NodePort on the cluster network, https to an Ingress
+	 * hostname when its TLS is on (`ARMADA_EXPOSE`).
 	 */
 	async exposePort(port: number, _options: ExposePortOptions): Promise<ExposePortResult> {
 		await this.ready();
 		if (this.job === undefined) throw new Error(`Sandbox ${this.id} has no job after ready()`);
-		const address: string = await this.armada.ingressAddress(this.job, port);
-		return { url: address.includes('://') ? address : `http://${address}` };
+		return { url: await this.armada.portUrl(this.job, port) };
 	}
 
 	/**

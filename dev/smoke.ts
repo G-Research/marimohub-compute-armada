@@ -55,7 +55,7 @@ const sandbox: ArmadaSandbox = new ArmadaSandbox(
 	config,
 	armada,
 	(endpoint: AgentEndpoint): AgentChannel => {
-		console.log(`  agent   ${endpoint.address}`);
+		console.log(`  agent   ${endpoint.url}`);
 		agent = new AgentChannel(endpoint);
 		return agent;
 	},

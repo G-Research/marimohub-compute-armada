@@ -16,6 +16,7 @@ import type {
 	JobCancelRequest,
 	JobSetRequest,
 	JobSubmitRequest,
+	JobSubmitRequestItem,
 	JobSubmitResponse,
 	JobSubmitResponseItem,
 	LookoutGetJobsRequest,
@@ -23,7 +24,7 @@ import type {
 	LookoutJob,
 } from './armada-types.js';
 import { authorizationHeader } from './auth.js';
-import type { ArmadaConfig } from './config.js';
+import type { ArmadaConfig, Exposure } from './config.js';
 import { readNdjson } from './ndjson.js';
 import { exposedPorts } from './podspec.js';
 import type { ActiveSandbox, SandboxId } from './types.js';
@@ -99,6 +100,28 @@ export class ArmadaClient {
 	 * `externalJobUri` because it is the only way to find the job again later.
 	 */
 	async submit(sandboxId: SandboxId, podSpec: V1PodSpec): Promise<SubmittedJob> {
+		const ports: number[] = exposedPorts(podSpec);
+		const expose: Exposure = this.config.expose;
+		// Either way the executor reports one address per port in the same event.
+		// An Ingress needs a service behind it, and Armada creates that itself: a
+		// ClusterIP one, since a headless service (Armada's default) leaves the
+		// ingress controller to resolve pod IPs on its own.
+		const exposure: Pick<JobSubmitRequestItem, 'ingress' | 'services'> =
+			expose.kind === 'ingress'
+				? {
+						ingress: [
+							{
+								ports,
+								tlsEnabled: expose.tls,
+								...(expose.certName === undefined ? {} : { certName: expose.certName }),
+								useClusterIP: true,
+								...(Object.keys(expose.annotations).length === 0
+									? {}
+									: { annotations: expose.annotations }),
+							},
+						],
+					}
+				: { services: [{ type: 'NodePort', ports }] };
 		const request: JobSubmitRequest = {
 			queue: this.config.queue,
 			jobSetId: sandboxId,
@@ -114,7 +137,7 @@ export class ArmadaClient {
 					// that are not marimohub's, and enumeration feeds a reconciler that
 					// destroys what it does not recognise, so only marked jobs may appear.
 					annotations: { 'armadaproject.io/failFast': 'true', [SANDBOX_MARK]: 'true' },
-					services: [{ type: 'NodePort', ports: exposedPorts(podSpec) }],
+					...exposure,
 				},
 			],
 		};
@@ -240,6 +263,19 @@ export class ArmadaClient {
 		throw new Error(
 			`Armada event stream ended before job ${job.jobId} reported an ingress address`,
 		);
+	}
+
+	/**
+	 * `ingressAddress` as a URL. The scheme is the submit's to choose, since the
+	 * submit is what decided whether the address is a NodePort on the cluster
+	 * network or an Ingress hostname with or without a certificate.
+	 */
+	async portUrl(job: SubmittedJob, port: number): Promise<string> {
+		const address: string = await this.ingressAddress(job, port);
+		if (address.includes('://')) return address;
+		const expose: Exposure = this.config.expose;
+		const scheme: string = expose.kind === 'ingress' && expose.tls ? 'https' : 'http';
+		return `${scheme}://${address}`;
 	}
 
 	async cancel(job: SubmittedJob): Promise<void> {

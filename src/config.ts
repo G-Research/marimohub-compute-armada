@@ -2,9 +2,37 @@ import { readFileSync } from 'node:fs';
 import type { ArmadaAuth } from './auth.js';
 import type { AdapterFactoryContext } from './types.js';
 
+/**
+ * How the kernel port and the agent port are reached from outside the pod.
+ *
+ * `nodeport` asks Armada for a NodePort service: the address event carries
+ * `hostIP:nodePort` per port, plaintext HTTP on the cluster's own network. It is
+ * what a local kind cluster can offer with nothing installed.
+ *
+ * `ingress` asks for an Ingress: one hostname per port, named by the executor
+ * (its `podDefaults.ingress.hostnameSuffix`), served by whatever ingress
+ * controller the worker cluster runs. The Ingress Armada generates carries no
+ * `ingressClassName`, so the cluster needs a default class or an annotation
+ * that names one. With `tls` the URLs are `https` and the Ingress names a
+ * certificate secret: `certName`, or Armada's `<namespace>-` default, either
+ * one with the executor's `certNameSuffix` appended. `annotations` land on
+ * every job's Ingress on top of the executor's cluster-wide ones, which is
+ * where a websocket read timeout or an IP allowlist goes.
+ */
+export type Exposure =
+	| { kind: 'nodeport' }
+	| {
+			kind: 'ingress';
+			tls: boolean;
+			certName?: string | undefined;
+			annotations: Record<string, string>;
+	  };
+
 export interface ArmadaConfig {
 	/** Armada REST gateway base URL, http or https. */
 	url: string;
+	/** NodePort service or Ingress, for both ports at once. */
+	expose: Exposure;
 	/** Armada queue jobs are submitted to. */
 	queue: string;
 	/** Kubernetes namespace the executor creates pods in. */
@@ -159,6 +187,69 @@ function readAuth(env: Record<string, string | undefined>): ArmadaAuth {
 	return { kind: 'anonymous' };
 }
 
+/**
+ * Ingress settings only mean something under `ARMADA_EXPOSE=ingress`; one set
+ * beside a NodePort would be silently ignored, which is the kind of startup
+ * mistake decision 15 exists to catch.
+ */
+function readExposure(env: Record<string, string | undefined>): Exposure {
+	const kind: string = env.ARMADA_EXPOSE ?? 'nodeport';
+	const ingressVars: string[] = [
+		'ARMADA_INGRESS_TLS',
+		'ARMADA_INGRESS_CERT_NAME',
+		'ARMADA_INGRESS_ANNOTATIONS',
+	].filter((name: string) => env[name] !== undefined);
+
+	if (kind === 'nodeport') {
+		if (ingressVars.length > 0) {
+			throw new Error(
+				`${ingressVars.join(', ')} only apply with ARMADA_EXPOSE=ingress, and ARMADA_EXPOSE is nodeport`,
+			);
+		}
+		return { kind: 'nodeport' };
+	}
+	if (kind !== 'ingress') {
+		throw new Error(`ARMADA_EXPOSE must be nodeport or ingress, got: ${kind}`);
+	}
+
+	const tlsRaw: string = env.ARMADA_INGRESS_TLS ?? 'true';
+	if (tlsRaw !== 'true' && tlsRaw !== 'false') {
+		throw new Error(`ARMADA_INGRESS_TLS must be true or false, got: ${tlsRaw}`);
+	}
+	const certName: string | undefined = env.ARMADA_INGRESS_CERT_NAME;
+	if (certName !== undefined && !certName.trim()) {
+		throw new Error('ARMADA_INGRESS_CERT_NAME is empty');
+	}
+	return {
+		kind: 'ingress',
+		tls: tlsRaw === 'true',
+		certName,
+		annotations: readAnnotations(env.ARMADA_INGRESS_ANNOTATIONS),
+	};
+}
+
+/** A JSON object of strings, the shape an Ingress annotation map has. */
+function readAnnotations(raw: string | undefined): Record<string, string> {
+	if (raw === undefined) return {};
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		throw new Error(`ARMADA_INGRESS_ANNOTATIONS must be a JSON object, got: ${raw}`);
+	}
+	if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+		throw new Error(`ARMADA_INGRESS_ANNOTATIONS must be a JSON object, got: ${raw}`);
+	}
+	const annotations: Record<string, string> = {};
+	for (const [key, value] of Object.entries(parsed)) {
+		if (typeof value !== 'string') {
+			throw new Error(`ARMADA_INGRESS_ANNOTATIONS: annotation ${key} must be a string`);
+		}
+		annotations[key] = value;
+	}
+	return annotations;
+}
+
 /** A day, when neither marimohub nor the environment says otherwise. */
 const DEFAULT_MAX_LIFETIME_SECONDS = 24 * 60 * 60;
 
@@ -179,6 +270,7 @@ export function readConfig(
 
 	const config: ArmadaConfig = {
 		url: requiredUrl(env, 'ARMADA_URL'),
+		expose: readExposure(env),
 		queue: required(env, 'ARMADA_QUEUE'),
 		namespace: env.ARMADA_NAMESPACE ?? 'default',
 		priorityClassName: env.ARMADA_PRIORITY_CLASS,

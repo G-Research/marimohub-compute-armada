@@ -9,9 +9,9 @@ Underneath every decision sits the one question we want answered more than any o
 mostly idle interactive jobs, one job set per session, a single queue today. Our position is
 that it is sensible, and the evidence exists to earn that position rather than assume it. If
 you read nothing else, read [The central bet](#the-central-bet) and
-[Still open](#still-open): the five judgement calls there are the ones we cannot settle
-without you, and the twenty-nine decisions exist to support them. They are written to be
-checked, not taken on faith. The first of the five has since been answered, and the answer
+[Still open](#still-open): the six judgement calls there are the ones we cannot settle
+without you, and the thirty decisions exist to support them. They are written to be
+checked, not taken on faith. The first of the six has since been answered, and the answer
 replaced the control channel: see the note at the head of decision 11, decision 28, and
 `AGENT-DESIGN.md`.
 
@@ -385,6 +385,11 @@ Assumptions this leans on, both satisfied by any image marimo itself runs on: `s
 (util-linux, present in Debian slim) and `python3` on the login-shell PATH.
 
 ### 20. `exposePort` returns the address Armada assigned, verbatim
+
+_Since decision 30 the scheme follows the submit: `portUrl` in `src/armada.ts` wraps
+the address below in `https://` when the job asked for an Ingress with TLS and
+`http://` otherwise, and the "revisits when an Ingress config with TLS lands" at the end
+of this decision is that revisit. The address itself is still read, never templated._
 
 `ingressAddress` reads `JobIngressInfoEvent` from the same job-set stream `waitForRunning`
 uses. The executor fills `ingressAddresses` with one entry per exposed container port:
@@ -934,6 +939,80 @@ agent waits for and whose `kill()` (a group signal) leaves nothing behind, a pro
 dies at once reported as a crash with its log, and the timed-out exec and cancelled stream
 leaving no strays, zombies included.
 
+### 30. Ingress exposure is a submit-time choice, and a real controller carried a session
+
+Step 4 of `AGENT-DESIGN.md`'s order of work, built and verified. Decision 20 left the
+kernel URL at plain `http://` to a NodePort "until an Ingress config with TLS lands";
+this is that landing, for the kernel port and the agent port alike.
+
+**What the submit sends.** `ARMADA_EXPOSE` chooses one of two shapes per job
+(`src/config.ts`, `src/armada.ts`). `nodeport`, the default, is decision 28 unchanged: a
+`services` entry of type `NodePort` over both declared ports. `ingress` sends one
+`ingress` entry instead, `{ports, tlsEnabled, certName?, useClusterIP: true, annotations?}`,
+and no service. Armada creates the service itself: with no submitted service covering the
+ingress ports it makes a ClusterIP one and the Ingress on top
+(`internal/server/submit/conversion/conversions.go:151`, `:181`), one rule per port with
+host `<container>-<port>-<pod>.<namespace>.` (`:263`) plus the executor's
+`hostnameSuffix` (`internal/executor/job/submit.go:165`). `useClusterIP` is true because
+Armada's default is headless (decision 13); ingress-nginx routes to endpoints and would
+cope, a controller that routes through the service IP would not, and there is no reason to
+find out per controller. With `tlsEnabled` the Ingress carries one TLS entry listing both
+hostnames, whose `secretName` is `certName` or `<namespace>-` (`conversions.go:297`) with
+the executor's `certNameSuffix` appended (`submit.go:170`). The executor ships with
+`hostnameSuffix: svc` and `certNameSuffix: ingress-tls-certificate`
+(`config/executor/config.yaml:64`), so an executor nobody configured yields
+`kernel-2718-armada-<job>-0.default.svc`, a name that resolves nowhere, and
+`default-ingress-tls-certificate`, a secret to create in the job's namespace.
+
+**What the adapter reads.** Unchanged: the same `JobIngressInfoEvent`, one entry per port,
+with the rule host where the NodePort address was (`internal/executor/reporter/event.go:162`;
+when both a NodePort service and an Ingress exist the host wins, since that loop runs
+second). `portUrl` adds the scheme, `https` when TLS is on, so the agent endpoint and
+`exposePort` both carry a URL rather than a bare address. No hostname is templated
+(decision 13).
+
+**Three things Armada cannot set, so the deployment must.** The generated Ingress has no
+`ingressClassName`: `conversions.go:312` copies rules and TLS only. The cluster therefore
+needs a default IngressClass, a controller that serves class-less Ingresses (kind's
+ingress-nginx manifest passes `--watch-ingress-without-class`), or the older
+`kubernetes.io/ingress.class` annotation, which `ARMADA_INGRESS_ANNOTATIONS` or the
+executor's `podDefaults.ingress.annotations` can carry. The hostname suffix must be a
+wildcard DNS record for the controller's address, one level below the namespace. And the
+certificate must be a wildcard for `*.<namespace>.<suffix>` in the secret the names above
+produce, with marimohub trusting its issuer: `NODE_EXTRA_CA_CERTS` for a private CA, which
+Node and Bun both honour.
+
+**Websockets.** The one assumption decision 20 could not test is now verified. Through
+ingress-nginx at its defaults, a 60-second `proxy-read-timeout` included, the editor's
+websocket lived 234 seconds and closed only when the session was stopped, across a
+110-second stretch with no interaction and no disconnect shown. Nothing needs setting for a
+session to work; an operator who sees idle drops behind another controller has
+`ARMADA_INGRESS_ANNOTATIONS` for its timeout.
+
+**A public hostname to a shell.** Over an Ingress the agent port is reachable from wherever
+the controller is, guarded by the token alone (decision 28). The per-job annotations are the
+place for a source allowlist (`nginx.ingress.kubernetes.io/whitelist-source-range` on
+ingress-nginx, marimohub's egress address as its value), the executor's cluster-wide
+annotations are the other, and a private ingress class is the third answer. Choosing is
+open question 6.
+
+**Local.** `dev/ingress-local.sh` gives the kind cluster all three things: ingress-nginx
+pinned to the worker node on its host ports 80 and 443, the executor's suffix patched to
+`<worker-ip-with-dashes>.sslip.io` so every generated hostname resolves to that node with no
+DNS of our own, and a self-signed wildcard certificate in the secret Armada's defaults
+name, with its CA under `dev/tls/` for the smoke run and marimohub to trust. The two dev
+scripts pass `ARMADA_EXPOSE` and the ingress variables through and mount that CA when it
+exists.
+
+**Verified live.** `bun run smoke` under `ARMADA_EXPOSE=ingress`: the agent answered at
+`https://kernel-8718-armada-<job>-0.default.172-18-0-2.sslip.io` and every check passed,
+the cancelled stream included, so nginx buffers nothing the protocol minds. A notebook
+session from a real browser against marimohub in ingress mode: Armada created one ClusterIP
+service and one Ingress with two host rules and one TLS entry naming
+`default-ingress-tls-certificate`; the provision line reported reachable in 24.0s and
+succeeded in 24.5s; the editor loaded through the proxy over the ingress and the kernel
+reported healthy; and Stop removed the pod, the service and the Ingress together.
+
 ## Constraints on the first submit
 
 Collected from `internal/server/submit/validation/submit_request.go` so the first real submit
@@ -1011,12 +1090,14 @@ These are judgement calls, not missing homework.
    at which this shape becomes an anti-pattern, and is there server-side tuning (event
    retention, expiry) an operator should set for it?
 6. **Where should the agent image live, and how should its port be exposed?** Decision 28
-   exposes the agent port exactly as the kernel port: a NodePort on the cluster network
-   locally, an ingress hostname in production. The token guards it either way, but an
-   ingress makes it a public hostname to a shell, and the sensible answers (an IP allowlist
-   annotation per job, or a private ingress class) are deployment choices. So is the
-   registry the worker clusters pull the agent image from, and whether one image for both
-   architectures is wanted.
+   exposes the agent port exactly as the kernel port, and decision 30 makes the ingress
+   form real: `ARMADA_EXPOSE=ingress` gives both ports an HTTPS hostname, verified against
+   ingress-nginx. The token guards the agent either way, but an ingress makes it a public
+   hostname to a shell, and the sensible answers (a source allowlist per job through
+   `ARMADA_INGRESS_ANNOTATIONS`, one cluster-wide in the executor's ingress annotations,
+   or a private ingress class) are deployment choices, as is which controller and which
+   default IngressClass, since Armada sets none. So is the registry the worker clusters
+   pull the agent image from, and whether one image for both architectures is wanted.
 
 ## What has been verified
 
@@ -1092,6 +1173,13 @@ Verified:
   editor loads through marimohub's `/proxy/<token>/` route, the kernel executes the
   notebook's cells, autosave writes back to `/workspace/notebook.py` over the proxied
   websocket, and the kernel's `/api/status` through the proxy reports healthy.
+- Ingress exposure (decision 30) against ingress-nginx on the local cluster: the submit
+  with an `ingress` entry and no service is accepted, Armada creates a ClusterIP service and
+  one Ingress with a host rule per port and a TLS entry naming the default secret, the
+  address event carries the two hostnames, `bun run smoke` passes in full over HTTPS
+  through the controller, a browser session provisions (24.5s), loads the editor and runs
+  a healthy kernel through it, the websocket outlives the controller's default 60-second
+  read timeout by minutes of idle time, and Stop removes the pod, service and Ingress.
 - Build, type checks, tests and image build pass in CI.
 
 Assumed, not verified:
@@ -1102,28 +1190,28 @@ Assumed, not verified:
   `setsid` and the `python3` waiter, so a kernel image no longer needs any of those.
 - That an interactive session survives normal scheduling behaviour once decisions 7 to 9 are
   applied.
-- That the generated Ingress carries WebSocket traffic with a real ingress controller.
-  This only matters for `subdomain` exposure; `proxy` exposure carries websockets through
-  marimohub and is verified.
+- That an ingress controller other than ingress-nginx behaves the same (decision 30):
+  serving a class-less Ingress, carrying the websocket, routing to a ClusterIP service.
 - That `listActive` answers against a real Lookout. The tests stub its responses; the local
   cluster's Lookout on port 30000 has not been asked yet.
 - The four items under [Still open](#still-open).
 
 ## Where to look in the code
 
-| Path                           | What it is                                                                                    |
-| ------------------------------ | --------------------------------------------------------------------------------------------- |
-| `src/types.ts`                 | marimohub's adapter interface, transcribed by hand. Not ours to change.                       |
-| `src/armada.ts`                | Placement: submit, watch, ingress address, cancel; `listActive` via Lookout.                  |
-| `src/channel.ts`               | Control channel: the client for the agent's exec, process and file endpoints.                 |
-| `agent/`                       | The agent itself: a Go program run as PID 1, with the exec, process and file endpoints.       |
-| `AGENT-DESIGN.md`              | The reviewer's design for the in-pod agent; decisions 28 and 29 are what was built from it.   |
-| `src/shell.ts`                 | Env prefix, quoting and the clone command that `exec` still needs, from `compute-commons`.    |
-| `src/sandbox.ts`               | One kernel session: `exec` on the agent, everything else on its typed endpoints.              |
-| `dev/smoke.sh`, `dev/smoke.ts` | The live check, run from a container on the `kind` network so it can reach the agent.         |
-| `src/armada-types.ts`          | Hand-written Armada wire types, with the reasoning in the header.                             |
-| `scripts/check-armada-api.ts`  | The contract check that keeps those types honest.                                             |
-| `README.md`                    | Configuration and deployment; `docs/ARCHITECTURE.md` and `docs/CONTRIBUTING.md` for the rest. |
+| Path                           | What it is                                                                                      |
+| ------------------------------ | ----------------------------------------------------------------------------------------------- |
+| `src/types.ts`                 | marimohub's adapter interface, transcribed by hand. Not ours to change.                         |
+| `src/armada.ts`                | Placement: submit, watch, ingress address, cancel; `listActive` via Lookout.                    |
+| `src/channel.ts`               | Control channel: the client for the agent's exec, process and file endpoints.                   |
+| `agent/`                       | The agent itself: a Go program run as PID 1, with the exec, process and file endpoints.         |
+| `AGENT-DESIGN.md`              | The reviewer's design for the in-pod agent; decisions 28 and 29 are what was built from it.     |
+| `src/shell.ts`                 | Env prefix, quoting and the clone command that `exec` still needs, from `compute-commons`.      |
+| `src/sandbox.ts`               | One kernel session: `exec` on the agent, everything else on its typed endpoints.                |
+| `dev/smoke.sh`, `dev/smoke.ts` | The live check, run from a container on the `kind` network so it can reach the agent.           |
+| `dev/ingress-local.sh`         | Ingress-nginx, a wildcard hostname suffix and a certificate for the kind cluster (decision 30). |
+| `src/armada-types.ts`          | Hand-written Armada wire types, with the reasoning in the header.                               |
+| `scripts/check-armada-api.ts`  | The contract check that keeps those types honest.                                               |
+| `README.md`                    | Configuration and deployment; `docs/ARCHITECTURE.md` and `docs/CONTRIBUTING.md` for the rest.   |
 
 One path is deliberately absent from the table: marimohub itself, cloned from the URL in the
 introduction. Its provisioner, reconciler, compute contract and kubernetes adapter

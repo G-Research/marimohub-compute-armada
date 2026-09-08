@@ -201,7 +201,8 @@ into `marimohub-armada:dev`, creates the `marimohub` queue, starts the container
 port 3000 joined to the `kind` network with `fs` storage, `dev` auth and `proxy`
 sandbox exposure, and polls `/api/health` until it answers. No credential of any kind
 is mounted. Override with `ARMADA_URL`, `ARMADA_QUEUE`, `ARMADA_NAMESPACE`, `PORT`,
-`IMAGE`, `AGENT_IMAGE`, `CONTAINER`, `ARMADACTL` and `NODE`.
+`IMAGE`, `AGENT_IMAGE`, `CONTAINER`, `ARMADACTL` and `NODE`; `ARMADA_EXPOSE` and the
+`ARMADA_INGRESS_*` variables pass through too (see step 6).
 
 ### 5. What you should see
 
@@ -225,6 +226,35 @@ docker logs marimohub-armada 2>&1 | grep request_error | tail -1 | jq -r '.error
 
 The `session_provision` log line reports each step's timing and which succeeded.
 marimohub compensates cleanly on a failed start, so Retry is safe.
+
+### 6. Through an ingress
+
+Everything above reaches the pod over NodePorts. Production reaches it over an Ingress
+(`ARMADA_EXPOSE=ingress`), and the kind cluster can do that too:
+
+```bash
+./dev/ingress-local.sh
+ARMADA_EXPOSE=ingress bun run smoke
+ARMADA_EXPOSE=ingress ./dev/run-local.sh
+```
+
+The script installs ingress-nginx from kind's manifest (pinned; its current version
+carries no `ingress-ready` node selector, so the script pins the controller to the
+worker node itself), patches the executor's `podDefaults.ingress.hostnameSuffix` to
+`<worker-ip-with-dashes>.sslip.io` so every hostname Armada generates resolves to the
+worker with no DNS of our own, waits for the executor to roll, and issues a self-signed
+wildcard certificate for `*.default.<suffix>` into the secret Armada's defaults name
+(`default-ingress-tls-certificate`). The CA lands in `dev/tls/` (gitignored); both dev
+scripts mount it and set `NODE_EXTRA_CA_CERTS` when it exists. Rerunnable.
+
+What you should see: the smoke prints the agent at
+`https://kernel-8718-armada-<job>-0.default.172-18-0-2.sslip.io` and passes every check.
+During a browser session `kubectl get ingress,svc` shows one ClusterIP service and one
+Ingress with two hosts and a TLS entry; the `session_provision` line reports
+`provision_reachable_ms` around 24000; and after Stop all three objects are gone. The
+controller's log (`kubectl -n ingress-nginx logs deploy/ingress-nginx-controller`) shows
+the editor's assets served and, once the session ends, one `101` line for the websocket
+whose request time is the whole session.
 
 ### Inspecting and tearing down
 

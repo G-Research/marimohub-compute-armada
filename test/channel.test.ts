@@ -152,7 +152,7 @@ afterEach(() => {
 
 function endpoint(token = 'token-1'): AgentEndpoint {
 	return {
-		address: `127.0.0.1:${String(server.port)}`,
+		url: `http://127.0.0.1:${String(server.port)}`,
 		token,
 		pod: { clusterId: 'Cluster1', podName: 'armada-job-0', podNamespace: 'default' },
 	};
@@ -229,15 +229,6 @@ describe('run', () => {
 
 		script = [JSON.stringify({ stdout: b64('partial') })];
 		expect(await rejection(channel().run(['sh']))).toContain('ended without an exit status');
-	});
-
-	it('keeps a scheme the address already has', async () => {
-		script = [JSON.stringify({ exit: 0 })];
-		const prefixed: AgentChannel = new AgentChannel({
-			...endpoint(),
-			address: `http://127.0.0.1:${String(server.port)}`,
-		});
-		expect((await prefixed.run(['true'])).exitCode).toBe(0);
 	});
 });
 
@@ -445,7 +436,10 @@ describe('ready', () => {
 	});
 
 	it('reports a connection that cannot be made', async () => {
-		const unreachable: AgentChannel = new AgentChannel({ ...endpoint(), address: '127.0.0.1:1' });
+		const unreachable: AgentChannel = new AgentChannel({
+			...endpoint(),
+			url: 'http://127.0.0.1:1',
+		});
 		expect(await rejection(unreachable.ready(300))).toContain('The agent in default/armada-job-0');
 	});
 });

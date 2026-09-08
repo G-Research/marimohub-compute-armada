@@ -160,7 +160,11 @@ hostname on a different domain from marimohub's.
 
 The adapter never templates a hostname. Armada names the host of an ingress rule, and
 the adapter returns whatever the address event says: `hostIP:nodePort` for a NodePort
-service, the rule host for an ingress.
+service, the rule host for an ingress. Which of the two the job asks for is
+`ARMADA_EXPOSE`, and it covers the agent port and the kernel port together: a NodePort
+service is plain HTTP on the cluster network, an Ingress is an HTTPS hostname per port
+served by the cluster's ingress controller, with the certificate and the DNS suffix
+coming from the executor's configuration rather than from this adapter.
 
 ## Abandoned commands
 

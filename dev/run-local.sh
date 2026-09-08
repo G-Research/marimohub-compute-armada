@@ -56,6 +56,14 @@ docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 # macOS cannot route to, but this container sits on that network and can. The
 # ack flag is proxy mode's required opt-in (kernels become same-origin with the
 # app), and the session secret signs its routing tokens; both are dev values.
+#
+# Under ARMADA_EXPOSE=ingress marimohub reaches the kernel and the agent at the
+# hostnames Armada reports, so it must trust the CA dev/ingress-local.sh made:
+# the file is mounted and named in NODE_EXTRA_CA_CERTS when it exists.
+CA_MOUNT=()
+if [ -f dev/tls/ca.crt ]; then
+	CA_MOUNT=(-v "$PWD/dev/tls/ca.crt:/etc/marimohub/ingress-ca.crt:ro" -e NODE_EXTRA_CA_CERTS=/etc/marimohub/ingress-ca.crt)
+fi
 docker run -d --name "$CONTAINER" --platform linux/amd64 \
 	--network kind \
 	-p "$PORT:3000" \
@@ -71,6 +79,11 @@ docker run -d --name "$CONTAINER" --platform linux/amd64 \
 	-e ARMADA_URL="${ARMADA_URL:-http://host.docker.internal:30001}" \
 	-e ARMADA_QUEUE="$QUEUE" \
 	-e ARMADA_NAMESPACE="${ARMADA_NAMESPACE:-default}" \
+	${ARMADA_EXPOSE:+-e ARMADA_EXPOSE="$ARMADA_EXPOSE"} \
+	${ARMADA_INGRESS_TLS:+-e ARMADA_INGRESS_TLS="$ARMADA_INGRESS_TLS"} \
+	${ARMADA_INGRESS_CERT_NAME:+-e ARMADA_INGRESS_CERT_NAME="$ARMADA_INGRESS_CERT_NAME"} \
+	${ARMADA_INGRESS_ANNOTATIONS:+-e ARMADA_INGRESS_ANNOTATIONS="$ARMADA_INGRESS_ANNOTATIONS"} \
+	"${CA_MOUNT[@]}" \
 	"$IMAGE" >/dev/null
 
 echo "==> waiting for marimohub"

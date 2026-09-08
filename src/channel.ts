@@ -105,8 +105,12 @@ export interface ControlChannel {
 
 /** Where one pod's agent is, and what it will accept. */
 export interface AgentEndpoint {
-	/** As Armada reported it: `host:port` for a NodePort, a hostname for an ingress. */
-	address: string;
+	/**
+	 * Where the agent answers: the address Armada reported for its port, with the
+	 * scheme the exposure implies. `http://host:port` for a NodePort, `https://host`
+	 * for an Ingress with TLS.
+	 */
+	url: string;
 	token: string;
 	pod: PodLocation;
 }
@@ -243,7 +247,7 @@ export class AgentChannel implements ControlChannel {
 	private readonly where: string;
 
 	constructor(private readonly endpoint: AgentEndpoint) {
-		this.base = endpoint.address.includes('://') ? endpoint.address : `http://${endpoint.address}`;
+		this.base = endpoint.url;
 		this.where = `${endpoint.pod.podNamespace}/${endpoint.pod.podName}`;
 	}
 
