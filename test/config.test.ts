@@ -67,7 +67,7 @@ describe('ARMADA_EXPOSE', () => {
 			'ARMADA_INGRESS_ANNOTATIONS must be a JSON object, got: ["a"]',
 		);
 		expect(() => readConfig({ ...ingress, ARMADA_INGRESS_ANNOTATIONS: '{"a":1}' })).toThrow(
-			'ARMADA_INGRESS_ANNOTATIONS: annotation a must be a string',
+			'ARMADA_INGRESS_ANNOTATIONS: a must be a non-empty string',
 		);
 	});
 });

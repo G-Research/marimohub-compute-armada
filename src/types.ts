@@ -163,11 +163,26 @@ export interface SandboxUserHome {
 	path: string;
 }
 
+/**
+ * Who a sandbox is for. Adapters that partition compute per tenant (an Armada
+ * queue, a Kubernetes namespace) key on it; the rest ignore it.
+ */
+export interface SandboxOwner {
+	projectId: string;
+	userId?: string;
+}
+
 export interface CreateSandboxOptions {
 	reuse?: boolean;
 	image?: string;
 	resources?: ComputeResources;
 	userHome?: SandboxUserHome;
+	/**
+	 * Who the sandbox is for, on every call where the caller holds a session
+	 * record. Absent where it holds only an id (orphan reconciliation), so an
+	 * adapter that keys on it must remember what it learned or look it up.
+	 */
+	owner?: SandboxOwner;
 }
 
 export interface SandboxProvider {

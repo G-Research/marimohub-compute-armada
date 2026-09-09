@@ -33,8 +33,15 @@ export interface ArmadaConfig {
 	url: string;
 	/** NodePort service or Ingress, for both ports at once. */
 	expose: Exposure;
-	/** Armada queue jobs are submitted to. */
+	/** Armada queue jobs are submitted to when no owner map claims them. */
 	queue: string;
+	/**
+	 * User id to queue, and project id to queue: the fairness model of a
+	 * multi-tenant deployment (`queues.ts`). A user's entry wins over their
+	 * project's. Empty means every sandbox goes to `queue`.
+	 */
+	queueByUser: Record<string, string>;
+	queueByProject: Record<string, string>;
 	/** Kubernetes namespace the executor creates pods in. */
 	namespace: string;
 	/**
@@ -224,30 +231,37 @@ function readExposure(env: Record<string, string | undefined>): Exposure {
 		kind: 'ingress',
 		tls: tlsRaw === 'true',
 		certName,
-		annotations: readAnnotations(env.ARMADA_INGRESS_ANNOTATIONS),
+		annotations: readStringMap(env, 'ARMADA_INGRESS_ANNOTATIONS'),
 	};
 }
 
-/** A JSON object of strings, the shape an Ingress annotation map has. */
-function readAnnotations(raw: string | undefined): Record<string, string> {
+/**
+ * A JSON object of non-empty strings: an Ingress annotation map, or an owner
+ * to queue map. Absent is the empty map.
+ */
+function readStringMap(
+	env: Record<string, string | undefined>,
+	name: string,
+): Record<string, string> {
+	const raw: string | undefined = env[name];
 	if (raw === undefined) return {};
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
 	} catch {
-		throw new Error(`ARMADA_INGRESS_ANNOTATIONS must be a JSON object, got: ${raw}`);
+		throw new Error(`${name} must be a JSON object, got: ${raw}`);
 	}
 	if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-		throw new Error(`ARMADA_INGRESS_ANNOTATIONS must be a JSON object, got: ${raw}`);
+		throw new Error(`${name} must be a JSON object, got: ${raw}`);
 	}
-	const annotations: Record<string, string> = {};
+	const map: Record<string, string> = {};
 	for (const [key, value] of Object.entries(parsed)) {
-		if (typeof value !== 'string') {
-			throw new Error(`ARMADA_INGRESS_ANNOTATIONS: annotation ${key} must be a string`);
+		if (typeof value !== 'string' || !value.trim()) {
+			throw new Error(`${name}: ${key} must be a non-empty string`);
 		}
-		annotations[key] = value;
+		map[key] = value;
 	}
-	return annotations;
+	return map;
 }
 
 /** A day, when neither marimohub nor the environment says otherwise. */
@@ -272,6 +286,8 @@ export function readConfig(
 		url: requiredUrl(env, 'ARMADA_URL'),
 		expose: readExposure(env),
 		queue: required(env, 'ARMADA_QUEUE'),
+		queueByUser: readStringMap(env, 'ARMADA_QUEUE_BY_USER'),
+		queueByProject: readStringMap(env, 'ARMADA_QUEUE_BY_PROJECT'),
 		namespace: env.ARMADA_NAMESPACE ?? 'default',
 		priorityClassName: env.ARMADA_PRIORITY_CLASS,
 		image,
