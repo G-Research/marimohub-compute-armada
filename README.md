@@ -135,7 +135,7 @@ is transcribed from; everything added since 0.3.12 is optional, so that release 
 - [ARMADA-REVIEW.md](ARMADA-REVIEW.md): every design decision, with evidence cited
   against the pinned Armada release, and what is still open.
 - [AGENT-DESIGN.md](AGENT-DESIGN.md): the design of the in-pod agent, written by an
-  Armada maintainer.
+  Armada maintainer; built in full, kept for the reasoning.
 
 ## License
 

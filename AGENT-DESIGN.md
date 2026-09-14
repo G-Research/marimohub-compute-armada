@@ -1,5 +1,9 @@
 # Kernel agent: how marimohub reaches a notebook that Armada placed
 
+**Status: built in full.** Every step of the order of work at the end is done and verified on a live cluster.
+This document is the design as it was written, kept for the reasoning; the adapter as it is today is described in `docs/ARCHITECTURE.md`, and what was built, and where it departs from this text, is in `ARMADA-REVIEW.md` decisions 28 to 34.
+Two departures matter to a reader of this document: the pod carries a hash of the agent's secret, not the secret, and a sandbox's queue is settled from what is known of its job before the owner map is consulted.
+
 ## The three systems
 
 ### marimo
@@ -84,7 +88,9 @@ flowchart LR
   armada -->|events: running · addresses| client
 ```
 
-## How this adapter works today
+## How the adapter worked before the agent
+
+This is the state the design set out to replace, kept so the problem below reads as it was.
 
 The adapter submits one Armada job per sandbox.
 The job is one pod with one container from the kernel image, the image the operator provides with Python, `uv`, and marimo in it.
@@ -295,8 +301,9 @@ These remove the adapter's workarounds for commands that outlive a dropped conne
 ### How the agent checks the caller
 
 The agent port gives command access to a pod that runs a user's code.
-The adapter generates a random secret per sandbox and sets it as an environment variable in the pod description.
-Every request must carry that secret in a header, and the agent refuses a request without it.
+The adapter generates a random secret per sandbox and puts its SHA-256 hash, not the secret, in the pod description as an environment variable.
+Every request must carry the secret in a header; the agent hashes it and refuses a request whose hash does not match.
+Anyone who can read the job's pod description sees only the hash.
 The secret is valid for one pod and for the life of that pod.
 marimohub holds nothing that reaches more than one pod.
 
@@ -323,9 +330,10 @@ A small change in marimohub adds the project id and the user id to the sandbox r
 The adapter then maps them to a queue and remembers the queue per sandbox.
 Until then, one marimohub installation per team, each with its own queue, gives team queues with no code change.
 
-Built as step 5: marimohub's `CreateSandboxOptions.owner` (merged upstream as marimohub#301) and the adapter's `ARMADA_QUEUE_BY_USER` and `ARMADA_QUEUE_BY_PROJECT` maps.
-The queue is remembered per sandbox and, for one nobody in the process has seen, asked of Lookout, because every Armada call about a job needs its queue.
-`ARMADA-REVIEW.md` decision 31 records it.
+Built as step 5: marimohub's `CreateSandboxOptions.owner` (merged upstream as marimohub#301, released in 0.4.0) and the adapter's `ARMADA_QUEUE_BY_USER` and `ARMADA_QUEUE_BY_PROJECT` maps.
+Every Armada call about a job needs its queue, and the queue a job is in is a fact while the map is only today's configuration, so the adapter asks what it remembers, then Lookout by job set, and lets the owner map place only a job that does not exist yet.
+A map therefore requires Lookout, and a question Lookout cannot answer fails the call rather than guess.
+`ARMADA-REVIEW.md` decision 31 records the build and decision 34 the corrected order.
 
 ## What else was considered
 
