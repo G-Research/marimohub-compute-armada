@@ -7,11 +7,13 @@ import type {
 	CommandResult,
 	ControlChannel,
 	ListFilesOutcome,
+	PortProbe,
 	PortWait,
 	ReadFileOutcome,
 } from './channel.js';
 import { CommandTimeoutError } from './channel.js';
 import { buildPodSpec } from './podspec.js';
+import type { QueueDirectory } from './queues.js';
 import { assertEnvName, gitCloneCommand, withEnvPrefix } from './shell.js';
 import type {
 	CreateSandboxOptions,
@@ -58,6 +60,13 @@ const WRITE_CONCURRENCY = 8;
 
 /** How long a running pod gets to answer on the agent port before `ready` gives up. */
 const AGENT_READY_TIMEOUT_MS = 30_000;
+
+/**
+ * `isPortReady` is one look, not a wait: a zero timeout makes the agent probe
+ * once and answer, the probe itself bounded to the 2s marimohub's local
+ * adapter allows (`agent/process.go`).
+ */
+const PORT_READY_TIMEOUT_MS = 0;
 
 /** A non-zero exit is the command's business; marimohub wants it as a result. */
 export function toExecResult(result: CommandResult): ExecResult {
@@ -120,6 +129,7 @@ export class ArmadaSandbox implements SandboxInstance {
 	private channel?: ControlChannel | undefined;
 	/** The bearer token this sandbox's agent expects. The pod carries only its hash. */
 	private token?: string;
+	/** Settled by `queue()`, and fixed for the life of the sandbox once it is. */
 
 	/**
 	 * The pod's environment is fixed at submission, so `setEnvVars` accumulates
@@ -135,6 +145,7 @@ export class ArmadaSandbox implements SandboxInstance {
 		private readonly config: ArmadaConfig,
 		private readonly armada: ArmadaClient,
 		private readonly openChannel: (endpoint: AgentEndpoint) => ControlChannel,
+		private readonly queues: QueueDirectory,
 		private readonly options?: CreateSandboxOptions,
 	) {}
 
@@ -155,6 +166,7 @@ export class ArmadaSandbox implements SandboxInstance {
 		this.job ??= await this.armada.submit(
 			this.id,
 			buildPodSpec(this.config, { tokenSha256 }, this.options),
+			await this.queue(),
 		);
 		this.pod = await this.armada.waitForRunning(this.job);
 		// The agent's address comes from the same event as the kernel's.
@@ -167,6 +179,41 @@ export class ArmadaSandbox implements SandboxInstance {
 	/** Where the pod landed, once it has. For reporting, not for reaching it. */
 	get placement(): PodLocation | undefined {
 		return this.pod;
+	}
+
+	/**
+	 * The queue this sandbox's job is in, or will be submitted to: the job's own
+	 * once submitted here, else what this process or Lookout knows of the
+	 * sandbox, else where the owner marimohub named maps to (`src/queues.ts`).
+	 */
+	async queue(): Promise<string> {
+		return this.job?.queue ?? this.queues.resolve(this.id, this.options?.owner);
+	}
+
+	/**
+	 * One probe of a port, for marimohub's surface manager checking whether a
+	 * surface it started earlier still answers. Without this it runs a
+	 * `python3` one-liner in the pod; the agent answers the same question from
+	 * inside without needing an interpreter. Anything but a clean answer is
+	 * "not ready", as marimohub's own adapters treat it, since the caller's
+	 * remedy is the same either way: start the surface again. Only the probe is
+	 * treated that way: a sandbox this process has not reached cannot have a
+	 * surface listening, and is not submitted or waited for to find that out.
+	 */
+	async isPortReady(port: number, options?: Omit<WaitForPortOptions, 'timeout'>): Promise<boolean> {
+		const channel: ControlChannel | undefined = this.channel;
+		if (channel === undefined) return false;
+		try {
+			const wait: PortWait = await channel.waitForPort(
+				port,
+				PORT_READY_TIMEOUT_MS,
+				undefined,
+				probeOf({ ...options, mode: options?.mode ?? 'http' }),
+			);
+			return wait.open;
+		} catch {
+			return false;
+		}
 	}
 
 	/**
@@ -413,11 +460,24 @@ export class ArmadaSandbox implements SandboxInstance {
 	 * never submitted at all: cancelling an empty set is a no-op.
 	 */
 	async destroy(): Promise<void> {
-		if (this.job === undefined) await this.armada.cancelSet(this.id);
+		if (this.job === undefined) await this.armada.cancelSet(this.id, await this.queue());
 		else await this.armada.cancel(this.job);
+		this.queues.forget(this.id);
 		this.pod = undefined;
 		this.channel = undefined;
 	}
+}
+
+/**
+ * marimohub's wait options as the agent's probe. `http` with a path is what a
+ * surface's readiness means; the kernel's own wait passes no mode and gets tcp.
+ */
+function probeOf(options: Omit<WaitForPortOptions, 'timeout'> | undefined): PortProbe | undefined {
+	if (options?.mode === undefined && options?.path === undefined) return undefined;
+	return {
+		...(options.mode === undefined ? {} : { mode: options.mode }),
+		...(options.path === undefined ? {} : { path: options.path }),
+	};
 }
 
 /** A detached process in the pod, addressed by the pid the agent returned. */
@@ -440,8 +500,9 @@ class ArmadaProcess implements SandboxProcess {
 	}
 
 	/**
-	 * `mode`/`path` are accepted but a TCP accept is all that is checked, the
-	 * same as marimohub's kubernetes adapter.
+	 * `mode` and `path` go to the agent as they are: `http` with a path is open
+	 * on any HTTP answer from that path, which is what a surface's readiness
+	 * means; no mode is a TCP accept, which is all the kernel's wait needs.
 	 *
 	 * One request: the agent loops in-pod against `127.0.0.1` and watches this
 	 * process at the same time, so a kernel that dies is reported the moment it
@@ -449,7 +510,12 @@ class ArmadaProcess implements SandboxProcess {
 	 */
 	async waitForPort(port: number, options?: WaitForPortOptions): Promise<void> {
 		const timeout: number = options?.timeout ?? 30_000;
-		const wait: PortWait = await this.channel.waitForPort(port, timeout, this.pid);
+		const wait: PortWait = await this.channel.waitForPort(
+			port,
+			timeout,
+			this.pid,
+			probeOf(options),
+		);
 		if (wait.open) return;
 		const log: string = await this.logsQuietly();
 		if (wait.exited === true) {

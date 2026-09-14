@@ -112,3 +112,20 @@ describe('podspec', () => {
 		);
 	});
 });
+
+describe('surface ports', () => {
+	it('declares each enabled surface port after the kernel and the agent, and exposes it', () => {
+		const surfaced: ArmadaConfig = readConfig({
+			ARMADA_URL: 'http://armada.example.com',
+			ARMADA_QUEUE: 'marimohub',
+			MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
+			ARMADA_AGENT_IMAGE: 'ghcr.io/example/kernel-agent:1',
+			MARIMOHUB_SURFACES: 'vscode,opencode',
+		});
+		const spec: V1PodSpec = buildPodSpec(surfaced, agent);
+		expect(
+			spec.containers[0]?.ports?.map((p: { containerPort: number }) => p.containerPort),
+		).toEqual([2718, 8718, 8443, 4096]);
+		expect(exposedPorts(spec)).toEqual([2718, 8718, 8443, 4096]);
+	});
+});

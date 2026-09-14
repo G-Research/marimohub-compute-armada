@@ -323,6 +323,10 @@ A small change in marimohub adds the project id and the user id to the sandbox r
 The adapter then maps them to a queue and remembers the queue per sandbox.
 Until then, one marimohub installation per team, each with its own queue, gives team queues with no code change.
 
+Built as step 5: marimohub's `CreateSandboxOptions.owner` (merged upstream as marimohub#301) and the adapter's `ARMADA_QUEUE_BY_USER` and `ARMADA_QUEUE_BY_PROJECT` maps.
+The queue is remembered per sandbox and, for one nobody in the process has seen, asked of Lookout, because every Armada call about a job needs its queue.
+`ARMADA-REVIEW.md` decision 31 records it.
+
 ## What else was considered
 
 Armada could add command execution to binoculars, its per-cluster component that reads pod logs.
@@ -345,6 +349,6 @@ That is still a Kubernetes credential, and it works for one cluster only.
        Run a full notebook session on a local cluster.
 3. [x] Add the process and file requests and delete the workarounds.
 4. [x] Test the ingress with a real ingress controller.
-5. [ ] Make the marimohub change for queues, then add the queue map.
+5. [x] Make the marimohub change for queues, then add the queue map.
 
 After step 2 the system talks only to Armada.

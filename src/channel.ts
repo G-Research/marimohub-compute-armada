@@ -47,6 +47,16 @@ export interface ProcessStatus {
 	exitCode?: number;
 }
 
+/**
+ * What "open" means to a port wait. `tcp` (the default) is a connection
+ * accepted; `http` is any HTTP response to a GET of `path`, the readiness
+ * meaning marimohub's surfaces ask for.
+ */
+export interface PortProbe {
+	mode?: 'tcp' | 'http';
+	path?: string;
+}
+
 /** How an in-pod port wait ended. */
 export interface PortWait {
 	open: boolean;
@@ -100,7 +110,7 @@ export interface ControlChannel {
 	/** Everything the process printed, both streams in order. */
 	processLogs(pid: number): Promise<string>;
 	/** Wait in-pod until the port answers, `timeoutMs` passes, or `pid` exits. */
-	waitForPort(port: number, timeoutMs: number, pid?: number): Promise<PortWait>;
+	waitForPort(port: number, timeoutMs: number, pid?: number, probe?: PortProbe): Promise<PortWait>;
 }
 
 /** Where one pod's agent is, and what it will accept. */
@@ -498,12 +508,23 @@ export class AgentChannel implements ControlChannel {
 		return response.text();
 	}
 
-	async waitForPort(port: number, timeoutMs: number, pid?: number): Promise<PortWait> {
+	async waitForPort(
+		port: number,
+		timeoutMs: number,
+		pid?: number,
+		probe?: PortProbe,
+	): Promise<PortWait> {
 		const what = `wait for port ${String(port)}`;
 		// The agent holds the request for up to the timeout; past that plus
 		// slack, the wait itself has gone missing.
 		const response: Response = await this.request(what, 'POST', '/process/waitport', {
-			json: { port, timeoutMs, ...(pid === undefined ? {} : { pid }) },
+			json: {
+				port,
+				timeoutMs,
+				...(pid === undefined ? {} : { pid }),
+				...(probe?.mode === undefined ? {} : { mode: probe.mode }),
+				...(probe?.path === undefined ? {} : { path: probe.path }),
+			},
 			signal: AbortSignal.timeout(timeoutMs + TIMEOUT_SLACK_MS),
 		});
 		if (!response.ok) {

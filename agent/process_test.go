@@ -286,3 +286,90 @@ func TestEveryEndpointRefusesWithoutTheToken(t *testing.T) {
 		}
 	}
 }
+
+// A server that answers, even with a 404, is ready in http mode: an answer is
+// what a readiness path means, not a particular status.
+func TestWaitPortHTTPModeIsOpenOnAnyResponse(t *testing.T) {
+	server := testServer(t)
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	defer upstream.Close()
+	port := upstream.Listener.Addr().(*net.TCPAddr).Port
+
+	response := request(t, server, http.MethodPost, "/process/waitport", waitPortRequest{Port: port, TimeoutMs: 2000, Mode: "http", Path: "/healthz"})
+	wait := decode[waitPortResponse](t, response)
+	if !wait.Open {
+		t.Errorf("got %+v, want open", wait)
+	}
+}
+
+// A port that accepts connections but never speaks HTTP is open to tcp and
+// not to http: that is the difference a surface's readiness relies on.
+func TestWaitPortHTTPModeIsNotOpenOnASilentListener(t *testing.T) {
+	server := testServer(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.Close() }()
+		}
+	}()
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	tcp := decode[waitPortResponse](t, request(t, server, http.MethodPost, "/process/waitport", waitPortRequest{Port: port, TimeoutMs: 2000}))
+	if !tcp.Open {
+		t.Errorf("tcp: got %+v, want open", tcp)
+	}
+	viaHTTP := decode[waitPortResponse](t, request(t, server, http.MethodPost, "/process/waitport", waitPortRequest{Port: port, TimeoutMs: 700, Mode: "http"}))
+	if viaHTTP.Open {
+		t.Errorf("http: got %+v, want not open", viaHTTP)
+	}
+}
+
+// A zero timeout is one probe and an answer: what isPortReady asks, so a look
+// at a dead port costs a refused connect, not a two-second wait.
+func TestWaitPortZeroTimeoutIsOneProbe(t *testing.T) {
+	server := testServer(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	open := listener.Addr().(*net.TCPAddr).Port
+
+	if wait := decode[waitPortResponse](t, request(t, server, http.MethodPost, "/process/waitport", waitPortRequest{Port: open, TimeoutMs: 0})); !wait.Open {
+		t.Errorf("open port: got %+v, want open", wait)
+	}
+	began := time.Now()
+	closed := decode[waitPortResponse](t, request(t, server, http.MethodPost, "/process/waitport", waitPortRequest{Port: closedPort(t), TimeoutMs: 0, Mode: "http"}))
+	if closed.Open {
+		t.Errorf("closed port: got %+v, want not open", closed)
+	}
+	if time.Since(began) > time.Second {
+		t.Errorf("closed port took %s, one refused connect should answer at once", time.Since(began))
+	}
+}
+
+func TestWaitPortRejectsABadModeOrPath(t *testing.T) {
+	server := testServer(t)
+	for _, req := range []waitPortRequest{
+		{Port: 80, TimeoutMs: 100, Mode: "udp"},
+		{Port: 80, TimeoutMs: 100, Mode: "http", Path: "healthz"},
+		// A bad escape would otherwise fail every probe until the deadline.
+		{Port: 80, TimeoutMs: 100, Mode: "http", Path: "/a%zz"},
+		// A path with nothing to request it.
+		{Port: 80, TimeoutMs: 100, Path: "/healthz"},
+	} {
+		response := request(t, server, http.MethodPost, "/process/waitport", req)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Errorf("%+v: status %d, want 400", req, response.StatusCode)
+		}
+	}
+}

@@ -8,6 +8,7 @@
  */
 import type { V1PodSpec } from '@kubernetes/client-node';
 import type {
+	LookoutFilter,
 	EventMessage,
 	EventStreamLine,
 	JobFailedEvent,
@@ -40,6 +41,13 @@ export interface PodLocation {
 export interface SubmittedJob {
 	jobId: string;
 	jobSetId: string;
+	/** Every later call about the job is addressed by queue and job set. */
+	queue: string;
+}
+
+/** A live job as Lookout reports it: the sandbox, and the queue that holds it. */
+export interface ActiveJob extends ActiveSandbox {
+	queue: string;
 }
 
 /**
@@ -62,9 +70,13 @@ const DEFAULT_RUNNING_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_INGRESS_TIMEOUT_MS = 60 * 1000;
 
 /**
- * Annotation marking a job as this adapter's, set at submit and filtered on by
- * `listActive`. Job annotations land on the pod too, so the mark is visible
- * from Lookout and from Kubernetes alike.
+ * Annotation marking a job as this installation's, set at submit and filtered
+ * on by `listActive` and `findQueue`. Its value is the default queue name
+ * (`ARMADA_QUEUE`), which names one marimohub installation however many queues
+ * its owner map spreads jobs over, so enumeration does not depend on the map
+ * of the day and two installations sharing an Armada never see each other's
+ * sandboxes. Job annotations land on the pod too, so the mark is visible from
+ * Lookout and from Kubernetes alike.
  */
 export const SANDBOX_MARK = 'marimohub/sandbox';
 
@@ -98,8 +110,11 @@ export class ArmadaClient {
 	 * `clientId` so a resubmit dedupes instead of starting a second kernel,
 	 * `jobSetId` so this sandbox's events are their own stream, and
 	 * `externalJobUri` because it is the only way to find the job again later.
+	 *
+	 * The queue is the caller's choice (`src/queues.ts`) and travels with the
+	 * returned job, since every later call is addressed by it.
 	 */
-	async submit(sandboxId: SandboxId, podSpec: V1PodSpec): Promise<SubmittedJob> {
+	async submit(sandboxId: SandboxId, podSpec: V1PodSpec, queue: string): Promise<SubmittedJob> {
 		const ports: number[] = exposedPorts(podSpec);
 		const expose: Exposure = this.config.expose;
 		// Either way the executor reports one address per port in the same event.
@@ -123,7 +138,7 @@ export class ArmadaClient {
 					}
 				: { services: [{ type: 'NodePort', ports }] };
 		const request: JobSubmitRequest = {
-			queue: this.config.queue,
+			queue,
 			jobSetId: sandboxId,
 			jobRequestItems: [
 				{
@@ -136,7 +151,7 @@ export class ArmadaClient {
 					// sandbox mark is what `listActive` filters on: a queue may hold jobs
 					// that are not marimohub's, and enumeration feeds a reconciler that
 					// destroys what it does not recognise, so only marked jobs may appear.
-					annotations: { 'armadaproject.io/failFast': 'true', [SANDBOX_MARK]: 'true' },
+					annotations: { 'armadaproject.io/failFast': 'true', [SANDBOX_MARK]: this.config.queue },
 					...exposure,
 				},
 			],
@@ -150,7 +165,7 @@ export class ArmadaClient {
 		if (item?.jobId === undefined || item.jobId === '') {
 			throw new Error(`Armada returned no job id for sandbox ${sandboxId}`);
 		}
-		return { jobId: item.jobId, jobSetId: sandboxId };
+		return { jobId: item.jobId, jobSetId: sandboxId, queue };
 	}
 
 	/**
@@ -165,12 +180,12 @@ export class ArmadaClient {
 		timeoutMs: number = DEFAULT_RUNNING_TIMEOUT_MS,
 	): Promise<PodLocation> {
 		const request: JobSetRequest = {
-			queue: this.config.queue,
+			queue: job.queue,
 			id: job.jobSetId,
 			watch: true,
 			errorIfMissing: false,
 		};
-		const path: string = `/v1/job-set/${encodeURIComponent(this.config.queue)}/${encodeURIComponent(job.jobSetId)}`;
+		const path: string = `/v1/job-set/${encodeURIComponent(job.queue)}/${encodeURIComponent(job.jobSetId)}`;
 		const response: Response = await this.post(path, request, AbortSignal.timeout(timeoutMs));
 		if (response.body === null) throw new Error(`Armada returned no event stream for ${path}`);
 
@@ -222,12 +237,12 @@ export class ArmadaClient {
 		timeoutMs: number = DEFAULT_INGRESS_TIMEOUT_MS,
 	): Promise<string> {
 		const request: JobSetRequest = {
-			queue: this.config.queue,
+			queue: job.queue,
 			id: job.jobSetId,
 			watch: true,
 			errorIfMissing: false,
 		};
-		const path: string = `/v1/job-set/${encodeURIComponent(this.config.queue)}/${encodeURIComponent(job.jobSetId)}`;
+		const path: string = `/v1/job-set/${encodeURIComponent(job.queue)}/${encodeURIComponent(job.jobSetId)}`;
 		const response: Response = await this.post(path, request, AbortSignal.timeout(timeoutMs));
 		if (response.body === null) throw new Error(`Armada returned no event stream for ${path}`);
 
@@ -280,7 +295,7 @@ export class ArmadaClient {
 
 	async cancel(job: SubmittedJob): Promise<void> {
 		const request: JobCancelRequest = {
-			queue: this.config.queue,
+			queue: job.queue,
 			jobSetId: job.jobSetId,
 			jobId: job.jobId,
 		};
@@ -296,9 +311,56 @@ export class ArmadaClient {
 	 * (`internal/server/submit/submit.go:170`). Cancelling a set that no longer
 	 * exists (or never did) is a no-op, not an error.
 	 */
-	async cancelSet(jobSetId: string): Promise<void> {
-		const request: JobCancelRequest = { queue: this.config.queue, jobSetId };
+	async cancelSet(jobSetId: string, queue: string): Promise<void> {
+		const request: JobCancelRequest = { queue, jobSetId };
 		await this.post('/v1/job/cancel', request);
+	}
+
+	/**
+	 * Which queue holds a sandbox's job, asked of Lookout by job set, for a
+	 * sandbox this process never submitted and has not enumerated
+	 * (`src/queues.ts`). `undefined` when no live or finished job carries the set
+	 * and the mark, or when Lookout is not configured; rejects when Lookout
+	 * cannot be asked, which the directory turns into a `QueueUnknownError`.
+	 */
+	async findQueue(jobSetId: SandboxId): Promise<string | undefined> {
+		const lookout: string | undefined = this.config.lookoutUrl;
+		if (lookout === undefined) return undefined;
+		const jobs: LookoutJob[] = await this.lookoutJobs(
+			lookout,
+			[{ field: 'jobSet', value: jobSetId, match: 'exact' }],
+			{ field: 'submitted', direction: 'DESC' },
+			0,
+			1,
+		);
+		const queue: string | undefined = jobs[0]?.queue;
+		return queue === undefined || queue === '' ? undefined : queue;
+	}
+
+	/**
+	 * One page of Lookout's job list, always scoped by the {@link SANDBOX_MARK}
+	 * annotation carrying this installation's name: the reconciler destroys
+	 * what `listActive` returns, and Lookout sees every queue of every tenant,
+	 * so an unmarked answer would cancel strangers' work on the next sweep.
+	 */
+	private async lookoutJobs(
+		lookout: string,
+		filters: LookoutFilter[],
+		order: LookoutGetJobsRequest['order'],
+		skip: number,
+		take: number,
+	): Promise<LookoutJob[]> {
+		const request: LookoutGetJobsRequest = {
+			filters: [
+				...filters,
+				{ field: SANDBOX_MARK, value: this.config.queue, match: 'exact', isAnnotation: true },
+			],
+			order,
+			skip,
+			take,
+		};
+		const response: object = await this.postJsonTo(lookout, '/api/v1/jobs', request);
+		return (response as LookoutGetJobsResponse).jobs ?? [];
 	}
 
 	/**
@@ -308,12 +370,13 @@ export class ArmadaClient {
 	 * the jobs I own" call at all (decision 4). Lookout is the component that
 	 * aggregates jobs across every executor cluster, so this needs no cluster
 	 * inventory, and it sees jobs still QUEUED, which have no pod anywhere yet.
-	 * The filters scope the answer to our queue and to jobs carrying the
-	 * {@link SANDBOX_MARK} annotation, because the reconciler destroys
-	 * sandboxes it has no record of and must never be shown a job that is not
-	 * marimohub's.
+	 * The answer is scoped by the mark alone, not by queue: a job is this
+	 * installation's wherever the owner map of the day put it, or a map since
+	 * retired. Each job comes back with its queue, so a sandbox found here can
+	 * be cancelled without another lookup; a job Lookout reports without one is
+	 * skipped rather than guessed at.
 	 */
-	async listActive(): Promise<ActiveSandbox[]> {
+	async listActive(): Promise<ActiveJob[]> {
 		const lookout: string | undefined = this.config.lookoutUrl;
 		if (lookout === undefined) {
 			throw new Error('listActive needs ARMADA_LOOKOUT_URL, which is not configured');
@@ -321,25 +384,22 @@ export class ArmadaClient {
 
 		// Keyed by job set so a set holding several jobs (ours hold one) appears
 		// once. Insertion order is submission order, per `order` below.
-		const sandboxes: Map<string, ActiveSandbox> = new Map();
+		const sandboxes: Map<string, ActiveJob> = new Map();
 		for (let skip = 0; ; skip += LIST_ACTIVE_PAGE) {
-			const request: LookoutGetJobsRequest = {
-				filters: [
-					{ field: 'queue', value: this.config.queue, match: 'exact' },
-					{ field: 'state', value: ACTIVE_JOB_STATES, match: 'anyOf' },
-					{ field: SANDBOX_MARK, value: 'true', match: 'exact', isAnnotation: true },
-				],
-				order: { field: 'submitted', direction: 'ASC' },
-				skip,
-				take: LIST_ACTIVE_PAGE,
-			};
 			// oxlint-disable-next-line no-await-in-loop -- each page's fullness decides whether another exists
-			const response: object = await this.postJsonTo(lookout, '/api/v1/jobs', request);
-			const jobs: LookoutJob[] = (response as LookoutGetJobsResponse).jobs ?? [];
+			const jobs: LookoutJob[] = await this.lookoutJobs(
+				lookout,
+				[{ field: 'state', value: ACTIVE_JOB_STATES, match: 'anyOf' }],
+				{ field: 'submitted', direction: 'ASC' },
+				skip,
+				LIST_ACTIVE_PAGE,
+			);
 			for (const job of jobs) {
 				if (job.jobSet === undefined || job.jobSet === '') continue;
+				if (job.queue === undefined || job.queue === '') continue;
 				sandboxes.set(job.jobSet, {
 					id: job.jobSet,
+					queue: job.queue,
 					...(job.submitted === undefined ? {} : { createdAt: job.submitted }),
 				});
 			}

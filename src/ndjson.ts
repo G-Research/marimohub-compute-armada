@@ -30,6 +30,10 @@ export async function* readNdjson(body: ReadableStream<Uint8Array>): AsyncGenera
 		const last: string = buffered.trim();
 		if (last !== '') yield JSON.parse(last);
 	} finally {
-		reader.releaseLock();
+		// A consumer that stops early, on the event it wanted or an abort, leaves
+		// the rest unread. Cancelling releases the connection; releasing the lock
+		// alone would leave a watch stream open for as long as the server keeps
+		// it, one socket per sandbox start in a long-lived process.
+		await reader.cancel().catch((): undefined => undefined);
 	}
 }

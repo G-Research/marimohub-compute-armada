@@ -13,26 +13,60 @@
  *   bun run smoke -- --keep  # leave the job running to poke at
  */
 import { ArmadaClient } from '../src/armada.js';
+import { ArmadaCompute } from '../src/provider.js';
 import type { PodLocation } from '../src/armada.js';
 import { AgentChannel } from '../src/channel.js';
 import type { AgentEndpoint, CommandResult, ProcessStatus } from '../src/channel.js';
 import { readConfig } from '../src/config.js';
 import type { ArmadaConfig } from '../src/config.js';
+import { QueueDirectory } from '../src/queues.js';
 import { ArmadaSandbox } from '../src/sandbox.js';
 import { parseStrayProcesses, strayProcessCommand } from '../src/shell.js';
 import type { StrayProcess } from '../src/shell.js';
-import type { ExecResult, ListFilesResult, ReadFileResult, SandboxProcess } from '../src/types.js';
+import type {
+	ActiveSandbox,
+	ExecResult,
+	ListFilesResult,
+	ReadFileResult,
+	SandboxOwner,
+	SandboxProcess,
+} from '../src/types.js';
 
 const config: ArmadaConfig = readConfig({
 	ARMADA_URL: 'http://localhost:30001',
 	ARMADA_QUEUE: 'marimohub',
 	MARIMOHUB_COMPUTE_IMAGE: 'marimo-sandbox:local',
 	ARMADA_AGENT_IMAGE: 'marimohub-kernel-agent:local',
+	// A secondary surface, so the pod declares a third port and the provider
+	// advertises multiPort; the checks below look at that port's address.
+	MARIMOHUB_SURFACES: 'vscode',
 	...process.env,
 });
 
 const sandboxId: string = `smoke-${Date.now().toString(36)}`;
 const armada: ArmadaClient = new ArmadaClient(config);
+
+// Name an owner to exercise the queue map (`ARMADA_QUEUE_BY_PROJECT`,
+// `ARMADA_QUEUE_BY_USER`): the job goes to the owner's queue, and a second
+// provider that knows nothing but the id finds that queue again through Lookout.
+const owner: SandboxOwner | undefined =
+	process.env.SMOKE_OWNER_PROJECT === undefined
+		? undefined
+		: {
+				projectId: process.env.SMOKE_OWNER_PROJECT,
+				...(process.env.SMOKE_OWNER_USER === undefined
+					? {}
+					: { userId: process.env.SMOKE_OWNER_USER }),
+			};
+const queues: QueueDirectory = new QueueDirectory(config, async (id: string) =>
+	armada.findQueue(id),
+);
+// Checked before anything is submitted: the owner check at the end needs a
+// second provider that can enumerate, and a run that cannot must not leave a
+// job behind.
+if (owner !== undefined && config.lookoutUrl === undefined) {
+	throw new Error('an owner check needs ARMADA_LOOKOUT_URL');
+}
 
 let failures = 0;
 function check(passed: boolean, message: string): void {
@@ -59,9 +93,13 @@ const sandbox: ArmadaSandbox = new ArmadaSandbox(
 		agent = new AgentChannel(endpoint);
 		return agent;
 	},
+	queues,
+	owner === undefined ? undefined : { owner },
 );
 
-console.log(`submitting ${sandboxId} to queue "${config.queue}" at ${config.url}`);
+console.log(
+	`submitting ${sandboxId}${owner === undefined ? '' : ` for ${JSON.stringify(owner)}`} at ${config.url}`,
+);
 console.log(`  kernel image ${config.image}`);
 console.log(`  agent image  ${config.agentImage}`);
 
@@ -70,8 +108,10 @@ await sandbox.ready();
 const pod: PodLocation | undefined = sandbox.placement;
 if (agent === undefined || pod === undefined) throw new Error('ready() returned without a pod');
 const seconds: string = ((Date.now() - startedAt) / 1000).toFixed(1);
+const queue: string = await sandbox.queue();
 
 console.log(`\nrunning and answering after ${seconds}s`);
+console.log(`  queue   ${queue}`);
 console.log(`  cluster ${pod.clusterId}`);
 console.log(`  pod     ${pod.podNamespace}/${pod.podName}`);
 console.log(`  node    ${pod.nodeName ?? 'unknown'}`);
@@ -119,6 +159,14 @@ const serving: SandboxProcess = await sandbox.startProcess(
 const servingPid: number = Number(serving.id.replace('armada-proc-', ''));
 await serving.waitForPort(8123, { timeout: 30_000 });
 console.log('  port 8123 answered');
+// The readiness a surface asks for: an HTTP answer on a path, not just a TCP
+// accept, and a one-shot look at it afterwards.
+await serving.waitForPort(8123, { mode: 'http', path: '/', timeout: 10_000 });
+check(
+	await sandbox.isPortReady(8123, { path: '/' }),
+	'isPortReady sees the server answer over http',
+);
+check(!(await sandbox.isPortReady(8125)), 'isPortReady is false for a port nothing listens on');
 const alive: ProcessStatus = await agent.processStatus(servingPid);
 check(alive.running, 'the agent reports the server running');
 await serving.kill();
@@ -132,6 +180,19 @@ for (let attempt = 0; attempt < 50 && afterKill.running; attempt++) {
 check(!afterKill.running, 'kill() really terminated it');
 const logs: { stdout: string } = await serving.getLogs();
 check(logs.stdout.length > 0, 'its log survived it');
+
+console.log('exposing the kernel port and a surface port');
+const kernelUrl: string = (await sandbox.exposePort(config.port, { hostname: 'ignored' })).url;
+const surfaceUrl: string = (await sandbox.exposePort(8443, { hostname: 'ignored' })).url;
+const surfaceAgain: string = (await sandbox.exposePort(8443, { hostname: 'ignored' })).url;
+console.log(`  kernel  ${kernelUrl}`);
+console.log(`  surface ${surfaceUrl}`);
+check(
+	new ArmadaCompute(config).capabilities.multiPort &&
+		surfaceUrl !== kernelUrl &&
+		surfaceAgain === surfaceUrl,
+	"multiPort: the surface port has its own stable address next to the kernel's",
+);
 
 console.log('starting a process that dies at once');
 const crashing: SandboxProcess = await sandbox.startProcess('echo boom; exit 7');
@@ -181,9 +242,36 @@ check(
 
 if (process.argv.includes('--keep')) {
 	console.log(`\nleft running. cancel it with:`);
-	console.log(`  armadactl cancel --queue ${config.queue} --jobSet ${sandboxId}`);
-} else {
+	console.log(`  armadactl cancel --queue ${queue} --jobSet ${sandboxId}`);
+} else if (owner === undefined) {
 	await sandbox.destroy();
 	console.log('\ncancelled');
+} else {
+	// A restart, in miniature: a provider with no memory of this sandbox must
+	// enumerate it (listActive spans every mapped queue) and cancel it in the
+	// right queue, which it can only learn from Lookout.
+	console.log('\ndestroying through a provider that knows only the id');
+	// The lookup by job set on its own, before listActive can remember anything.
+	check(
+		(await armada.findQueue(sandboxId)) === queue,
+		`Lookout names queue "${queue}" for the job set, by the installation's mark`,
+	);
+	const fresh: ArmadaCompute = new ArmadaCompute(config);
+	if (fresh.listActive === undefined) throw new Error('unreachable: Lookout was checked above');
+	const before: ActiveSandbox[] = await fresh.listActive();
+	check(
+		before.some((active: ActiveSandbox) => active.id === sandboxId),
+		`listActive sees it (${String(before.length)} active across ${queues.all.join(', ')})`,
+	);
+	await fresh.create(sandboxId).destroy();
+	let gone = false;
+	for (let attempt = 0; attempt < 15 && !gone; attempt += 1) {
+		// oxlint-disable-next-line no-await-in-loop -- Lookout ingests the cancel a moment after the server accepts it
+		await sleep(2_000);
+		// oxlint-disable-next-line no-await-in-loop -- see above
+		const after: ActiveSandbox[] = await fresh.listActive();
+		gone = !after.some((active: ActiveSandbox) => active.id === sandboxId);
+	}
+	check(gone, `cancelled in queue "${queue}" by a provider that had to look it up`);
 }
 console.log(failures === 0 ? 'all checks passed' : `${String(failures)} check(s) FAILED`);

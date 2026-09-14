@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -193,6 +195,61 @@ type waitPortRequest struct {
 	// will never open its port, and its caller should hear "crashed", not
 	// "timed out".
 	Pid int `json:"pid"`
+	// "tcp" (the default) is open once a connection is accepted. "http" is
+	// open once a GET of Path gets any HTTP response at all, which is what a
+	// readiness path means: a server that accepts connections while it still
+	// loads is not ready, and a 404 from one that answers is.
+	Mode string `json:"mode"`
+	Path string `json:"path"`
+}
+
+// How long one HTTP probe may take: a server that accepts and then hangs is
+// not ready, and the next probe should not wait on it for the whole deadline.
+const httpProbeTimeout = 2 * time.Second
+
+// probeClient makes the HTTP probes: one connection per probe, closed with it,
+// so a look at a server that is still starting leaves nothing behind.
+var probeClient = &http.Client{
+	Transport: &http.Transport{DisableKeepAlives: true},
+	// A redirect is an answer; following it could leave the pod.
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+// probeBound is how long one probe may take: the mode's limit, or what remains
+// of the caller's deadline when that is shorter. A deadline already passed
+// still gets the limit, so a zero timeout is exactly one bounded probe.
+func probeBound(remaining, limit time.Duration) time.Duration {
+	if remaining > 0 && remaining < limit {
+		return remaining
+	}
+	return limit
+}
+
+// open reports whether one probe of the port succeeds, by the request's mode.
+func (req waitPortRequest) open(ctx context.Context, address string, remaining time.Duration) bool {
+	if req.Mode == "http" {
+		ctx, cancel := context.WithTimeout(ctx, probeBound(remaining, httpProbeTimeout))
+		defer cancel()
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+address+req.Path, nil)
+		if err != nil {
+			return false
+		}
+		response, err := probeClient.Do(request)
+		if err != nil {
+			return false
+		}
+		_ = response.Body.Close()
+		return true
+	}
+	dialer := net.Dialer{Timeout: probeBound(remaining, dialTimeout)}
+	conn, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 type waitPortResponse struct {
@@ -203,7 +260,8 @@ type waitPortResponse struct {
 
 // waitPort connects to 127.0.0.1:port until it answers, the deadline passes,
 // or the watched process exits. In-pod for the reason the old in-pod waiter
-// was: polling from outside pays a round trip per probe.
+// was: polling from outside pays a round trip per probe. The port is always
+// probed at least once, so a zero timeout is one look and an answer.
 func (a *agent) waitPort(w http.ResponseWriter, r *http.Request) {
 	var req waitPortRequest
 	body := http.MaxBytesReader(w, r.Body, maxRequestBytes)
@@ -213,6 +271,30 @@ func (a *agent) waitPort(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Port < 1 || req.Port > 65535 {
 		writeError(w, http.StatusBadRequest, "port must be between 1 and 65535")
+		return
+	}
+	switch req.Mode {
+	case "", "tcp":
+		req.Mode = "tcp"
+		if req.Path != "" {
+			writeError(w, http.StatusBadRequest, "path needs mode http; a tcp probe does not request anything")
+			return
+		}
+	case "http":
+		if req.Path == "" {
+			req.Path = "/"
+		}
+		if !strings.HasPrefix(req.Path, "/") {
+			writeError(w, http.StatusBadRequest, "path must start with /")
+			return
+		}
+		// Checked here, once, rather than failing every probe until the deadline.
+		if _, err := url.Parse("http://127.0.0.1" + req.Path); err != nil {
+			writeError(w, http.StatusBadRequest, "path is not a valid URL path: "+err.Error())
+			return
+		}
+	default:
+		writeError(w, http.StatusBadRequest, "mode must be tcp or http")
 		return
 	}
 	var proc *startedProcess
@@ -229,14 +311,7 @@ func (a *agent) waitPort(w http.ResponseWriter, r *http.Request) {
 	deadline := time.Now().Add(time.Duration(req.TimeoutMs) * time.Millisecond)
 	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(req.Port))
 	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			writeJSON(w, waitPortResponse{Open: false})
-			return
-		}
-		conn, err := net.DialTimeout("tcp", address, min(remaining, dialTimeout))
-		if err == nil {
-			_ = conn.Close()
+		if req.open(r.Context(), address, time.Until(deadline)) {
 			writeJSON(w, waitPortResponse{Open: true})
 			return
 		}
@@ -247,6 +322,10 @@ func (a *agent) waitPort(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, waitPortResponse{Open: false, Exited: true, ExitCode: &code})
 				return
 			}
+		}
+		if time.Until(deadline) <= 0 {
+			writeJSON(w, waitPortResponse{Open: false})
+			return
 		}
 		select {
 		case <-r.Context().Done():

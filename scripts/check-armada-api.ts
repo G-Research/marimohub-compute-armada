@@ -167,6 +167,7 @@ const LOOKOUT_TOKENS: readonly string[] = [
 	// The job fields we read. `jobSet` is the sandbox id, `submitted` becomes
 	// `createdAt`.
 	'jobSet:',
+	'queue:',
 	'submitted:',
 	'state:',
 	'jobs:',

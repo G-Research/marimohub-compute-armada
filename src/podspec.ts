@@ -99,10 +99,14 @@ export function buildPodSpec(
 				// and it reaps what a detached kernel leaves behind.
 				command: [AGENT_PATH, '--port', String(config.agentPort)],
 				env: [{ name: AGENT_TOKEN_HASH_ENV, value: agent.tokenSha256 }],
-				ports: [
-					{ containerPort: config.port, protocol: 'TCP' },
-					{ containerPort: config.agentPort, protocol: 'TCP' },
-				],
+				// The kernel, the agent, then each surface marimohub may start
+				// (`config.surfacePorts`): all of them earn an address this way.
+				ports: [config.port, config.agentPort, ...config.surfacePorts].map(
+					(port: number): { containerPort: number; protocol: string } => ({
+						containerPort: port,
+						protocol: 'TCP',
+					}),
+				),
 				resources: { requests: resources, limits: resources },
 				volumeMounts: [{ name: AGENT_VOLUME, mountPath: AGENT_DIR }],
 			},

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { ArmadaClient } from '../src/armada.js';
-import type { PodLocation, SubmittedJob } from '../src/armada.js';
+import type { ActiveJob, PodLocation, SubmittedJob } from '../src/armada.js';
 import { readConfig } from '../src/config.js';
 import type { ArmadaConfig } from '../src/config.js';
 import { buildPodSpec } from '../src/podspec.js';
@@ -78,9 +78,10 @@ describe('submit', () => {
 		const job: SubmittedJob = await new ArmadaClient(config).submit(
 			'sandbox-7',
 			buildPodSpec(config, agent),
+			'marimohub',
 		);
 
-		expect(job).toEqual({ jobId: 'job-1', jobSetId: 'sandbox-7' });
+		expect(job).toEqual({ jobId: 'job-1', jobSetId: 'sandbox-7', queue: 'marimohub' });
 		expect(calls[0]?.url).toBe('http://armada.example.com/v1/job/submit');
 		expect(calls[0]?.headers['authorization']).toBe('Bearer secret');
 
@@ -110,7 +111,11 @@ describe('submit', () => {
 			ARMADA_INGRESS_ANNOTATIONS: '{"nginx.ingress.kubernetes.io/proxy-read-timeout":"3600"}',
 		});
 
-		await new ArmadaClient(ingressConfig).submit('sandbox-7', buildPodSpec(ingressConfig, agent));
+		await new ArmadaClient(ingressConfig).submit(
+			'sandbox-7',
+			buildPodSpec(ingressConfig, agent),
+			'marimohub',
+		);
 
 		expect(JSON.stringify(calls[0]?.body)).not.toContain('"services"');
 		expect(calls[0]?.body).toMatchObject({
@@ -139,7 +144,11 @@ describe('submit', () => {
 			ARMADA_INGRESS_TLS: 'false',
 		});
 
-		await new ArmadaClient(ingressConfig).submit('sandbox-7', buildPodSpec(ingressConfig, agent));
+		await new ArmadaClient(ingressConfig).submit(
+			'sandbox-7',
+			buildPodSpec(ingressConfig, agent),
+			'marimohub',
+		);
 
 		const body: string = JSON.stringify(calls[0]?.body);
 		expect(body).not.toContain('certName');
@@ -159,7 +168,7 @@ describe('submit', () => {
 		stubFetch(Response.json({ jobResponseItems: [{ error: 'queue does not exist' }] }));
 
 		const message: string = await rejection(
-			new ArmadaClient(config).submit('s', buildPodSpec(config, agent)),
+			new ArmadaClient(config).submit('s', buildPodSpec(config, agent), 'marimohub'),
 		);
 		expect(message).toContain('queue does not exist');
 	});
@@ -168,14 +177,14 @@ describe('submit', () => {
 		stubFetch(new Response('no such queue', { status: 404 }));
 
 		const message: string = await rejection(
-			new ArmadaClient(config).submit('s', buildPodSpec(config, agent)),
+			new ArmadaClient(config).submit('s', buildPodSpec(config, agent), 'marimohub'),
 		);
 		expect(message).toContain('(404): no such queue');
 	});
 });
 
 describe('waitForRunning', () => {
-	const job: SubmittedJob = { jobId: 'job-1', jobSetId: 'sandbox-7' };
+	const job: SubmittedJob = { jobId: 'job-1', jobSetId: 'sandbox-7', queue: 'marimohub' };
 
 	it('returns where the pod landed', async () => {
 		stubFetch(
@@ -273,7 +282,7 @@ describe('waitForRunning', () => {
 });
 
 describe('ingressAddress', () => {
-	const job: SubmittedJob = { jobId: 'job-1', jobSetId: 'sandbox-7' };
+	const job: SubmittedJob = { jobId: 'job-1', jobSetId: 'sandbox-7', queue: 'marimohub' };
 
 	it('returns the address Armada assigned for the port', async () => {
 		stubFetch(
@@ -339,7 +348,7 @@ describe('ingressAddress', () => {
 });
 
 describe('portUrl', () => {
-	const job: SubmittedJob = { jobId: 'job-1', jobSetId: 'sandbox-7' };
+	const job: SubmittedJob = { jobId: 'job-1', jobSetId: 'sandbox-7', queue: 'marimohub' };
 
 	function addressEvent(address: string): void {
 		stubFetch(
@@ -387,7 +396,11 @@ describe('cancel', () => {
 	it('cancels the job by queue, job set and id', async () => {
 		stubFetch(Response.json({ cancelledIds: ['job-1'] }));
 
-		await new ArmadaClient(config).cancel({ jobId: 'job-1', jobSetId: 'sandbox-7' });
+		await new ArmadaClient(config).cancel({
+			jobId: 'job-1',
+			jobSetId: 'sandbox-7',
+			queue: 'marimohub',
+		});
 
 		expect(calls[0]?.url).toBe('http://armada.example.com/v1/job/cancel');
 		expect(calls[0]?.body).toEqual({
@@ -400,7 +413,7 @@ describe('cancel', () => {
 	it('cancels a whole set with no job id, which the server routes to CancelJobSet', async () => {
 		stubFetch(Response.json({}));
 
-		await new ArmadaClient(config).cancelSet('sandbox-7');
+		await new ArmadaClient(config).cancelSet('sandbox-7', 'marimohub');
 
 		expect(calls[0]?.body).toEqual({ queue: 'marimohub', jobSetId: 'sandbox-7' });
 	});
@@ -419,29 +432,37 @@ function lookoutPage(start: number, count: number): Response {
 	return Response.json({
 		jobs: Array.from({ length: count }, (_: unknown, n: number) => ({
 			jobSet: `sb-${String(start + n)}`,
+			queue: 'marimohub',
 		})),
 	});
 }
 
 describe('listActive', () => {
-	it('asks Lookout for marked, active jobs in our queue', async () => {
+	it("asks Lookout for active jobs carrying this installation's mark, whatever their queue", async () => {
 		stubFetch(
 			Response.json({
 				jobs: [
-					{ jobId: 'job-1', jobSet: 'sb-one', state: 'RUNNING', submitted: '2026-09-02T12:00:00Z' },
-					{ jobId: 'job-2', jobSet: 'sb-two', state: 'QUEUED' },
+					{
+						jobId: 'job-1',
+						jobSet: 'sb-one',
+						queue: 'marimohub',
+						state: 'RUNNING',
+						submitted: '2026-09-02T12:00:00Z',
+					},
+					{ jobId: 'job-2', jobSet: 'sb-two', queue: 'team-a', state: 'QUEUED' },
 				],
 			}),
 		);
 
-		const active: ActiveSandbox[] = await new ArmadaClient(lookoutConfig).listActive();
+		const active: ActiveJob[] = await new ArmadaClient(lookoutConfig).listActive();
 
 		expect(calls[0]?.url).toBe('http://lookout.example.com/api/v1/jobs');
+		// No queue filter: the mark's value is the default queue name, which
+		// names the installation across every queue its map ever used.
 		expect(calls[0]?.body).toEqual({
 			filters: [
-				{ field: 'queue', value: 'marimohub', match: 'exact' },
 				{ field: 'state', value: ['QUEUED', 'LEASED', 'PENDING', 'RUNNING'], match: 'anyOf' },
-				{ field: 'marimohub/sandbox', value: 'true', match: 'exact', isAnnotation: true },
+				{ field: 'marimohub/sandbox', value: 'marimohub', match: 'exact', isAnnotation: true },
 			],
 			order: { field: 'submitted', direction: 'ASC' },
 			skip: 0,
@@ -449,7 +470,25 @@ describe('listActive', () => {
 		});
 		// A QUEUED job has no pod anywhere yet, but its sandbox is on its way and
 		// must not look reapable, so it is in the list, with no createdAt to give.
-		expect(active).toEqual([{ id: 'sb-one', createdAt: '2026-09-02T12:00:00Z' }, { id: 'sb-two' }]);
+		expect(active).toEqual([
+			{ id: 'sb-one', queue: 'marimohub', createdAt: '2026-09-02T12:00:00Z' },
+			{ id: 'sb-two', queue: 'team-a' },
+		]);
+	});
+
+	it('skips a job Lookout reports without a queue rather than guess one', async () => {
+		stubFetch(
+			Response.json({
+				jobs: [
+					{ jobId: 'job-1', jobSet: 'sb-one', state: 'RUNNING' },
+					{ jobId: 'job-2', jobSet: 'sb-two', queue: 'team-a', state: 'RUNNING' },
+				],
+			}),
+		);
+
+		expect(await new ArmadaClient(lookoutConfig).listActive()).toEqual([
+			{ id: 'sb-two', queue: 'team-a' },
+		]);
 	});
 
 	it('pages until a page comes back short', async () => {
@@ -465,5 +504,45 @@ describe('listActive', () => {
 
 	it('rejects with the missing variable when Lookout is not configured', async () => {
 		expect(await rejection(new ArmadaClient(config).listActive())).toContain('ARMADA_LOOKOUT_URL');
+	});
+});
+
+describe('findQueue', () => {
+	it('asks Lookout for the marked job set and returns its queue', async () => {
+		stubFetch(Response.json({ jobs: [{ jobId: 'job-1', jobSet: 'sb-one', queue: 'team-a' }] }));
+
+		expect(await new ArmadaClient(lookoutConfig).findQueue('sb-one')).toBe('team-a');
+		expect(calls[0]?.url).toBe('http://lookout.example.com/api/v1/jobs');
+		expect(calls[0]?.body).toEqual({
+			filters: [
+				{ field: 'jobSet', value: 'sb-one', match: 'exact' },
+				{ field: 'marimohub/sandbox', value: 'marimohub', match: 'exact', isAnnotation: true },
+			],
+			order: { field: 'submitted', direction: 'DESC' },
+			skip: 0,
+			take: 1,
+		});
+	});
+
+	it('is undefined for a job set Lookout does not know, and without Lookout at all', async () => {
+		stubFetch(Response.json({ jobs: [] }));
+		expect(await new ArmadaClient(lookoutConfig).findQueue('sb-none')).toBeUndefined();
+		expect(await new ArmadaClient(config).findQueue('sb-none')).toBeUndefined();
+		expect(calls).toHaveLength(1);
+	});
+});
+
+describe('submit to a mapped queue', () => {
+	it('sends the queue it was given, not the default', async () => {
+		stubFetch(Response.json({ jobResponseItems: [{ jobId: 'job-1' }] }));
+
+		const job: SubmittedJob = await new ArmadaClient(config).submit(
+			'sandbox-7',
+			buildPodSpec(config, agent),
+			'team-b',
+		);
+
+		expect(job.queue).toBe('team-b');
+		expect(calls[0]?.body).toMatchObject({ queue: 'team-b', jobSetId: 'sandbox-7' });
 	});
 });

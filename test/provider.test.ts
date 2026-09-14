@@ -32,3 +32,30 @@ describe('listActive capability', () => {
 		);
 	});
 });
+
+describe('queue maps', () => {
+	it('are refused without Lookout, which is the only way to place an id-only sandbox', () => {
+		expect(() =>
+			readConfig({ ...baseEnv, ARMADA_QUEUE_BY_PROJECT: '{"proj-b": "team-b"}' }),
+		).toThrow('needs ARMADA_LOOKOUT_URL');
+	});
+
+	it('are fine without Lookout when every entry names the default queue', () => {
+		expect(
+			readConfig({ ...baseEnv, ARMADA_QUEUE_BY_PROJECT: '{"proj-b": "marimohub"}' }).queueByProject,
+		).toEqual({ 'proj-b': 'marimohub' });
+	});
+});
+
+describe('multiPort capability', () => {
+	it('is off with no surface configured, so marimohub refuses to start one', () => {
+		expect(new ArmadaCompute(readConfig(baseEnv)).capabilities).toEqual({ multiPort: false });
+	});
+
+	it('is on exactly when a surface port is declared on every pod', () => {
+		const provider: ArmadaCompute = new ArmadaCompute(
+			readConfig({ ...baseEnv, MARIMOHUB_SURFACES: 'vscode' }),
+		);
+		expect(provider.capabilities).toEqual({ multiPort: true });
+	});
+});

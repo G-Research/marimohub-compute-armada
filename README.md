@@ -43,6 +43,8 @@ in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `ARMADA_INGRESS_TLS`                 | no       | `true` (default) or `false`; ingress only             |
 | `ARMADA_INGRESS_CERT_NAME`           | no       | TLS secret name prefix (default `<namespace>-`)       |
 | `ARMADA_INGRESS_ANNOTATIONS`         | no       | JSON object put on every job's Ingress                |
+| `ARMADA_QUEUE_BY_USER`               | no       | JSON object, marimohub user id to queue               |
+| `ARMADA_QUEUE_BY_PROJECT`            | no       | JSON object, marimohub project id to queue            |
 | `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` | no       | Public kernel hostname                                |
 | `ARMADA_AUTH_USERNAME`               | no       | Basic auth, set with the password                     |
 | `ARMADA_AUTH_PASSWORD`               | no       | Basic auth, set with the username                     |
@@ -69,6 +71,24 @@ record for the controller; and the TLS secret, `<namespace>-` (or
 certificate for `*.<namespace>.<suffix>` that marimohub trusts (`NODE_EXTRA_CA_CERTS` for
 a private CA). `ARMADA_INGRESS_ANNOTATIONS` lands on every job's Ingress: a source
 allowlist for the agent's hostname, or a longer websocket read timeout, go there.
+
+`ARMADA_QUEUE` takes every sandbox unless its owner maps elsewhere. Armada computes fair
+share and priority per queue, so a queue per team or per user is how tenants are told
+apart. `ARMADA_QUEUE_BY_USER` and `ARMADA_QUEUE_BY_PROJECT` map marimohub ids to queue
+names, the user's entry winning; every queue named must already exist, with permissions
+for the configured credential. marimohub names the owner on the calls where it holds a
+session record (marimohub#301, released in 0.4.0), and the owner places a sandbox that does
+not exist yet. For one that does, the queue it is in is the answer whatever the map says
+today: the adapter remembers it, takes it from Lookout during `listActive`, and asks
+Lookout by job set for a sandbox it has never seen, since marimohub addresses sandboxes by
+id alone on several paths. A queue map therefore requires `ARMADA_LOOKOUT_URL`, and a
+call Lookout cannot answer fails rather than guesses; marimohub retries it.
+
+Session surfaces (VS Code or OpenCode inside the sandbox, `MARIMOHUB_SURFACES`) need a
+port each next to the kernel's. The adapter reads marimohub's own `MARIMOHUB_SURFACES`
+and `MARIMOHUB_SURFACE_<ID>_PORT` settings, declares those ports on every pod so Armada
+exposes them like the kernel's, and advertises `multiPort` exactly then. A surface port
+may not be the agent's. The kernel image must ship the surface's binary.
 
 `ARMADA_LOOKOUT_URL` gates a capability: set it and the adapter advertises
 `listActive`, which marimohub's reconciler uses to enumerate live sandboxes after a
@@ -103,7 +123,8 @@ plaintext HTTP on the cluster network, over an ingress it is a public HTTPS host
 Restrict the ingress to marimohub's egress address in the latter case, through
 `ARMADA_INGRESS_ANNOTATIONS` or the executor's cluster-wide ingress annotations.
 
-Verified against `ghcr.io/marimo-team/marimohub:0.3.12`.
+Verified against `ghcr.io/marimo-team/marimohub:0.4.2`, the release the adapter interface
+is transcribed from; everything added since 0.3.12 is optional, so that release loads it too.
 
 ## Documentation
 

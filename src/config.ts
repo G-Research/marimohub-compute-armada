@@ -66,6 +66,15 @@ export interface ArmadaConfig {
 	/** Port the agent listens on inside the pod, exposed next to the kernel's. */
 	agentPort: number;
 	/**
+	 * Ports of marimohub's enabled secondary surfaces (VS Code, OpenCode),
+	 * declared on every pod and exposed like the kernel's, so `exposePort` can
+	 * answer for them. Read from marimohub's own `MARIMOHUB_SURFACES` and
+	 * `MARIMOHUB_SURFACE_<ID>_PORT` variables rather than a variable of ours, so
+	 * the `multiPort` capability is advertised exactly when the surfaces marimohub
+	 * will ask for are on every sandbox. Empty when no surface is enabled.
+	 */
+	surfacePorts: number[];
+	/**
 	 * Hard cap on one session, submitted as `activeDeadlineSeconds`. Armada gives
 	 * any pod without one the server default, 72 hours as shipped, so a kernel must
 	 * always carry its own.
@@ -264,6 +273,46 @@ function readStringMap(
 	return map;
 }
 
+/**
+ * marimohub's secondary surfaces and their port variables, transcribed from
+ * `packages/config/src/surfaces.ts`. marimohub validates the same variables
+ * itself (unknown ids, shared ports, the kernel's port), so this only has to
+ * read them the same way; what it adds is the collision with the agent's port,
+ * which marimohub cannot know about.
+ */
+const SURFACES: readonly { id: string; variable: string; defaultPort: number }[] = [
+	{ id: 'vscode', variable: 'MARIMOHUB_SURFACE_VSCODE_PORT', defaultPort: 8443 },
+	{ id: 'opencode', variable: 'MARIMOHUB_SURFACE_OPENCODE_PORT', defaultPort: 4096 },
+];
+
+/** marimohub's primary surface, which is the kernel itself and needs no port here. */
+const PRIMARY_SURFACE = 'marimo';
+
+function readSurfacePorts(env: Record<string, string | undefined>): number[] {
+	const enabled: Set<string> = new Set(
+		(env.MARIMOHUB_SURFACES ?? PRIMARY_SURFACE)
+			.split(',')
+			.map((id: string) => id.trim())
+			.filter((id: string) => id !== ''),
+	);
+	// marimohub refuses an id it does not know, so one reaching here can only
+	// come from a marimohub newer than this table, whose surface would then have
+	// no port on the pod and fail at exposePort after launch instead of here.
+	for (const id of enabled) {
+		if (id !== PRIMARY_SURFACE && !SURFACES.some((surface: { id: string }) => surface.id === id)) {
+			throw new Error(
+				`MARIMOHUB_SURFACES names "${id}", a surface this adapter does not know; it knows ${SURFACES.map((surface: { id: string }) => surface.id).join(', ')}`,
+			);
+		}
+	}
+	const ports: number[] = [];
+	for (const surface of SURFACES) {
+		if (!enabled.has(surface.id)) continue;
+		ports.push(optionalPort(env, surface.variable, surface.defaultPort));
+	}
+	return ports;
+}
+
 /** A day, when neither marimohub nor the environment says otherwise. */
 const DEFAULT_MAX_LIFETIME_SECONDS = 24 * 60 * 60;
 
@@ -295,6 +344,7 @@ export function readConfig(
 		port: optionalPort(env, 'ARMADA_KERNEL_PORT', 2718),
 		agentImage: required(env, 'ARMADA_AGENT_IMAGE'),
 		agentPort: optionalPort(env, 'ARMADA_AGENT_PORT', 8718),
+		surfacePorts: readSurfacePorts(env),
 		lookoutUrl: optionalUrl(env, 'ARMADA_LOOKOUT_URL'),
 		maxLifetimeSeconds:
 			compute?.sessionMaxLifetimeSeconds ??
@@ -310,6 +360,25 @@ export function readConfig(
 	if (config.agentPort === config.port) {
 		throw new Error(
 			`ARMADA_AGENT_PORT and ARMADA_KERNEL_PORT are both ${String(config.port)}; the agent and the kernel each need a port`,
+		);
+	}
+	for (const port of config.surfacePorts) {
+		if (port === config.agentPort || port === config.port) {
+			throw new Error(
+				`A surface port (MARIMOHUB_SURFACE_*_PORT) is ${String(port)}, which is the ${port === config.port ? 'kernel' : 'agent'} port; each needs its own`,
+			);
+		}
+	}
+	// marimohub creates sandboxes by id alone on paths that exec and destroy,
+	// so once jobs can be in more than one queue, Lookout is the only way to
+	// place one of those after a restart (`src/queues.ts`).
+	const mappedQueues: string[] = [
+		...Object.values(config.queueByUser),
+		...Object.values(config.queueByProject),
+	].filter((queue: string) => queue !== config.queue);
+	if (mappedQueues.length > 0 && config.lookoutUrl === undefined) {
+		throw new Error(
+			'ARMADA_QUEUE_BY_USER / ARMADA_QUEUE_BY_PROJECT name queues other than ARMADA_QUEUE, which needs ARMADA_LOOKOUT_URL: a sandbox addressed by id alone can only be placed through Lookout',
 		);
 	}
 	return config;

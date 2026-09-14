@@ -10,16 +10,16 @@ mostly idle interactive jobs, one job set per session, a single queue today. Our
 that it is sensible, and the evidence exists to earn that position rather than assume it. If
 you read nothing else, read [The central bet](#the-central-bet) and
 [Still open](#still-open): the six judgement calls there are the ones we cannot settle
-without you, and the thirty decisions exist to support them. They are written to be
+without you, and the thirty-four decisions exist to support them. They are written to be
 checked, not taken on faith. The first of the six has since been answered, and the answer
 replaced the control channel: see the note at the head of decision 11, decision 28, and
 `AGENT-DESIGN.md`.
 
 Marimohub questions will come up, and they are out of scope here: this document explains the
 Armada side of the seam and only summarizes what marimohub needs from it. marimohub is open
-source at `https://github.com/marimo-team/marimohub`; clone it, check out the 0.3.12 release
-the interface was transcribed from, and the citations of the form `packages/...` point into
-it. When a question is about marimohub's side (what the provisioner does between `create` and
+source at `https://github.com/marimo-team/marimohub`; clone it, check out `v0.4.2`
+(the release the interface was transcribed from and verified against), and
+the citations of the form `packages/...` point into it. When a question is about marimohub's side (what the provisioner does between `create` and
 `ready`, why the reconciler destroys what `listActive` returns, what happens when a user stops
 a kernel), do not answer it from this document: run an agentic session with that checkout in
 reach and let it read the source, the same way this document's Armada claims were answered
@@ -55,9 +55,10 @@ what a sandbox actually is. This repo is such an adapter: each kernel session be
 Armada job.
 
 The interface we implement (`src/types.ts`) is marimohub's, transcribed by hand from
-marimohub 0.3.12 because `@marimo-hub/core` is not published yet. A sandbox must support
-exec, read file, list files, write files, git checkout, set env vars, start a background
-process, expose a port, and destroy. `exec` is the primitive; the rest is built on it.
+marimohub v0.4.2 (decisions 32 and 33; everything added after 0.3.12 is optional)
+because `@marimo-hub/core` is not published yet. A sandbox must support exec, read file,
+list files, write files, git checkout, set env vars, start a background process, expose a
+port, and destroy. `exec` is the primitive; the rest is built on it.
 
 ## The central bet
 
@@ -766,6 +767,11 @@ way upstream's kubernetes adapter does. A missing git fails the clone with sh's 
 
 ### 27. `listActive` asks Lookout, and only exists when Lookout is configured
 
+_Since decision 31 the queue filter is `anyOf` over every queue the owner map can name,
+`exact` when there is only the default, and each job's `queue` is read back so the
+reconciler can cancel an orphan where it lives. Lookout also answers `findQueue`, one
+job set by name, for a sandbox nobody in this process has seen._
+
 marimohub's reconciler needs the one question decision 4 left open: after a restart, which
 sandboxes exist? A local registry would reintroduce exactly the state decision 4's design
 exists to avoid, and the Armada server has no call that enumerates a queue's jobs. The
@@ -774,7 +780,8 @@ UI can list jobs and the server API cannot.
 
 So `listActive` is a paged `POST /api/v1/jobs` to Lookout:
 
-- Filters scope the answer to our queue (`match: exact`), to the states where a sandbox is
+- Filters scope the answer to our queue (`match: exact`; dropped in decision 34, where the
+  annotation's value took over that job), to the states where a sandbox is
   alive or on its way (`QUEUED`, `LEASED`, `PENDING`, `RUNNING`), and to jobs carrying the
   `marimohub/sandbox` annotation set at submit. The annotation filter is the safety
   property, not decoration: **the reconciler destroys what `listActive` returns**, and a
@@ -1013,6 +1020,250 @@ service and one Ingress with two host rules and one TLS entry naming
 succeeded in 24.5s; the editor loaded through the proxy over the ingress and the kernel
 reported healthy; and Stop removed the pod, the service and the Ingress together.
 
+### 31. The queue is the owner's, and it is remembered
+
+Step 5 of `AGENT-DESIGN.md`'s order of work, built and verified: the mechanism behind
+open question 2, which stays open as a matter of policy.
+
+**Corrected on 2026-09-14 by decision 34.** The order of the three sources below put the
+owner map before what is known of the job, the miss fell back to a guess, and Lookout was
+framed as a fallback for an older marimohub. All three were wrong; the map, the marimohub
+change and the remembering stand.
+
+**The marimohub change.** marimohub told the adapter nothing about whose sandbox it was
+creating, so every job went to one queue. The change adds `owner?: { projectId, userId? }`
+to `CreateSandboxOptions` (`packages/core/src/ports/sandbox.ts`), passed on every `create`
+that starts from something marimohub knows: the provisioner (project from
+`ProvisionOptions`, user from the session route), the session sweep and the retirer
+(both from the session record, through one `sessionOwner` helper). It is absent on the
+reconciler's orphan path, which holds only an id, and on the data-preview sandbox, which
+has no tenant. Merged upstream as marimo-team/marimohub#301 on 2026-09-09, unchanged from
+what was proposed, and upstream since added a fourth site, the session route's own
+teardown; released in 0.4.0 (decision 33).
+`src/types.ts` mirrors the field.
+
+**The map.** `ARMADA_QUEUE_BY_USER` and `ARMADA_QUEUE_BY_PROJECT` are JSON objects from
+id to queue name; the user's entry wins over the project's, and an owner in neither, or no
+owner at all, gets `ARMADA_QUEUE` (`src/queues.ts`). A map rather than a template because
+a queue must exist before a submit names it, with permissions for the submitting
+credential, and a template invites a name that does not: the server answers such a submit
+with a 403 `could not find queue`, and does so for a queue created seconds earlier as well,
+until its queue cache refreshes. Creating queues is the operator's job, with `armadactl`,
+not the adapter's.
+
+**Why the queue must be remembered.** Every call about a job is addressed by queue and
+job set: the event stream (`/v1/job-set/{queue}/{id}`), cancel
+(`internal/server/submit/submit.go:184` validates both), and even the lookup by our own
+`externalJobUri` (`pkg/api/job.proto:92` takes `queue` and `jobset`). The server has no
+call that answers "which queue holds this job set". So a sandbox's queue is settled once
+per `ArmadaSandbox` from three sources in order: the owner, when marimohub passes one, a
+pure function of it and so the same answer after a restart; what this process has seen,
+the queue chosen at `create` or the one Lookout reported during `listActive`; and Lookout
+asked for the job set by name (`findQueue`: `jobSet` exact plus the sandbox mark, newest
+first, one row), for a caller that holds only an id after a restart. `listActive` now
+filters `queue` with `anyOf` over every queue the map can name (decision 27's `exact`
+when there is one) and returns each job's queue, so the reconciler, which enumerates
+before it destroys, always cancels an orphan where it lives. With no map configured none
+of this costs a request: the default queue is the only answer.
+
+**What it does not solve.** A marimohub from before #301, 0.3.12 included, still works: new
+sandboxes land in the default queue, and a sandbox in a mapped queue is found through
+Lookout when its record-holding caller comes back after a restart. Without Lookout that
+caller assumes the default queue, and a cancel there is a no-op, so the pod lives to its
+`activeDeadlineSeconds`. A queue map therefore wants either the marimohub change or
+Lookout (decision 34: it needs Lookout on every marimohub, and refuses to load without it).
+And which queues to have, who shares one, and what priority factor each gets is
+the fairness policy of open question 2, which this decision makes possible to apply and
+does not choose.
+
+**Verified live.** A second queue `marimohub-team-b`, `ARMADA_QUEUE_BY_PROJECT` mapping
+`proj-b` to it, and `bun run smoke` naming `proj-b` as the owner: the job was submitted to
+and ran in `marimohub-team-b`; a second provider with no memory of the sandbox listed it
+among the active jobs of both queues and, told only the id, cancelled it in the right
+queue after asking Lookout, after which `listActive` no longer showed it. The first
+attempt, run seconds after `armadactl create queue`, was the 403 above.
+
+### 32. Synced with marimohub `main`: surfaces need ports, an HTTP probe, and `multiPort`
+
+Not a step of the plan; a re-transcription. marimohub's `main` moved 27 commits past
+0.3.12 between decisions 29 and 31, and `src/types.ts` was still the 0.3.12 port. This
+decision records what changed in the port, what the adapter does about each change, and
+what it deliberately leaves alone. The transcription now names `main` at 2495463
+(2026-09-10); every member added since 0.3.12 is optional, so the adapter still loads in
+0.3.12.
+
+**What changed upstream.** Four members, all driven by one feature, session surfaces: VS
+Code and OpenCode started inside the kernel sandbox next to marimo
+(`packages/core/src/services/runtime/surfaces/`). `SandboxProvider.capabilities.multiPort`
+says every sandbox exposes the surfaces' ports as well as the kernel's, and marimohub
+refuses to start a surface without it (`packages/api/src/routes/sessionSurfaces.ts:161`).
+`SandboxInstance.isPortReady(port, {mode, path})` is one look at a surface started earlier;
+without it marimohub runs a `python3 urllib` one-liner in the pod
+(`surfaces/SurfaceManager.ts:84`). `SandboxInstance.resolveProcessPath` maps a hub-side
+workspace path for adapters whose processes see another (`:143`). And
+`CreateSandboxOptions.sessionIdleTimeoutMs` hands the control plane's idle deadline to a
+provider that can set a backstop of its own. The compute contract gained a `secondaryPort`
+case asserting a distinct, stable `exposePort` URL per port
+(`packages/core/src/testing/computeContract.ts:294`). `compute-commons` and
+`externalAdapter.ts` did not change, so the shell helpers and the factory context stand.
+
+**Surface ports come from marimohub's own settings.** A library adapter sees only the
+environment (`AdapterFactoryContext.env`), so the ports are read the way marimohub reads
+them (`packages/config/src/surfaces.ts`): `MARIMOHUB_SURFACES` names the enabled
+surfaces, `MARIMOHUB_SURFACE_VSCODE_PORT` (8443) and `MARIMOHUB_SURFACE_OPENCODE_PORT`
+(4096) name their ports. There is no `ARMADA_SURFACE_PORTS`: a variable of ours could
+disagree with marimohub's, and `multiPort` must be advertised exactly when the ports
+marimohub will ask for are on every pod, which is how the kubernetes adapter keeps it
+honest too (`packages/compute-kubernetes/src/index.ts:678`). The pod declares them after
+the kernel's and the agent's (`src/podspec.ts`), the submit's service or ingress covers
+every declared port already (decisions 28 and 30), and the address event names each, so
+`exposePort(8443)` answers with no new code. What the adapter adds is the one check
+marimohub cannot make: a surface port must not be the agent's.
+
+**The agent learns what "ready" means.** marimohub's surfaces wait for a port with
+`{mode: 'http', path}` (`SurfaceManager.ts:78`), meaning an HTTP answer on a readiness
+path, not a TCP accept: a code-server that listens while it still loads is not ready, and
+its 404 on `/healthz` when it is answers the question. marimohub's own adapters treat
+that wait as TCP anyway (`compute-commons` `portWaitCommand` connects; `compute-local`
+`waitForPort` calls `tcpReady`), and only `compute-local` probes over HTTP, in
+`isPortReady`, counting any response and timing out at 2 seconds
+(`packages/compute-local/src/index.ts:316`). The agent's `/process/waitport` now takes
+`mode` and `path` (`agent/process.go`): `http` is open on any response to a GET of the
+path, redirects included, each probe bounded to 2 seconds so a server that accepts and
+hangs is not mistaken for one that answers. `SandboxProcess.waitForPort` forwards
+marimohub's mode and path, so a surface's wait really is what it asks for, and
+`isPortReady` is the same probe once, with no process to watch and any failure reported as
+"not ready", as `compute-local` does. Both are exact where the reference is approximate.
+
+**Left alone, on purpose.** `resolveProcessPath` is not implemented: a pod's processes see
+the same paths marimohub writes, and the kubernetes adapter omits it too. `sessionIdleTimeoutMs`
+is mirrored and ignored: only the Modal adapter uses it, for a native idle fallback Armada
+has no equivalent of, and `activeDeadlineSeconds` (decision 7) already bounds a session.
+The kernel now starts with an auth token the provisioner writes as a file
+(`KERNEL_AUTH_TOKEN_FILE`), which is ordinary `writeFiles` traffic and changes nothing
+here.
+
+**Verified live.** `bun run smoke` with `MARIMOHUB_SURFACES=vscode` in its defaults, over the
+ingress: the pod declares 8443 as its third port; a detached server is waited for in
+`http` mode on `/`; `isPortReady` is true for it and false for a port nothing listens on;
+`exposePort` returns `https://kernel-8443-armada-<job>-0...` beside the kernel's
+`kernel-2718-...`, the same URL on a second call; and `capabilities.multiPort` is true.
+The agent's Go tests cover a 404 counting as open in `http` mode, a listener that accepts
+but never speaks HTTP being open to `tcp` and not to `http`, and a bad mode or path being
+refused. Not verified: an actual VS Code or OpenCode session, which needs a kernel image
+that ships the surface binary (`docs/surfaces.md` upstream) and a marimohub build newer
+than 0.3.12.
+
+### 33. Pinned to marimohub 0.4.2, and the owner's queue seen end to end
+
+marimo-team released 0.4.0 on 2026-09-11 and 0.4.2 on 2026-09-12 (d58bb8a), the first
+releases that carry #301. The Dockerfile's base image moved from 0.3.12 to 0.4.2. Nothing in
+the adapter's code changed: `packages/core/src/ports/sandbox.ts` and
+`ports/externalAdapter.ts` are byte-identical between `main` 2495463 (decision 32) and
+v0.4.2, and `compute-commons` is identical since v0.3.12, so `src/types.ts` and
+`src/shell.ts` only name the release now. The 15 commits in between touched the hub, not the
+port: native kernel authentication became opt-in (`MARIMOHUB_SANDBOX_AUTH`, default `off`,
+#330), which made `ExposureContext.kernelAuthToken` optional on the hub's side of the
+proxy and changes nothing for a compute adapter.
+
+**Verified live, 2026-09-14.** `dev/run-local.sh` on 0.4.2 (it now passes
+`ARMADA_LOOKOUT_URL`, the two queue maps and `MARIMOHUB_SURFACES` through), with
+`ARMADA_QUEUE_BY_PROJECT` mapping the dev project to `marimohub-team-b` and
+`ARMADA_EXPOSE=ingress`. A session created through the hub's own API
+(`POST /api/v1/projects/{pid}/notebooks/{nid}/sessions`) submitted one job to
+`marimohub-team-b`, which decision 31 could only show with the smoke's stand-in owner.
+`session_provision` reported `provision_reachable_ms` 10145 and `provision_total_ms` 10566;
+the editor answered through the proxy; one ClusterIP service, one Ingress with two hosts
+and one pod existed; stopping the session left the job `CANCELLED` in `marimohub-team-b`
+and the namespace empty. One hub behaviour worth knowing: a session record the hub still
+calls running is reused without a submit (`reused: true`), so stale records from before a
+hub restart must be stopped before a fresh provision can be observed.
+
+### 34. State before configuration: the queue a job is in outranks the owner map
+
+A review of decisions 31 to 33 before they were committed (eight independent passes over
+the diff, 2026-09-14) found the queue directory trusting configuration over state. The
+batch is corrected here rather than committed as it was.
+
+**What was wrong.** `resolve` consulted the owner map first, then memory, then Lookout, and
+guessed the default queue when none answered (`src/queues.ts` as of decision 31). Three
+failures followed. A job is where it was submitted, and the map is whatever the operator
+has today: move a project between queues while its sessions run and the retirer's
+`destroy` cancels in the new queue, a server-side no-op reported as success, and the pod
+lives to `activeDeadlineSeconds`. On the submit path a guess is worse than a wrong queue:
+Armada dedupes `clientId` per queue (`internal/server/submit/deduplicaton.go`,
+`jobKey(queue, clientId)`), so a mapped sandbox that marimohub creates by id alone after
+a restart, which it does for surfaces (`surfaces/SurfaceManager.ts:136`), the
+reconciler's orphans and job cleanup, was resubmitted into the default queue as a second
+kernel beside the first, and the later `destroy` cancelled only that one. And the Lookout
+lookup was uncaught under a comment saying "never fails", so a Lookout outage failed every
+id-only `destroy` and start before it reached the Armada server. Decision 31 framed Lookout
+as a fallback for a marimohub older than #301; the id-only paths above exist on 0.4.2 too,
+so a queue map needs Lookout on every version.
+
+**The order now.** What this process remembers, then Lookout by job set, then the owner
+map, which only places a job set Lookout says holds nothing: a submit that has not
+happened yet. A Lookout error is a `QueueUnknownError` from `resolve`, which fails the
+`destroy` or the start it was answering; every marimohub caller retries a failed create or
+destroy (the retirer's `reclaim` returns false and the next sweep tries again, the
+reconciler backstops the rest), where a false success is the one outcome nobody upstream
+can repair. `readConfig` refuses `ARMADA_QUEUE_BY_USER` / `ARMADA_QUEUE_BY_PROJECT` naming
+any queue but `ARMADA_QUEUE` without `ARMADA_LOOKOUT_URL`. `destroy` forgets the sandbox's
+entry, so the memory is bounded by live sandboxes. The residual window is Lookout's
+ingestion lag: a hub restarted within seconds of a submit could see "no such set" and place
+by owner, which with an unchanged map is the same queue. The cost is one Lookout query per
+session start when a map is configured, which was free before.
+
+**The mark names the installation.** `listActive` filtered by the queues the map names
+today, so a job in a queue retired from the map became invisible to the reconciler, the
+very backstop the wrong-queue failure relies on, while `findQueue` had no queue filter at
+all: two queries, two scopes. The `marimohub/sandbox` annotation's value is now
+`ARMADA_QUEUE`, the default queue name, which names one installation across every queue
+its map ever used, and both Lookout queries filter on the mark alone, built by one helper.
+Two installations sharing an Armada keep distinct default queues and so never see each
+other's sandboxes. Jobs marked `true` by the earlier build are not found, which matters to
+no deployment yet. A job Lookout reports without a queue is skipped, not placed.
+
+**Smaller corrections from the same review.** `isPortReady` no longer opens the sandbox to
+answer: a sandbox this process has not reached cannot have a surface listening, and
+`open()` could submit a job and wait minutes inside a `try` that turned any failure, a
+rejected submit included, into "not ready". It sends a zero timeout, and the agent probes
+at least once before it checks the deadline, so the look is one probe bounded to 2s
+rather than 2s of polling a refused port, as decision 32's comment had claimed. The agent
+refuses a `path` without `mode: http` and an unparseable path at the request (400)
+instead of failing every probe until the deadline, and its HTTP probes share one client
+with keep-alives off and a request-scoped deadline, so nothing outlives a probe.
+`readConfig` refuses a surface id it does not know: marimohub validates the same list, so
+an unknown id can only mean a newer marimohub, whose surface would otherwise fail at
+`exposePort` after launch. The smoke checks for Lookout before it submits an owner run, so
+a misconfigured run leaves no job behind. Two stale comments (`ArmadaProcess.waitForPort`
+still describing a TCP-only check; the decision count in the introduction) were fixed.
+
+**A leak the verification itself exposed.** The owner smoke printed its last line and never
+exited, while the plain smoke did. `readNdjson` (`src/ndjson.ts`) released its reader's lock
+on the way out but never cancelled the body, and `waitForRunning` and `ingressAddress`
+both return from the middle of a job-set stream opened with `watch: true`, which the
+server keeps open indefinitely. In the smoke that was two sockets Bun would not exit
+with once a Lookout request had joined them; in marimohub's long-lived process it was two
+open streams to the Armada server per sandbox start, released only when the server gave
+up. The reader now cancels the body in its `finally`, which a test pins (a consumer that
+breaks early cancels the stream), and the smoke exits.
+
+**Verified live, 2026-09-14.** Agent image rebuilt and imported, hub rebuilt on 0.4.2 with
+`dev/run-local.sh` (dev project mapped to `marimohub-team-b`, `ARMADA_EXPOSE=ingress`,
+Lookout set). `bun run smoke` with `SMOKE_OWNER_PROJECT=proj-b` and the same map passed
+every check: `isPortReady` true for a server started in the pod and false for a port
+nothing listens on, both by a zero-timeout wait; `findQueue` on its own, before any
+`listActive` could remember anything, named `marimohub-team-b` for the job set by the
+installation's mark; a fresh provider enumerated it with no queue filter and cancelled it
+there. Through the hub's API, a session on the dev project submitted a job carrying
+`marimohub/sandbox: marimohub` into `marimohub-team-b`, which a mark-only Lookout query
+listed; `provision_total_ms` 16403 over the ingress; stopping the session left it
+`CANCELLED` in `marimohub-team-b`, with no `request_error` in the hub's log. Covered by
+unit tests rather than live: a Lookout outage (a `destroy` and a write reject naming
+Lookout, and nothing is submitted or cancelled) and a map moved under a live session (the
+cancel goes where Lookout says, not where the owner maps now).
+
 ## Constraints on the first submit
 
 Collected from `internal/server/submit/validation/submit_request.go` so the first real submit
@@ -1068,8 +1319,10 @@ These are judgement calls, not missing homework.
    and it did.
 2. **One queue or a queue per user?** Fair share is computed per queue with a per-queue
    priority factor (`docs/scheduling_and_preempting_jobs.md`), so queue granularity _is_ the
-   fairness model for a multi-tenant notebook server. We currently take a single queue from
-   configuration. Whether that is right depends on how you expect tenants to compete.
+   fairness model for a multi-tenant notebook server. Since decision 31 the adapter can put
+   each user's or project's sandboxes in a queue of its own (`ARMADA_QUEUE_BY_USER`,
+   `ARMADA_QUEUE_BY_PROJECT`), once marimohub names the owner. What remains is policy:
+   which queues to create, who shares one, and how you expect tenants to compete.
 3. **Is a mostly-idle interactive job a reasonable citizen of an Armada cluster?** Fair share
    is computed from resource _requests_ of running jobs, so an idle kernel costs its full
    request all session. That is a capacity-planning question for whoever runs the cluster,
@@ -1110,7 +1363,7 @@ Verified:
 - Every citation in this document was read in the Armada source at that release.
 - The local environment works: armada-operator's kind quickstart, REST gateway on port 30001,
   jobs submittable with `armadactl`.
-- marimohub 0.3.12 loads this adapter in library mode, and a missing environment variable
+- marimohub 0.4.2 (and 0.3.12 before it) loads this adapter in library mode, and a missing environment variable
   fails startup with our own error message.
 - Before decision 28, exec into an executor-created pod worked in practice, from the host
   and from inside the marimohub container through a mounted kubeconfig. Kept for the
@@ -1180,6 +1433,13 @@ Verified:
   through the controller, a browser session provisions (24.5s), loads the editor and runs
   a healthy kernel through it, the websocket outlives the controller's default 60-second
   read timeout by minutes of idle time, and Stop removes the pod, service and Ingress.
+- Surface ports and readiness (decision 32) against the local cluster over the ingress: a
+  pod with a third declared port, an `http` wait on a path, `isPortReady` true and false, a
+  distinct and stable ingress hostname for the surface port, and `multiPort` advertised.
+- The owner queue map (decision 31) against the local cluster with two queues: a sandbox
+  whose owner maps to the second queue is submitted there and runs; `listActive` spans both
+  queues; a provider that knows only the sandbox id finds its queue through Lookout and
+  cancels it there, after which it is gone from `listActive`.
 - Build, type checks, tests and image build pass in CI.
 
 Assumed, not verified:
@@ -1209,6 +1469,7 @@ Assumed, not verified:
 | `src/sandbox.ts`               | One kernel session: `exec` on the agent, everything else on its typed endpoints.                |
 | `dev/smoke.sh`, `dev/smoke.ts` | The live check, run from a container on the `kind` network so it can reach the agent.           |
 | `dev/ingress-local.sh`         | Ingress-nginx, a wildcard hostname suffix and a certificate for the kind cluster (decision 30). |
+| `src/queues.ts`                | Which queue a sandbox is in: the owner map, what was seen, Lookout, the default (decision 31).  |
 | `src/armada-types.ts`          | Hand-written Armada wire types, with the reasoning in the header.                               |
 | `scripts/check-armada-api.ts`  | The contract check that keeps those types honest.                                               |
 | `README.md`                    | Configuration and deployment; `docs/ARCHITECTURE.md` and `docs/CONTRIBUTING.md` for the rest.   |

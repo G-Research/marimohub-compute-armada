@@ -71,3 +71,52 @@ describe('ARMADA_EXPOSE', () => {
 		);
 	});
 });
+
+describe('surface ports', () => {
+	it('are empty unless marimohub enables a secondary surface', () => {
+		expect(readConfig(baseEnv).surfacePorts).toEqual([]);
+		expect(readConfig({ ...baseEnv, MARIMOHUB_SURFACES: 'marimo' }).surfacePorts).toEqual([]);
+		// An id marimohub accepts but this table does not know can only come from
+		// a newer marimohub, whose surface would have no port on the pod.
+		expect(() => readConfig({ ...baseEnv, MARIMOHUB_SURFACES: 'vscode,jupyter' })).toThrow(
+			'MARIMOHUB_SURFACES names "jupyter", a surface this adapter does not know',
+		);
+	});
+
+	it("follow marimohub's surface variables and their defaults", () => {
+		expect(readConfig({ ...baseEnv, MARIMOHUB_SURFACES: 'vscode' }).surfacePorts).toEqual([8443]);
+		expect(
+			readConfig({ ...baseEnv, MARIMOHUB_SURFACES: 'marimo, vscode,opencode' }).surfacePorts,
+		).toEqual([8443, 4096]);
+		expect(
+			readConfig({
+				...baseEnv,
+				MARIMOHUB_SURFACES: 'opencode',
+				MARIMOHUB_SURFACE_OPENCODE_PORT: '5000',
+			}).surfacePorts,
+		).toEqual([5000]);
+	});
+
+	it('reject a surface on the agent port or the kernel port', () => {
+		expect(() =>
+			readConfig({
+				...baseEnv,
+				MARIMOHUB_SURFACES: 'vscode',
+				MARIMOHUB_SURFACE_VSCODE_PORT: '8718',
+			}),
+		).toThrow('is 8718, which is the agent port');
+		expect(() =>
+			readConfig({
+				...baseEnv,
+				MARIMOHUB_SURFACES: 'vscode',
+				MARIMOHUB_SURFACE_VSCODE_PORT: '2718',
+			}),
+		).toThrow('is 2718, which is the kernel port');
+	});
+
+	it('reject a surface port that is not a port', () => {
+		expect(() =>
+			readConfig({ ...baseEnv, MARIMOHUB_SURFACES: 'vscode', MARIMOHUB_SURFACE_VSCODE_PORT: 'x' }),
+		).toThrow('MARIMOHUB_SURFACE_VSCODE_PORT must be a port number');
+	});
+});

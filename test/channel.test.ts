@@ -418,6 +418,17 @@ describe('processes', () => {
 		const crashed: PortWait = await channel().waitForPort(2718, 30_000, 77);
 		expect(crashed).toEqual({ open: false, exited: true, exitCode: 7 });
 	});
+
+	it('sends an http probe with its path when asked for one', async () => {
+		answers['/process/waitport'] = { status: 200, body: { open: true } };
+		await channel().waitForPort(8443, 2_000, undefined, { mode: 'http', path: '/healthz' });
+		expect(JSON.parse(new TextDecoder().decode(requests[0]?.body))).toEqual({
+			port: 8443,
+			timeoutMs: 2_000,
+			mode: 'http',
+			path: '/healthz',
+		});
+	});
 });
 
 describe('ready', () => {

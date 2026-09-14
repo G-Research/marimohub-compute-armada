@@ -62,6 +62,16 @@ job on destroy. The job's ids are all the sandbox id: `clientId` so a resubmit d
 `jobSetId` so the session has its own event stream, and `externalJobUri` so the job
 can be found again. `listActive`, when Lookout is configured, asks Lookout.
 
+Which queue a job goes to is the owner's (`src/queues.ts`): marimohub names the project
+and user a sandbox is for, `ARMADA_QUEUE_BY_USER` and `ARMADA_QUEUE_BY_PROJECT` map them
+to queues, and the rest go to `ARMADA_QUEUE`. Every later call about a job is addressed
+by its queue, and the queue a job is in outranks the map of the day, so the adapter
+remembers each sandbox's queue, takes it from Lookout's answer during `listActive`, and
+asks Lookout by job set for a sandbox it has never seen; the owner only places a job set
+Lookout holds nothing for. A map needs Lookout, and a question Lookout cannot answer
+fails the call rather than guess. Every job carries the installation's name (the default
+queue) as an annotation, which is what both Lookout queries filter on.
+
 **Control channel** (`src/channel.ts`) is the client for the agent, and the only thing
 that reaches into a pod. It has `ready`, which polls the agent's health endpoint until
 the route to the pod works; `run` and `stream`, which execute a shell command and
@@ -151,6 +161,12 @@ While the user works, the Armada API and the agent are idle. Only the kernel por
 carries traffic.
 
 ## Kernel traffic
+
+A pod declares the kernel port, the agent port, and one port per session surface marimohub
+has enabled (`MARIMOHUB_SURFACES`: VS Code, OpenCode), and Armada exposes them all the
+same way, so `exposePort` answers for any of them from the one address event. That is what
+the provider's `multiPort` capability promises, and the agent's port wait can check an
+HTTP readiness path rather than a TCP accept, which is what a surface's readiness means.
 
 marimohub has two modes for reaching the kernel. In **proxy** mode the browser talks
 to marimohub, which forwards to the address the adapter returned after checking the

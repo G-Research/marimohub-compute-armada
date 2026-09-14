@@ -1,7 +1,7 @@
 /**
  * Shell-building helpers for commands run through the agent's `/exec`.
  *
- * Semantics transcribed from marimohub's `@marimo-hub/compute-commons` (v0.3.12),
+ * Semantics transcribed from marimohub's `@marimo-hub/compute-commons` (v0.4.2, unchanged since v0.3.12),
  * like `src/types.ts`, so this adapter behaves the same as marimohub's own
  * pod-exec backends. Replace with an import once the packages are published.
  *

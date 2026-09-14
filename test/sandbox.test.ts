@@ -3,13 +3,21 @@ import type { ArmadaClient, PodLocation } from '../src/armada.js';
 import { readConfig } from '../src/config.js';
 import type { ArmadaConfig } from '../src/config.js';
 import { CommandTimeoutError } from '../src/channel.js';
-import type { CommandResult, ControlChannel, RunOptions, StreamOptions } from '../src/channel.js';
+import type {
+	CommandResult,
+	ControlChannel,
+	PortProbe,
+	RunOptions,
+	StreamOptions,
+} from '../src/channel.js';
+import { QueueDirectory } from '../src/queues.js';
 import { ArmadaSandbox } from '../src/sandbox.js';
 import type {
 	ExecResult,
 	FileInfo,
 	ListFilesResult,
 	ReadFileResult,
+	SandboxOwner,
 	SandboxProcess,
 } from '../src/types.js';
 
@@ -52,13 +60,19 @@ function scriptOf(call: ExecCall | undefined): string {
 /** Everything the stub channel recorded, one array per capability. */
 interface Recorded {
 	calls: ExecCall[];
+	submitted: string[];
 	cancelled: string[];
 	writes: { path: string; content: string | Uint8Array }[];
 	reads: string[];
 	lists: { path: string; recursive: boolean }[];
 	starts: { command: readonly string[]; cwd: string | undefined }[];
 	signals: { pid: number; signal: string }[];
-	waits: { port: number; timeoutMs: number; pid: number | undefined }[];
+	waits: {
+		port: number;
+		timeoutMs: number;
+		pid: number | undefined;
+		probe: PortProbe | undefined;
+	}[];
 }
 
 /** A sandbox whose job is "already placed" and whose channel calls are recorded. */
@@ -67,11 +81,17 @@ function stubSandbox(
 		| CommandResult
 		| ((call: ExecCall) => CommandResult)
 		| ((call: ExecCall) => Promise<CommandResult>) = ok,
-	options: { env?: Record<string, string>; channel?: Partial<ControlChannel> } = {},
+	options: {
+		env?: Record<string, string>;
+		channel?: Partial<ControlChannel>;
+		queues?: QueueDirectory;
+		owner?: SandboxOwner;
+	} = {},
 ): Recorded & { sandbox: ArmadaSandbox } {
 	const settings: ArmadaConfig = readConfig({ ...baseEnv, ...options.env });
 	const recorded: Recorded = {
 		calls: [],
+		submitted: [],
 		cancelled: [],
 		writes: [],
 		reads: [],
@@ -82,14 +102,17 @@ function stubSandbox(
 	};
 	// oxlint-disable-next-line no-unsafe-type-assertion -- a stub of a class with private fields; structural typing cannot satisfy it
 	const armada: ArmadaClient = {
-		submit: async () => ({ jobId: 'job-1', jobSetId: 'set-1' }),
+		submit: async (_id: string, _spec: unknown, queue: string) => {
+			recorded.submitted.push(queue);
+			return { jobId: 'job-1', jobSetId: 'set-1', queue };
+		},
 		waitForRunning: async () => pod,
 		portUrl: async (_job: unknown, port: number) => `http://172.18.0.3:${String(30000 + port)}`,
 		cancel: async (job: { jobId: string }) => {
 			recorded.cancelled.push(`job:${job.jobId}`);
 		},
-		cancelSet: async (jobSetId: string) => {
-			recorded.cancelled.push(`set:${jobSetId}`);
+		cancelSet: async (jobSetId: string, queue: string) => {
+			recorded.cancelled.push(`set:${jobSetId}@${queue}`);
 		},
 	} as unknown as ArmadaClient;
 	const channel: ControlChannel = {
@@ -135,14 +158,21 @@ function stubSandbox(
 			recorded.signals.push({ pid, signal });
 		},
 		processLogs: async () => '',
-		waitForPort: async (port: number, timeoutMs: number, pid?: number) => {
-			recorded.waits.push({ port, timeoutMs, pid });
+		waitForPort: async (port: number, timeoutMs: number, pid?: number, probe?: PortProbe) => {
+			recorded.waits.push({ port, timeoutMs, pid, probe });
 			return { open: true };
 		},
 		...options.channel,
 	};
 	return {
-		sandbox: new ArmadaSandbox('sandbox-1', settings, armada, () => channel),
+		sandbox: new ArmadaSandbox(
+			'sandbox-1',
+			settings,
+			armada,
+			() => channel,
+			options.queues ?? new QueueDirectory(settings, undefined),
+			options.owner === undefined ? undefined : { owner: options.owner },
+		),
 		...recorded,
 	};
 }
@@ -161,7 +191,7 @@ describe('destroy', () => {
 		await sandbox.destroy();
 
 		// The job set id is the sandbox id, so no job lookup is needed.
-		expect(cancelled).toEqual(['set:sandbox-1']);
+		expect(cancelled).toEqual(['set:sandbox-1@marimohub']);
 	});
 });
 
@@ -326,8 +356,8 @@ describe('startProcess', () => {
 		await started.waitForPort(8080, { timeout: 5_000 });
 
 		expect(waits).toEqual([
-			{ port: 2718, timeoutMs: 30_000, pid: 4242 },
-			{ port: 8080, timeoutMs: 5_000, pid: 4242 },
+			{ port: 2718, timeoutMs: 30_000, pid: 4242, probe: undefined },
+			{ port: 8080, timeoutMs: 5_000, pid: 4242, probe: undefined },
 		]);
 	});
 
@@ -691,5 +721,153 @@ describe('execStream', () => {
 		await sandbox.execStream('cat /tmp/log');
 
 		expect(calls[0]?.timeoutMs).toBeUndefined();
+	});
+});
+
+describe('queue', () => {
+	const mapped: Record<string, string> = {
+		ARMADA_LOOKOUT_URL: 'http://lookout.example.com',
+		ARMADA_QUEUE_BY_USER: '{"user-a": "team-a"}',
+		ARMADA_QUEUE_BY_PROJECT: '{"proj-b": "team-b"}',
+	};
+
+	it('submits to the queue the owner maps to', async () => {
+		const { sandbox, submitted } = stubSandbox(ok, {
+			env: mapped,
+			owner: { projectId: 'proj-b', userId: 'user-x' },
+		});
+		await sandbox.exec('true');
+		expect(submitted).toEqual(['team-b']);
+	});
+
+	it('submits to the default queue for an owner that maps nowhere', async () => {
+		const { sandbox, submitted } = stubSandbox(ok, { env: mapped, owner: { projectId: 'proj-x' } });
+		await sandbox.exec('true');
+		expect(submitted).toEqual(['marimohub']);
+	});
+
+	it('cancels by id in the queue the directory remembers, as after listActive', async () => {
+		const queues: QueueDirectory = new QueueDirectory(
+			readConfig({ ...baseEnv, ...mapped }),
+			undefined,
+		);
+		queues.remember('sandbox-1', 'team-a');
+		const { sandbox, cancelled } = stubSandbox(ok, { env: mapped, queues });
+		await sandbox.destroy();
+		expect(cancelled).toEqual(['set:sandbox-1@team-a']);
+	});
+
+	it('asks Lookout for the queue of a sandbox nobody named, then cancels there', async () => {
+		const asked: string[] = [];
+		const queues: QueueDirectory = new QueueDirectory(
+			readConfig({ ...baseEnv, ...mapped }),
+			async (id: string) => {
+				asked.push(id);
+				return 'team-b';
+			},
+		);
+		const { sandbox, cancelled } = stubSandbox(ok, { env: mapped, queues });
+		await sandbox.destroy();
+		expect(asked).toEqual(['sandbox-1']);
+		expect(cancelled).toEqual(['set:sandbox-1@team-b']);
+	});
+
+	it('cancels where Lookout says the job is, not where the owner maps to now', async () => {
+		const queues: QueueDirectory = new QueueDirectory(
+			readConfig({ ...baseEnv, ...mapped }),
+			async () => 'team-a',
+		);
+		const { sandbox, cancelled } = stubSandbox(ok, {
+			env: mapped,
+			queues,
+			owner: { projectId: 'proj-b' },
+		});
+		await sandbox.destroy();
+		expect(cancelled).toEqual(['set:sandbox-1@team-a']);
+	});
+
+	it('fails a destroy and a start rather than guess when Lookout cannot be asked', async () => {
+		const queues: QueueDirectory = new QueueDirectory(
+			readConfig({ ...baseEnv, ...mapped }),
+			async () => {
+				throw new Error('connect ECONNREFUSED');
+			},
+		);
+		const { sandbox, cancelled, submitted } = stubSandbox(ok, { env: mapped, queues });
+		expect(await rejection(sandbox.destroy())).toContain('Lookout did not answer');
+		// `exec` reports a backend failure instead of throwing; a write throws.
+		expect(await rejection(sandbox.writeFiles([{ path: '/w/a', content: 'x' }]))).toContain(
+			'Lookout did not answer',
+		);
+		expect(cancelled).toEqual([]);
+		expect(submitted).toEqual([]);
+	});
+
+	it('forgets the queue once the sandbox is destroyed', async () => {
+		const asked: string[] = [];
+		const queues: QueueDirectory = new QueueDirectory(
+			readConfig({ ...baseEnv, ...mapped }),
+			async (id: string) => {
+				asked.push(id);
+				return 'team-a';
+			},
+		);
+		queues.remember('sandbox-1', 'team-a');
+		const { sandbox } = stubSandbox(ok, { env: mapped, queues });
+		await sandbox.destroy();
+		expect(await queues.resolve('sandbox-1', undefined)).toBe('team-a');
+		expect(asked).toEqual(['sandbox-1']);
+	});
+});
+
+describe('port readiness', () => {
+	it('passes a surface readiness probe (http mode and path) to the agent', async () => {
+		const { sandbox, waits } = stubSandbox();
+		const started: SandboxProcess = await sandbox.startProcess('code-server');
+		await started.waitForPort(8443, { mode: 'http', path: '/healthz', timeout: 5_000 });
+		expect(waits).toEqual([
+			{ port: 8443, timeoutMs: 5_000, pid: 4242, probe: { mode: 'http', path: '/healthz' } },
+		]);
+	});
+
+	it('sends no probe for a plain wait, so the agent defaults to tcp', async () => {
+		const { sandbox, waits } = stubSandbox();
+		const started: SandboxProcess = await sandbox.startProcess('marimo edit');
+		await started.waitForPort(2718, { timeout: 1_000 });
+		expect(waits[0]?.probe).toBeUndefined();
+	});
+
+	it('isPortReady is one http look (a zero wait), with no process to watch', async () => {
+		const { sandbox, waits } = stubSandbox();
+		await sandbox.exec('true'); // reaches the agent, as the surface manager's exec does first
+		expect(await sandbox.isPortReady(8443, { path: '/healthz' })).toBe(true);
+		expect(waits).toEqual([
+			{ port: 8443, timeoutMs: 0, pid: undefined, probe: { mode: 'http', path: '/healthz' } },
+		]);
+	});
+
+	it('isPortReady is false when the port is closed or the agent cannot be asked', async () => {
+		const closed: { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			channel: { waitForPort: async () => ({ open: false }) },
+		});
+		await closed.sandbox.exec('true');
+		expect(await closed.sandbox.isPortReady(8443)).toBe(false);
+
+		const unreachable: { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			channel: {
+				waitForPort: async () => {
+					throw new Error('agent gone');
+				},
+			},
+		});
+		await unreachable.sandbox.exec('true');
+		expect(await unreachable.sandbox.isPortReady(8443)).toBe(false);
+	});
+
+	it('isPortReady is false, and submits nothing, for a sandbox this process has not reached', async () => {
+		const { sandbox, submitted, waits } = stubSandbox();
+		expect(await sandbox.isPortReady(8443, { path: '/healthz' })).toBe(false);
+		expect(submitted).toEqual([]);
+		expect(waits).toEqual([]);
 	});
 });

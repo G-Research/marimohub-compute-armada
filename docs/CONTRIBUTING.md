@@ -180,9 +180,12 @@ running a command in it
 That exercises the config, the auth header, the pod spec with its init container, the
 submit, the event stream, the address event for both ports, and the agent itself. It
 then writes, reads and lists a file with a hostile name through the agent's `/files`
-endpoints, starts a detached server and waits for its port, kills it, starts a process
-that crashes at once, and finally abandons a command by timing it out and cancels a
-stream mid-command. A healthy run shows every check pass and lists no process left
+endpoints, starts a detached server and waits for its port (once over TCP, once as an
+HTTP readiness check on a path, the way a surface does), looks at it with
+`isPortReady`, kills it, exposes the kernel port and a surface port (the smoke enables
+the `vscode` surface, so the pod declares 8443 and `multiPort` is on) and checks the two
+URLs differ, starts a process that crashes at once, and finally abandons a command by
+timing it out and cancels a stream mid-command. A healthy run shows every check pass and lists no process left
 behind, zombies included: the agent kills what its callers abandon and reaps the rest.
 Anything else exits non-zero.
 
@@ -202,7 +205,8 @@ port 3000 joined to the `kind` network with `fs` storage, `dev` auth and `proxy`
 sandbox exposure, and polls `/api/health` until it answers. No credential of any kind
 is mounted. Override with `ARMADA_URL`, `ARMADA_QUEUE`, `ARMADA_NAMESPACE`, `PORT`,
 `IMAGE`, `AGENT_IMAGE`, `CONTAINER`, `ARMADACTL` and `NODE`; `ARMADA_EXPOSE` and the
-`ARMADA_INGRESS_*` variables pass through too (see step 6).
+`ARMADA_INGRESS_*` variables pass through too (step 6), as do `ARMADA_LOOKOUT_URL`, the
+two queue maps (step 7) and `MARIMOHUB_SURFACES`.
 
 ### 5. What you should see
 
@@ -255,6 +259,46 @@ Ingress with two hosts and a TLS entry; the `session_provision` line reports
 controller's log (`kubectl -n ingress-nginx logs deploy/ingress-nginx-controller`) shows
 the editor's assets served and, once the session ends, one `101` line for the websocket
 whose request time is the whole session.
+
+### 7. A queue per owner
+
+Everything above submits to the one `marimohub` queue. To see the owner map work, give
+the cluster a second queue and tell the smoke whose sandbox it is submitting:
+
+```bash
+./bin/app/armadactl create queue marimohub-team-b   # in armada-operator; wait ~10s
+ARMADA_LOOKOUT_URL=http://host.docker.internal:30000 \
+ARMADA_QUEUE_BY_PROJECT='{"proj-b":"marimohub-team-b"}' \
+SMOKE_OWNER_PROJECT=proj-b bun run smoke
+```
+
+A map needs `ARMADA_LOOKOUT_URL`; `readConfig` refuses one without it, and the smoke
+checks for it before submitting so a misconfigured run leaves nothing behind.
+
+What you should see: `queue   marimohub-team-b` under the placement line, and at the
+end, instead of a plain cancel, a second provider that knows only the sandbox id listing
+it among the active jobs of both queues and cancelling it in the right one after asking
+Lookout, then `listActive` no longer showing it. A submit in the first seconds after
+`create queue` fails with a 403 `could not find queue`, because the server's queue cache
+has not refreshed yet; run it again.
+
+The same through the hub, which names the owner from 0.4.0 onwards (the Dockerfile's base
+image is 0.4.2). Map the dev project's id, the `id` in `curl localhost:3000/api/v1/projects`,
+restart, and start a session through the API (dev auth accepts a bare request):
+
+```bash
+ARMADA_LOOKOUT_URL=http://host.docker.internal:30000 \
+ARMADA_QUEUE_BY_PROJECT='{"<project id>":"marimohub-team-b"}' ./dev/run-local.sh
+curl -X POST localhost:3000/api/v1/projects/<pid>/notebooks/<nid>/sessions \
+  -H 'content-type: application/json' -d '{}'
+```
+
+What you should see: the job in `marimohub-team-b` in Lookout (<http://localhost:30000>)
+while the session runs, `CANCELLED` there once it is stopped (`DELETE` on the same path
+with `/<session id>` appended), and nothing left in the namespace. A session the hub still
+records as running is reused as-is (`"reused": true`, nothing submitted), so after a hub
+restart stop the stale ones first. `dev/smoke.sh` passes `ARMADA_LOOKOUT_URL`, the two
+queue maps and the `SMOKE_OWNER_*` variables through as well.
 
 ### Inspecting and tearing down
 
