@@ -5,7 +5,7 @@
 // runs this program in place of `sleep infinity`: it keeps the container
 // alive, listens on a port, and runs the commands marimohub sends it. The
 // adapter reads the port's address from the same event it reads the kernel's
-// from, and holds no Kubernetes credential of any kind (AGENT-DESIGN.md).
+// from, and holds no Kubernetes credential of any kind (docs/ARCHITECTURE.md).
 //
 // POST /exec runs a shell command. The response streams: stdout and stderr
 // chunks as they are produced, then the exit status. Streaming is what makes

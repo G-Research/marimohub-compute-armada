@@ -1,0 +1,19 @@
+# Keeps the SHA-pinned actions in ci.yml, the two Docker base images and the
+# agent's Go module current. The agent has no Go dependencies today, so the
+# gomod entry is idle until it gains one.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+  - package-ecosystem: docker
+    directories:
+      - /
+      - /agent
+    schedule:
+      interval: monthly
+  - package-ecosystem: gomod
+    directory: /agent
+    schedule:
+      interval: monthly

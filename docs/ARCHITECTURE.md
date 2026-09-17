@@ -2,8 +2,7 @@
 
 How marimohub reaches a notebook kernel that Armada placed. This is the map; the
 reasoning behind each choice, with citations into the Armada source, is in
-[ARMADA-REVIEW.md](../ARMADA-REVIEW.md), and the design of the agent is in
-[AGENT-DESIGN.md](../AGENT-DESIGN.md).
+[DECISIONS.md](DECISIONS.md).
 
 ## The three systems
 

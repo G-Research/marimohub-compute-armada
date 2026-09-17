@@ -2,7 +2,7 @@
  * Control channel: the agent inside the kernel container.
  *
  * Armada exposes no exec, so the container runs a small agent as PID 1
- * (`agent/`, designed in `AGENT-DESIGN.md`) that listens on a second port next
+ * (`agent/`) that listens on a second port next
  * to marimo's. The job asks Armada to expose both ports and the address event
  * reports both, so this is the one place the adapter reaches into a pod, and it
  * does so with an address Armada handed it and a token minted for that one pod.

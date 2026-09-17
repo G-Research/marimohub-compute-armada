@@ -12,10 +12,12 @@ How to build, check and run this adapter, and what to update when you change it.
 - **Go 1.26** builds the agent (`agent/go.mod`, standard library only). Any Go that
   honours the `go` directive fetches the right toolchain.
 - **golangci-lint v2.13+** lints and format-checks the agent (`agent/.golangci.yml`).
-  Install it with `brew install golangci-lint`, as the
-  [project recommends](https://golangci-lint.run/docs/welcome/install/local/#homebrew).
   A build older than the module's Go cannot typecheck it, so keep it current.
 - **Docker** and a **kind** cluster with Armada in it, for anything live.
+
+`mise.toml` pins the first four; `mise install` gets them in one go. Homebrew works
+just as well (`brew install golangci-lint`, and Bun, Node and Go from their own formulae
+or installers), as long as the versions match the ones `mise.toml` names.
 
 ## Commands
 
@@ -150,7 +152,7 @@ The import goes straight into the node's containerd because `kind load` trips ov
 multi-platform manifests from Docker Desktop's containerd image store.
 
 If you bring your own kernel image, it must provide `/bin/sh` and `git`
-(ARMADA-REVIEW.md, decision 22).
+(see [DECISIONS.md](DECISIONS.md)).
 
 ### 3. Check that placement works
 
@@ -320,13 +322,15 @@ then `make kind-delete-cluster` in armada-operator.
   `packages/compute-kubernetes` and `packages/compute-commons` are the reference for
   every sandbox operation, and its compute contract tests are the behavioural
   authority. Check the consumers of a result before choosing its shape.
-- **Every design decision goes in ARMADA-REVIEW.md**, numbered, with the evidence
-  cited against the Armada source at the release in `.armada-version`. A deliberate
-  divergence from upstream is recorded there too. If a decision is superseded, add a
-  note at its head and keep the text.
+- **Every design decision goes in `docs/DECISIONS.md`**, with the evidence cited
+  against the Armada source at the release in `.armada-version`. A deliberate
+  divergence from marimohub's own adapters is recorded there too. When a decision is
+  replaced, rewrite it rather than appending a note: the file records the design as it
+  is, not its history.
 - **Verify live before calling it done.** Unit tests stub the channel; the smoke run
   and a notebook session in a browser are what prove a change against a real Armada.
-  Add what you verified to the list in ARMADA-REVIEW.md.
+  If a change rests on something not yet verified, add it to the list at the end of
+  `docs/DECISIONS.md`.
 - **Keep the docs current.** `docs/ARCHITECTURE.md` when the shape changes, this
   file when the dev loop changes, the README's configuration table when a variable
   is added.
