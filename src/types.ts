@@ -2,9 +2,13 @@
  * Hand-written mirror of the marimohub port surface we implement.
  *
  * `@marimo-hub/core` is not published to npm yet, so these are transcribed from
- * `packages/core/src/ports/sandbox.ts` and `ports/externalAdapter.ts` at v0.3.12.
+ * `packages/core/src/ports/sandbox.ts` and `ports/externalAdapter.ts` at
+ * marimohub v0.4.2 (d58bb8a, 2026-09-12; both files are unchanged since `main`
+ * 2495463, the earlier transcription point). Every member added since 0.3.12
+ * is optional, so the file serves 0.3.12 as well. Branded ids
+ * (`ProjectId`, `UserId`, `Millis`) are plain `string` and `number` here.
  * Replace this file with `import type { … } from '@marimo-hub/core'` once the
- * packages ship (or pin a git sha) — the shapes are frozen under `apiVersion: 1`.
+ * packages ship (or pin a git sha): the shapes are frozen under `apiVersion: 1`.
  */
 
 export type SandboxId = string;
@@ -128,6 +132,10 @@ export interface SandboxFileWrite {
 
 export interface SandboxInstance {
 	readonly supportsBucketMount?: boolean;
+	/** A hub-side workspace path as the sandbox's processes see it; identity when absent. */
+	resolveProcessPath?(path: string): string;
+	/** One look at a port, for a surface started earlier; a wait is `SandboxProcess.waitForPort`. */
+	isPortReady?(port: number, options?: Omit<WaitForPortOptions, 'timeout'>): Promise<boolean>;
 	ready?(): Promise<void>;
 	exec(cmd: string, options?: ExecOptions): Promise<ExecResult>;
 	execStream(cmd: string, options?: ExecStreamOptions): Promise<ReadableStream>;
@@ -163,14 +171,44 @@ export interface SandboxUserHome {
 	path: string;
 }
 
+/**
+ * Who a sandbox is for. Adapters that partition compute per tenant (an Armada
+ * queue, a Kubernetes namespace) key on it; the rest ignore it.
+ *
+ * Merged upstream in marimo-team/marimohub#301 (2026-09-09) and released in 0.4.0,
+ * so a 0.3.x marimohub never sets it.
+ */
+export interface SandboxOwner {
+	projectId: string;
+	userId?: string;
+}
+
 export interface CreateSandboxOptions {
 	reuse?: boolean;
 	image?: string;
 	resources?: ComputeResources;
 	userHome?: SandboxUserHome;
+	/**
+	 * The control plane's idle deadline for the session, for a provider that can
+	 * set a later backstop of its own. Not the lifecycle enforcement itself.
+	 */
+	sessionIdleTimeoutMs?: number;
+	/**
+	 * Who the sandbox is for, on every call where the caller holds a session
+	 * record. Absent where it holds only an id (orphan reconciliation), so an
+	 * adapter that keys on it must remember what it learned or look it up.
+	 */
+	owner?: SandboxOwner;
 }
 
 export interface SandboxProvider {
+	/**
+	 * `multiPort`: every sandbox exposes the ports of the enabled surfaces next
+	 * to the kernel's. marimohub refuses to start a surface without it.
+	 */
+	readonly capabilities?: {
+		multiPort: boolean;
+	};
 	create(id: SandboxId, options?: CreateSandboxOptions): SandboxInstance;
 	proxy(request: Request): Promise<Response | null>;
 	listActive?(): Promise<ActiveSandbox[]>;

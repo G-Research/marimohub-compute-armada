@@ -9,13 +9,35 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
       - run: bun install --frozen-lockfile
-      - run: bun run check
+      # Go linting lives in the `agent` job, which installs golangci-lint.
+      - run: bun run check:ts
       - run: bun run typecheck
       - run: bun test
       - run: bun run build
+
+  agent:
+    # The kernel agent is a Go program with no dependencies; its tests run the
+    # real protocol against real processes.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: agent/go.mod
+          cache-dependency-path: agent/go.mod
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.13.2
+          working-directory: agent
+      - name: Check Go formatting
+        run: golangci-lint fmt --diff
+        working-directory: agent
+      - run: go -C agent vet ./...
+      - run: go -C agent test ./...
+      - run: docker build agent
 
   armada-api:
     # The hand-written types in src/armada-types.ts are only as good as their last
@@ -27,7 +49,7 @@ jobs:
     # reports a status, which blocks any PR that requires this check.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2

@@ -236,6 +236,8 @@ export interface LookoutGetJobsRequest {
 /** The fields of `definitions.job` we read; the response carries many more. */
 export interface LookoutJob {
 	jobId?: string;
+	/** Which queue holds the job; a sandbox's queue after a restart (`src/queues.ts`). */
+	queue?: string;
 	/** Our job set id is the sandbox id, so this is how a job names its sandbox. */
 	jobSet?: string;
 	state?: string;

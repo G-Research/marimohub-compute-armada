@@ -8,394 +8,135 @@ needs no changes to marimohub itself.
 
 ## How it works
 
-Armada is a batch meta-scheduler: you submit a job (a podspec plus optional
-ingress and service objects) to a queue, and it places that job on one of many
-Kubernetes clusters. Its API has no exec, attach or port-forward — but its job
-events report `cluster_id`, `pod_name` and `pod_namespace`, so once a job is
-running we exec against that cluster directly.
+Armada is a batch meta-scheduler: you submit a job to a queue and it places the pod
+on one of many Kubernetes clusters. Its API has no exec, and it exists to keep cluster
+credentials away from the tools that use it. Each kernel session becomes one Armada
+job.
 
-The adapter is therefore two halves:
+Because Armada cannot run commands in a pod, the kernel container runs a small
+**agent** as PID 1 (`agent/`, a static Go binary) instead of `sleep infinity`. It
+listens on a second port next to marimo's and runs the commands marimohub sends it.
+Armada exposes both ports and reports both addresses, so the adapter reaches the pod
+with an address Armada handed it and a token minted for that one pod, and holds no
+Kubernetes credential of any kind.
 
-- **Placement** (`src/armada.ts`) — submit a job, follow its event stream, learn
-  where the pod landed and which ingress address it was assigned.
-- **Control channel** (`src/exec.ts`) — exec into that pod, the same way
-  marimohub's own kubernetes adapter does.
-
-Everything in `src/sandbox.ts` above `exec` is ordinary shell commands.
+The adapter is two halves: **placement** (`src/armada.ts`) submits the job and follows
+its events, and the **control channel** (`src/channel.ts`) talks to the agent.
+Everything above that is ordinary shell commands. The full picture, with diagrams, is
+in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Configuration
 
-| Variable                             | Required | Description                                              |
-| ------------------------------------ | -------- | -------------------------------------------------------- |
-| `ARMADA_URL`                         | yes      | Armada API base URL                                      |
-| `ARMADA_QUEUE`                       | yes      | Queue jobs are submitted to                              |
-| `ARMADA_NAMESPACE`                   | no       | Pod namespace (default `default`)                        |
-| `ARMADA_LOOKOUT_URL`                 | no       | Lookout base URL; enables `listActive` reconciliation    |
-| `ARMADA_PRIORITY_CLASS`              | no       | Use a non-preemptible class for interactive sessions     |
-| `ARMADA_KERNEL_PORT`                 | no       | Port marimo serves on (default `2718`)                   |
-| `ARMADA_GHOST_SWEEP_SECONDS`         | no       | Abandoned-process sweep interval (default `60`, `0` off) |
-| `ARMADA_COMMAND_MAX_SECONDS`         | no       | Backstop for one exec (default `21600`, `0` off)         |
-| `MARIMOHUB_COMPUTE_IMAGE`            | yes      | Kernel image (first entry of the list)                   |
-| `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` | no       | Public kernel hostname                                   |
-| `ARMADA_AUTH_USERNAME`               | no       | Basic auth, set with the password                        |
-| `ARMADA_AUTH_PASSWORD`               | no       | Basic auth, set with the username                        |
-| `ARMADA_AUTH_TOKEN`                  | no       | Bearer token, for example from OIDC                      |
-| `ARMADA_AUTH_TOKEN_FILE`             | no       | Bearer token file, re-read on every request              |
-| `ARMADA_KUBECONFIG_PATTERN`          | no       | Kubeconfig path, `{CLUSTER_ID}` substituted              |
-
-`ARMADA_KUBECONFIG_PATTERN` is how the adapter reaches the cluster a job landed on,
-which Armada names only as a `clusterId`. It mirrors Lookout's `binocularsBaseUrlPattern`:
-`/etc/marimohub/clusters/{CLUSTER_ID}.yaml` in a multi-cluster deployment, a plain path
-when there is one cluster, and unset to use the ambient credentials (the in-cluster
-service account, or `~/.kube/config` on a laptop).
-
-`ARMADA_LOOKOUT_URL` is optional and gates a capability: set it to Lookout's base URL and
-the adapter advertises `listActive`, which marimohub's reconciler uses to enumerate live
-sandboxes after a restart. Leave it unset and the adapter never lists jobs, so
-reconciliation is a clean no-op.
-
-Configure at most one auth mechanism. With none, no `Authorization` header is sent, which
-is what a server running `anonymousAuth: true` expects. Prefer `ARMADA_AUTH_TOKEN_FILE`
-for anything that rotates, such as a projected Kubernetes service account token: it is read
-per request, so a new token is picked up without restarting marimohub.
-
-## Running it locally
-
-The Armada side comes from
-[armada-operator](https://github.com/armadaproject/armada-operator), which is much
-the easiest way to get one: a single `make kind-all` gives you a kind cluster
-running the operator, Armada itself, and the Pulsar, Postgres and Redis it depends
-on. Nothing below assembles Armada by hand.
-
-### What you end up with
-
-Three moving parts, all on your machine:
-
-```
-┌─ Docker ─────────────────────────────────────────────────────┐
-│                                                               │
-│  marimohub-armada            plain container, host port 3000  │
-│  (marimohub + this adapter)                                   │
-│         │                                                     │
-│         │ HTTP to host.docker.internal:30001                  │
-│         ▼                                                     │
-│  armada-control-plane ┐                                       │
-│  armada-worker        ┴─ kind cluster "armada"                │
-│                                                               │
-│    These two containers are Kubernetes *nodes*. Armada runs   │
-│    as pods inside them (namespace `armada`), together with    │
-│    Pulsar, Postgres and Redis (namespace `data`).             │
-└───────────────────────────────────────────────────────────────┘
-```
-
-marimohub runs as an **ordinary Docker container, not inside Kubernetes**. It
-reaches Armada over `host.docker.internal:30001`, which lands on the host port
-that kind maps to the Armada server's NodePort.
-
-### How the adapter is loaded
-
-There is only **one process**: marimohub's own Node server. This adapter is not a
-sidecar, a service, or a second process — it is a library that server imports.
-
-At startup marimohub sees `MARIMOHUB_COMPUTE_BACKEND=library`, dynamically
-`import()`s the path in `MARIMOHUB_COMPUTE_LIBRARY`, checks the default export is
-`{ apiVersion: 1, kind: 'compute' }`, and calls `create(context)`. The
-`SandboxProvider` it gets back then lives on marimohub's heap and is called
-in-process whenever a kernel is needed.
-
-Two consequences worth knowing:
-
-- A configuration error here is a **startup** error. `readConfig()` throws inside
-  marimohub's boot sequence, so a missing `ARMADA_URL` stops the server rather
-  than failing later at session start.
-- The adapter runs with the server's full privileges, which is why marimohub's
-  docs say to load only trusted code in library mode.
-
-Inside the container, do not confuse the two bundles: `/app/dist/index.mjs` is
-marimohub's own server, and `/etc/marimohub/compute.mjs` is this adapter.
-
-### Apple Silicon
-
-Armada publishes **amd64-only** images (`gresearch/armada-*`), as does marimohub.
-Both still run on an M-series Mac: Docker Desktop registers its binfmt handler
-with the `F` flag, which the nested containerd inside a kind node inherits, so
-amd64 pods schedule onto arm64 kind nodes. The Kubernetes control plane stays
-native; only the Armada processes are emulated. The kernel image is built here
-from `python:3.13-slim`, so kernels are native arm64.
-
-### 1. Bring up Armada
-
-```bash
-git clone https://github.com/armadaproject/armada-operator
-cd armada-operator
-make kind-all
-```
-
-That creates the `armada` kind cluster, installs cert-manager, the operator and
-Armada's dependencies, applies the Armada CRs, writes `~/.armadactl.yaml`, and
-downloads `armadactl` to `./bin/app/armadactl`. It pulls several GB the first
-time; `apachepulsar/pulsar-all` alone is ~3 GB.
-
-The quickstart pins nothing: every `gresearch/armada-*` image is `latest`. Today
-those serve the same API as the `v0.22.7` in `.armada-version`, verified, but the
-two can drift apart without warning.
-
-Host ports mapped by `hack/kind-config.yaml`:
-
-| Port    | Service         |
-| ------- | --------------- |
-| `30000` | Lookout UI      |
-| `30001` | Armada REST API |
-| `30002` | Armada gRPC API |
-
-The quickstart CRs set `anonymousAuth: true` and grant every permission to
-`everyone`, so no credentials are needed locally.
-
-Confirm Armada works on its own before involving marimohub:
-
-```bash
-./bin/app/armadactl create queue example
-./bin/app/armadactl submit dev/quickstart/example-job.yaml
-./bin/app/armadactl watch example job-set-1
-```
-
-### 2. Build the kernel image
-
-marimohub needs a sandbox image with marimo + uv preinstalled. Build the
-upstream example and load it into the cluster, so no registry is involved:
-
-```bash
-docker build -t marimo-sandbox:local path/to/marimohub/examples/sandbox-image
-kind load docker-image marimo-sandbox:local --name armada
-```
-
-If you bring your own image instead, the adapter assumes it provides `/bin/sh`,
-`python3`, `git`, GNU `find` and util-linux `setsid` (with `--wait`), and never
-probes for them: a missing one surfaces as that command's own failure. The
-example image has all five (verified, git 2.47.3). A Debian-family base covers
-the shell, `find` and `setsid`, but `python3` and `git` come from the image
-build: `python:*-slim` ships one and not the other, and busybox-based images
-lack the GNU specifics entirely (see ARMADA-REVIEW.md, decision 22).
-
-### 3. Check that placement works
-
-Before involving marimohub, submit one job the way the adapter does:
-
-```bash
-bun run smoke            # submit, wait for the pod, cancel
-bun run smoke -- --keep  # leave it running to poke at
-```
-
-```
-submitting smoke-mth9i8gg to queue "marimohub" at http://localhost:30001
-  job 01m1bzdp2tz93cyeh8ftzfr7nm, waiting for it to run
-
-running after 11.7s
-  cluster Cluster1
-  pod     default/armada-01m1bzdp2tz93cyeh8ftzfr7nm-0
-  node    armada-worker
-```
-
-```
-running a command in it
-  hello from armada-01m1bzdp2tz93cyeh8ftzfr7nm-0
-  Python 3.13.15
-  exit 0
-```
-
-That exercises the config, the auth header, the podspec, `/v1/job/submit`, the event
-stream and a Kubernetes exec against a real server and a real pod. Armada also creates
-the NodePort service the kernel will be reached through, which `kubectl get svc` shows
-as `2718:3xxxx/TCP`.
-
-The script runs on your machine, so it uses `~/.kube/config`. marimohub in a container
-needs its own route to the API server: join the `kind` network and point a kubeconfig at
-`https://armada-control-plane:6443`. The kind API server certificate lists
-`armada-control-plane`, `localhost`, `127.0.0.1` and the node IP as subject alternative
-names, so reaching it as `host.docker.internal` fails TLS verification.
-`dev/run-local.sh` wires exactly that: it writes the internal kubeconfig
-(`kind get kubeconfig --internal`) to `dev/kubeconfig-internal.yaml`, mounts it,
-joins the container to the `kind` network, and points
-`ARMADA_KUBECONFIG_PATTERN` at the mount. Verified: the whole
-submit-exec-read sequence works from inside the container.
-
-### 4. Start marimohub with this adapter
-
-```bash
-./dev/run-local.sh
-```
-
-The script does six things:
-
-1. `bun run build` — bundles `src/` into `dist/index.js`.
-2. `kind get kubeconfig --internal` — writes the control-channel credentials to
-   `dev/kubeconfig-internal.yaml` (gitignored).
-3. `docker build` — bakes the bundle into `marimohub-armada:dev`, a stock
-   marimohub image plus one `COPY`.
-4. `armadactl create queue marimohub` — idempotent.
-5. `docker run` — starts the container on port 3000, joined to the `kind`
-   network, with `fs` storage (a named volume), `dev` auth, `proxy` sandbox
-   exposure (see step 5's note on reaching the kernel), the `ARMADA_*`
-   variables, and the kubeconfig mounted read-only.
-6. Polls `/api/health` until it answers, then prints the URL.
-
-Override with environment variables: `ARMADA_URL`, `ARMADA_QUEUE`,
-`ARMADA_NAMESPACE`, `PORT`, `IMAGE`, `CONTAINER`, `ARMADACTL`, `KIND`.
-
-### 5. What you should see
-
-marimohub comes up at <http://localhost:3000>, already signed in as the dev
-user. Browsing, creating a project and creating a notebook all work — those are
-storage operations and never touch compute.
-
-**Starting a kernel now runs the whole provision sequence.** `ready()` submits
-the job and waits for it to run, the file and environment step goes in over exec
-(`writeFiles` streams each file through the pod's stdin; `setEnvVars` accumulates
-an export prefix for later commands), `startProcess` launches the kernel detached
-with `setsid` and waits for its port in-pod, and `exposePort` returns the address
-Armada assigned to the NodePort service, read from `JobIngressInfoEvent`. Session
-capture can also read back out: `readFile` returns a file as text or, for content
-that is not valid UTF-8, as base64, and `listFiles` lists a directory through
-`find`. `execStream` streams a command's stdout as it is produced, and cancelling
-the stream kills the command's process group. `gitCheckout` clones a repository
-through the same exec path, so a session that loads from a repository works too
-(provided the kernel image ships `git`).
-
-The URL `exposePort` returns is `<node-ip>:<nodePort>` on the docker network,
-which a browser on the host cannot reach. That is why `run-local.sh` sets
-`MARIMOHUB_SANDBOX_EXPOSURE=proxy`: the browser talks to the kernel through the
-app at `/proxy/<token>/…`, and only marimohub, which sits on the `kind` network,
-dereferences the NodePort address. With that in place a notebook works end to
-end locally: opening one provisions the pod (about 12s warm) and the marimo
-editor connects through the proxy, websocket included. When a start does fail,
-the notebook
-shows a generic _"Sandbox compute backend is not available"_ with a Retry button;
-the real error is nested in the server log's `cause` field. Dig it out with:
-
-```bash
-docker logs marimohub-armada 2>&1 | grep request_error | tail -1 | jq -r '.error.cause.message'
-```
-
-The surrounding `session_provision` line is the useful one for progress: it
-reports `launch_strategy`, the chosen `image`, and which steps succeeded before
-the failure. marimohub compensates cleanly on failure
-(`editor_claim_compensated`, `app_claim_compensated`), so a failed start leaves
-no stale claims and Retry is safe.
-
-### Inspecting
-
-```bash
-./bin/app/armadactl get queues              # queues
-./bin/app/armadactl watch <queue> <job-set> # job events
-kubectl get pods -n armada                  # Armada's own components
-kubectl get pods -n default                 # pods the executor created
-docker logs -f marimohub-armada             # marimohub, including adapter errors
-```
-
-Lookout UI: <http://localhost:30000>.
-
-### Tearing down
-
-```bash
-docker rm -f marimohub-armada
-make kind-delete-cluster    # from armada-operator
-```
-
-## Development
-
-```bash
-bun install
-bun run build   # bundles src + all dependencies into dist/index.js (bun build --target=node)
-bun run test
-bun run smoke   # submit one job to a running Armada, see where it lands
-```
-
-`bun run smoke` also exercises the ghost machinery, because closing an exec
-websocket does not stop the command it started (decisions 23 to 25). It abandons a
-command by timing it out, cancels a stream mid-command, and plants a group nothing
-is waiting on, which is what a failed kill or a marimohub restart leaves behind.
-Then it sweeps and lists every process that is not PID 1 and not the shell doing
-the asking. A healthy run kills the planted group and reports no live strays;
-anything else exits non-zero. A process in state `Z` is a zombie rather than a
-leak: the pod's PID 1 is `sleep infinity` and never reaps.
-
-While marimohub is running, the same sweep happens on a timer per sandbox, every
-`ARMADA_GHOST_SWEEP_SECONDS`. When it finds something it says so in marimohub's
-log, and the count reaches the `session_provision` line as `ghosts_killed`:
-
-```bash
-docker logs marimohub-armada 2>&1 | grep "killed .* abandoned process group"
-```
-
-CI (`.github/workflows/ci.yml`) runs `check` (oxfmt + oxlint), `typecheck`, `test` and
-`build` on every push to `main` and every pull request.
-
-### Armada API surface
-
-`src/armada-types.ts` is hand-written rather than generated from Armada's swagger. The
-four endpoints we call reach 202 of the spec's 249 definitions, but 165 of those are
-embedded Kubernetes types already available from `@kubernetes/client-node`, and only a
-dozen of the rest are ones we read. Generating would mean re-reviewing six thousand lines
-on every Armada release for endpoints we never touch.
-
-What keeps that honest is `bun run check:armada-api`. It fetches `api.swagger.json` at the
-release pinned in `.armada-version` and asserts that every field we depend on still exists
-with the type we read it as, so a drifting API fails in CI rather than at runtime:
-
-```bash
-bun run check:armada-api                          # against the pinned version
-ARMADA_VERSION=v0.23.0 bun run check:armada-api   # try a candidate
-```
-
-CI runs it in the `armada-api` job, which reports on every PR but only fetches the spec
-when an Armada-related file changed. There is no scheduled run: the spec is fetched at a
-git tag, and a tag is immutable, so the result can only change when this repo does.
-
-`dist/index.js` is fully self-contained: marimohub imports it from wherever it is
-mounted, with no `node_modules` beside it. Now that the adapter really loads
-`@kubernetes/client-node`, the bundle is about 8 MB: that client depends on
-`undici`, `openid-client`, `tar-fs` and `socks`, and bundling reaches all of them
-even though the import is lazy. That is far past the 1 MiB ConfigMap limit, so
-ship it via a volume or a one-line derived image (`COPY dist/index.js …`), which
-is what the Dockerfile here does. Size is not otherwise interesting: it is one
-layer in an image that already carries a Node runtime.
-
-The bundle is deliberately not minified. When a kernel fails to start, the useful
-error is a stack trace in marimohub's log, and the Dockerfile ships no source map.
-
-Point a local marimohub dev server at the build output:
-
-```bash
-# marimohub/apps/server/.env
-MARIMOHUB_COMPUTE_BACKEND=library
-MARIMOHUB_COMPUTE_LIBRARY=/absolute/path/to/marimohub-compute-armada/dist/index.js
-```
+| Variable                             | Required | Description                                           |
+| ------------------------------------ | -------- | ----------------------------------------------------- |
+| `ARMADA_URL`                         | yes      | Armada REST API base URL                              |
+| `ARMADA_QUEUE`                       | yes      | Queue jobs are submitted to                           |
+| `ARMADA_AGENT_IMAGE`                 | yes      | Kernel agent image, run as the init container         |
+| `MARIMOHUB_COMPUTE_IMAGE`            | yes      | Kernel image (first entry of the list)                |
+| `ARMADA_NAMESPACE`                   | no       | Pod namespace (default `default`)                     |
+| `ARMADA_LOOKOUT_URL`                 | no       | Lookout base URL; enables `listActive` reconciliation |
+| `ARMADA_PRIORITY_CLASS`              | no       | Use a non-preemptible class for interactive sessions  |
+| `ARMADA_KERNEL_PORT`                 | no       | Port marimo serves on (default `2718`)                |
+| `ARMADA_AGENT_PORT`                  | no       | Port the agent listens on (default `8718`)            |
+| `ARMADA_COMMAND_MAX_SECONDS`         | no       | Backstop for one exec (default `21600`, `0` off)      |
+| `ARMADA_EXPOSE`                      | no       | `nodeport` (default) or `ingress`, for both ports     |
+| `ARMADA_INGRESS_TLS`                 | no       | `true` (default) or `false`; ingress only             |
+| `ARMADA_INGRESS_CERT_NAME`           | no       | TLS secret name prefix (default `<namespace>-`)       |
+| `ARMADA_INGRESS_ANNOTATIONS`         | no       | JSON object put on every job's Ingress                |
+| `ARMADA_QUEUE_BY_USER`               | no       | JSON object, marimohub user id to queue               |
+| `ARMADA_QUEUE_BY_PROJECT`            | no       | JSON object, marimohub project id to queue            |
+| `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` | no       | Public kernel hostname                                |
+| `ARMADA_AUTH_USERNAME`               | no       | Basic auth, set with the password                     |
+| `ARMADA_AUTH_PASSWORD`               | no       | Basic auth, set with the username                     |
+| `ARMADA_AUTH_TOKEN`                  | no       | Bearer token, for example from OIDC                   |
+| `ARMADA_AUTH_TOKEN_FILE`             | no       | Bearer token file, re-read on every request           |
+
+Configuration is validated at startup, so a missing variable stops marimohub from
+booting rather than failing at the first session.
+
+`ARMADA_AGENT_IMAGE` has no default because the image is not published anywhere
+public yet: build it from `agent/` for the architecture of the worker nodes (see
+Deployment). The agent port is exposed the same way as the kernel port, so whatever
+reaches one reaches the other.
+
+`ARMADA_EXPOSE` decides how those two ports are reached. `nodeport` asks Armada for a
+NodePort service: plaintext HTTP on the cluster's own network, which is what a local
+cluster offers with nothing installed and is enough when marimohub runs beside it in
+`proxy` exposure. `ingress` asks for an Ingress instead: one hostname per port, named by
+the executor's `podDefaults.ingress.hostnameSuffix`, served over HTTPS by the cluster's
+ingress controller. Armada's Ingress names no class, so the cluster needs a default
+IngressClass or an annotation naming one; the executor's suffix must be a wildcard DNS
+record for the controller; and the TLS secret, `<namespace>-` (or
+`ARMADA_INGRESS_CERT_NAME`) plus the executor's `certNameSuffix`, must hold a wildcard
+certificate for `*.<namespace>.<suffix>` that marimohub trusts (`NODE_EXTRA_CA_CERTS` for
+a private CA). `ARMADA_INGRESS_ANNOTATIONS` lands on every job's Ingress: a source
+allowlist for the agent's hostname, or a longer websocket read timeout, go there.
+
+`ARMADA_QUEUE` takes every sandbox unless its owner maps elsewhere. Armada computes fair
+share and priority per queue, so a queue per team or per user is how tenants are told
+apart. `ARMADA_QUEUE_BY_USER` and `ARMADA_QUEUE_BY_PROJECT` map marimohub ids to queue
+names, the user's entry winning; every queue named must already exist, with permissions
+for the configured credential. marimohub names the owner on the calls where it holds a
+session record (marimohub#301, released in 0.4.0), and the owner places a sandbox that does
+not exist yet. For one that does, the queue it is in is the answer whatever the map says
+today: the adapter remembers it, takes it from Lookout during `listActive`, and asks
+Lookout by job set for a sandbox it has never seen, since marimohub addresses sandboxes by
+id alone on several paths. A queue map therefore requires `ARMADA_LOOKOUT_URL`, and a
+call Lookout cannot answer fails rather than guesses; marimohub retries it.
+
+Session surfaces (VS Code or OpenCode inside the sandbox, `MARIMOHUB_SURFACES`) need a
+port each next to the kernel's. The adapter reads marimohub's own `MARIMOHUB_SURFACES`
+and `MARIMOHUB_SURFACE_<ID>_PORT` settings, declares those ports on every pod so Armada
+exposes them like the kernel's, and advertises `multiPort` exactly then. A surface port
+may not be the agent's. The kernel image must ship the surface's binary.
+
+`ARMADA_LOOKOUT_URL` gates a capability: set it and the adapter advertises
+`listActive`, which marimohub's reconciler uses to enumerate live sandboxes after a
+restart. Leave it unset and reconciliation is a clean no-op.
+
+Configure at most one auth mechanism. With none, no `Authorization` header is sent,
+which is what a server running `anonymousAuth: true` expects. Prefer
+`ARMADA_AUTH_TOKEN_FILE` for anything that rotates: it is read per request.
 
 ## Deployment
 
 ```bash
 bun run build
 docker build --platform linux/amd64 -t <registry>/marimohub-armada:<tag> .
+docker build --platform linux/amd64 -t <registry>/marimohub-kernel-agent:<tag> agent
 ```
 
-The Dockerfile is the whole deployment story: stock marimohub image plus one
-`COPY` of the bundle, with `MARIMOHUB_COMPUTE_BACKEND=library` and
-`MARIMOHUB_COMPUTE_LIBRARY` preset. Armada settings (`ARMADA_URL`,
-`ARMADA_QUEUE`, …) come from the runtime environment, not the image.
-`--platform linux/amd64` is required on Apple Silicon: the upstream image
-ships no arm64 variant, so local runs go through Rosetta.
+Two images:
 
-Verified against `ghcr.io/marimo-team/marimohub:0.3.12`: the server boots with
-the adapter loaded, and a missing `ARMADA_URL` fails startup with this
-adapter's own error wrapped in marimohub's config diagnostics.
+- **marimohub with the adapter baked in.** The stock marimohub image plus one `COPY`
+  of the bundle, with `MARIMOHUB_COMPUTE_BACKEND=library` and
+  `MARIMOHUB_COMPUTE_LIBRARY` preset. Armada settings come from the runtime
+  environment, not the image. `--platform linux/amd64` is required on Apple Silicon:
+  the upstream image ships no arm64 variant.
+- **The agent.** A few megabytes, pushed to a registry the worker clusters can pull
+  from and named in `ARMADA_AGENT_IMAGE`. Build it for the architecture of the worker
+  nodes (or both, with `buildx`); it runs there, not where marimohub runs.
 
-## Toolchain
+The agent authenticates every request with a per-session token whose hash travels in
+the pod spec. It is exposed exactly as the kernel port is: over a NodePort that is
+plaintext HTTP on the cluster network, over an ingress it is a public HTTPS hostname.
+Restrict the ingress to marimohub's egress address in the latter case, through
+`ARMADA_INGRESS_ANNOTATIONS` or the executor's cluster-wide ingress annotations.
 
-- **Node 24** — matches marimohub's `.node-version` and its `node:24-slim` runtime
-  image. `@types/node` tracks the same major on purpose: newer types would
-  describe APIs the runtime does not have.
-- `src/` is typed against Node only (`tsconfig.src.json`), so Bun globals
-  cannot leak into shipped code. Bun types are available in `test/` alone.
-- Tests use `bun test`. If the marimohub conformance suite
-  (`@marimo-hub/core/testing/compute-contract`) is wired up later it imports
-  `vitest`, so it needs its own runner at that point.
+Verified against `ghcr.io/marimo-team/marimohub:0.4.2`, the release the adapter interface
+is transcribed from; everything added since 0.3.12 is optional, so that release loads it too.
+
+## Documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the three systems, the agent, and
+  how one session flows through them.
+- [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): toolchain, checks, running the whole
+  thing locally, and what to update when you change something.
+- [ARMADA-REVIEW.md](ARMADA-REVIEW.md): every design decision, with evidence cited
+  against the pinned Armada release, and what is still open.
+- [AGENT-DESIGN.md](AGENT-DESIGN.md): the design of the in-pod agent, written by an
+  Armada maintainer; built in full, kept for the reasoning.
+
+## License
+
+Apache-2.0, see [LICENSE](LICENSE).

@@ -1,0 +1,30 @@
+# golangci-lint v2 configuration for the kernel agent.
+#
+# `golangci-lint run` lints, `golangci-lint fmt --diff` is the format check;
+# both run from this directory, through `bun run check` and CI.
+version: '2'
+
+linters:
+  default: standard
+  enable:
+    - errorlint
+    - gocritic
+    - misspell
+    - nolintlint
+    - revive
+    - unconvert
+    - unparam
+  settings:
+    revive:
+      rules:
+        # A doc comment on every exported symbol is not worth it in a main
+        # package with three exports; the file headers carry the story.
+        - name: exported
+          disabled: true
+        - name: package-comments
+          disabled: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

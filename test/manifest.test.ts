@@ -6,6 +6,7 @@ const env: Record<string, string | undefined> = {
 	ARMADA_URL: 'https://armada.example.com',
 	ARMADA_QUEUE: 'marimohub',
 	MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
+	ARMADA_AGENT_IMAGE: 'ghcr.io/example/kernel-agent:1',
 };
 
 const context: AdapterFactoryContext = {

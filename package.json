@@ -8,18 +8,20 @@
 	"scripts": {
 		"build": "bun build src/index.ts --target=node --format=esm --sourcemap=linked --outdir=dist",
 		"dev": "bun build src/index.ts --target=node --format=esm --sourcemap=linked --outdir=dist --watch",
-		"test": "bun test",
+		"test": "bun test && bun run agent:test",
 		"typecheck": "tsc --noEmit && tsc -p tsconfig.src.json",
-		"fmt": "oxfmt --write .",
-		"check": "oxfmt --check . && oxlint --type-aware",
+		"fmt": "oxfmt --write . && cd agent && golangci-lint fmt",
+		"check": "bun run check:ts && bun run agent:lint",
+		"check:ts": "oxfmt --check . && oxlint --type-aware",
 		"check:armada-api": "bun run scripts/check-armada-api.ts",
-		"smoke": "bun run dev/smoke.ts",
-		"lint": "oxlint --type-aware"
-	},
-	"dependencies": {
-		"@kubernetes/client-node": "^2.0.0"
+		"smoke": "bash dev/smoke.sh",
+		"lint": "oxlint --type-aware",
+		"agent:lint": "cd agent && golangci-lint fmt --diff && golangci-lint run",
+		"agent:test": "go -C agent vet ./... && go -C agent test ./...",
+		"agent:build": "docker build -t marimohub-kernel-agent:local agent"
 	},
 	"devDependencies": {
+		"@kubernetes/client-node": "^2.0.0",
 		"@nojaf/oxlint-plugin-annotate-non-primitives": "^0.1.1",
 		"@types/bun": "^1.4.0",
 		"@types/node": "^24",

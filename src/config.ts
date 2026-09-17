@@ -2,11 +2,46 @@ import { readFileSync } from 'node:fs';
 import type { ArmadaAuth } from './auth.js';
 import type { AdapterFactoryContext } from './types.js';
 
+/**
+ * How the kernel port and the agent port are reached from outside the pod.
+ *
+ * `nodeport` asks Armada for a NodePort service: the address event carries
+ * `hostIP:nodePort` per port, plaintext HTTP on the cluster's own network. It is
+ * what a local kind cluster can offer with nothing installed.
+ *
+ * `ingress` asks for an Ingress: one hostname per port, named by the executor
+ * (its `podDefaults.ingress.hostnameSuffix`), served by whatever ingress
+ * controller the worker cluster runs. The Ingress Armada generates carries no
+ * `ingressClassName`, so the cluster needs a default class or an annotation
+ * that names one. With `tls` the URLs are `https` and the Ingress names a
+ * certificate secret: `certName`, or Armada's `<namespace>-` default, either
+ * one with the executor's `certNameSuffix` appended. `annotations` land on
+ * every job's Ingress on top of the executor's cluster-wide ones, which is
+ * where a websocket read timeout or an IP allowlist goes.
+ */
+export type Exposure =
+	| { kind: 'nodeport' }
+	| {
+			kind: 'ingress';
+			tls: boolean;
+			certName?: string | undefined;
+			annotations: Record<string, string>;
+	  };
+
 export interface ArmadaConfig {
 	/** Armada REST gateway base URL, http or https. */
 	url: string;
-	/** Armada queue jobs are submitted to. */
+	/** NodePort service or Ingress, for both ports at once. */
+	expose: Exposure;
+	/** Armada queue jobs are submitted to when no owner map claims them. */
 	queue: string;
+	/**
+	 * User id to queue, and project id to queue: the fairness model of a
+	 * multi-tenant deployment (`queues.ts`). A user's entry wins over their
+	 * project's. Empty means every sandbox goes to `queue`.
+	 */
+	queueByUser: Record<string, string>;
+	queueByProject: Record<string, string>;
 	/** Kubernetes namespace the executor creates pods in. */
 	namespace: string;
 	/**
@@ -23,11 +58,22 @@ export interface ArmadaConfig {
 	/** Port marimo serves on inside the pod. */
 	port: number;
 	/**
-	 * Where to find Kubernetes credentials for the cluster a job landed on, with
-	 * `{CLUSTER_ID}` replaced by the id Armada reports. Unset means the ambient
-	 * config: the in-cluster service account, or `~/.kube/config` outside one.
+	 * Image of the kernel agent, which an init container copies into the kernel
+	 * container (AGENT-DESIGN.md). Required: there is no public default yet, and
+	 * a wrong guess would fail at the first session rather than at startup.
 	 */
-	kubeconfigPattern?: string | undefined;
+	agentImage: string;
+	/** Port the agent listens on inside the pod, exposed next to the kernel's. */
+	agentPort: number;
+	/**
+	 * Ports of marimohub's enabled secondary surfaces (VS Code, OpenCode),
+	 * declared on every pod and exposed like the kernel's, so `exposePort` can
+	 * answer for them. Read from marimohub's own `MARIMOHUB_SURFACES` and
+	 * `MARIMOHUB_SURFACE_<ID>_PORT` variables rather than a variable of ours, so
+	 * the `multiPort` capability is advertised exactly when the surfaces marimohub
+	 * will ask for are on every sandbox. Empty when no surface is enabled.
+	 */
+	surfacePorts: number[];
 	/**
 	 * Hard cap on one session, submitted as `activeDeadlineSeconds`. Armada gives
 	 * any pod without one the server default, 72 hours as shipped, so a kernel must
@@ -35,25 +81,15 @@ export interface ArmadaConfig {
 	 */
 	maxLifetimeSeconds: number;
 	/**
-	 * How often to sweep a pod for process groups this adapter started and is no
-	 * longer waiting on, in seconds. `0` turns the sweep off.
-	 *
-	 * Closing an exec websocket does not stop the command it started, so an
-	 * abandoned command is killed explicitly (decisions 23 and 24), and this is
-	 * what repairs the cases where that kill did not happen: it raced the command
-	 * recording its group, its own exec failed, or marimohub restarted and left a
-	 * pod's streams behind.
-	 */
-	ghostSweepSeconds: number;
-	/**
 	 * Backstop for a single `exec`, in seconds. `0` turns it off.
 	 *
 	 * Not a timeout: the caller's own `ExecOptions.timeout` is the timeout, and
 	 * most of marimohub's exec calls deliberately carry none because unpacking a
 	 * workspace or running a data preview legitimately takes minutes. This is the
 	 * hours-later answer to "nobody expected this to still be running", which
-	 * otherwise holds a websocket and a process for the rest of the session.
-	 * Streams are exempt: how long one stays open is the consumer's choice.
+	 * otherwise holds a request and a process for the rest of the session. It is
+	 * enforced by the agent, as the deadline of a command that arrived without
+	 * one. Streams are exempt: how long one stays open is the consumer's choice.
 	 */
 	commandMaxSeconds: number;
 	/** How to authenticate to Armada. */
@@ -167,14 +203,118 @@ function readAuth(env: Record<string, string | undefined>): ArmadaAuth {
 	return { kind: 'anonymous' };
 }
 
-/** A day, when neither marimohub nor the environment says otherwise. */
-const DEFAULT_MAX_LIFETIME_SECONDS = 24 * 60 * 60;
+/**
+ * Ingress settings only mean something under `ARMADA_EXPOSE=ingress`; one set
+ * beside a NodePort would be silently ignored, which is the kind of startup
+ * mistake decision 15 exists to catch.
+ */
+function readExposure(env: Record<string, string | undefined>): Exposure {
+	const kind: string = env.ARMADA_EXPOSE ?? 'nodeport';
+	const ingressVars: string[] = [
+		'ARMADA_INGRESS_TLS',
+		'ARMADA_INGRESS_CERT_NAME',
+		'ARMADA_INGRESS_ANNOTATIONS',
+	].filter((name: string) => env[name] !== undefined);
+
+	if (kind === 'nodeport') {
+		if (ingressVars.length > 0) {
+			throw new Error(
+				`${ingressVars.join(', ')} only apply with ARMADA_EXPOSE=ingress, and ARMADA_EXPOSE is nodeport`,
+			);
+		}
+		return { kind: 'nodeport' };
+	}
+	if (kind !== 'ingress') {
+		throw new Error(`ARMADA_EXPOSE must be nodeport or ingress, got: ${kind}`);
+	}
+
+	const tlsRaw: string = env.ARMADA_INGRESS_TLS ?? 'true';
+	if (tlsRaw !== 'true' && tlsRaw !== 'false') {
+		throw new Error(`ARMADA_INGRESS_TLS must be true or false, got: ${tlsRaw}`);
+	}
+	const certName: string | undefined = env.ARMADA_INGRESS_CERT_NAME;
+	if (certName !== undefined && !certName.trim()) {
+		throw new Error('ARMADA_INGRESS_CERT_NAME is empty');
+	}
+	return {
+		kind: 'ingress',
+		tls: tlsRaw === 'true',
+		certName,
+		annotations: readStringMap(env, 'ARMADA_INGRESS_ANNOTATIONS'),
+	};
+}
 
 /**
- * Often enough that an abandoned command wastes at most a minute of the kernel's
- * CPU, rare enough that an idle session costs one exec a minute.
+ * A JSON object of non-empty strings: an Ingress annotation map, or an owner
+ * to queue map. Absent is the empty map.
  */
-const DEFAULT_GHOST_SWEEP_SECONDS = 60;
+function readStringMap(
+	env: Record<string, string | undefined>,
+	name: string,
+): Record<string, string> {
+	const raw: string | undefined = env[name];
+	if (raw === undefined) return {};
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		throw new Error(`${name} must be a JSON object, got: ${raw}`);
+	}
+	if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+		throw new Error(`${name} must be a JSON object, got: ${raw}`);
+	}
+	const map: Record<string, string> = {};
+	for (const [key, value] of Object.entries(parsed)) {
+		if (typeof value !== 'string' || !value.trim()) {
+			throw new Error(`${name}: ${key} must be a non-empty string`);
+		}
+		map[key] = value;
+	}
+	return map;
+}
+
+/**
+ * marimohub's secondary surfaces and their port variables, transcribed from
+ * `packages/config/src/surfaces.ts`. marimohub validates the same variables
+ * itself (unknown ids, shared ports, the kernel's port), so this only has to
+ * read them the same way; what it adds is the collision with the agent's port,
+ * which marimohub cannot know about.
+ */
+const SURFACES: readonly { id: string; variable: string; defaultPort: number }[] = [
+	{ id: 'vscode', variable: 'MARIMOHUB_SURFACE_VSCODE_PORT', defaultPort: 8443 },
+	{ id: 'opencode', variable: 'MARIMOHUB_SURFACE_OPENCODE_PORT', defaultPort: 4096 },
+];
+
+/** marimohub's primary surface, which is the kernel itself and needs no port here. */
+const PRIMARY_SURFACE = 'marimo';
+
+function readSurfacePorts(env: Record<string, string | undefined>): number[] {
+	const enabled: Set<string> = new Set(
+		(env.MARIMOHUB_SURFACES ?? PRIMARY_SURFACE)
+			.split(',')
+			.map((id: string) => id.trim())
+			.filter((id: string) => id !== ''),
+	);
+	// marimohub refuses an id it does not know, so one reaching here can only
+	// come from a marimohub newer than this table, whose surface would then have
+	// no port on the pod and fail at exposePort after launch instead of here.
+	for (const id of enabled) {
+		if (id !== PRIMARY_SURFACE && !SURFACES.some((surface: { id: string }) => surface.id === id)) {
+			throw new Error(
+				`MARIMOHUB_SURFACES names "${id}", a surface this adapter does not know; it knows ${SURFACES.map((surface: { id: string }) => surface.id).join(', ')}`,
+			);
+		}
+	}
+	const ports: number[] = [];
+	for (const surface of SURFACES) {
+		if (!enabled.has(surface.id)) continue;
+		ports.push(optionalPort(env, surface.variable, surface.defaultPort));
+	}
+	return ports;
+}
+
+/** A day, when neither marimohub nor the environment says otherwise. */
+const DEFAULT_MAX_LIFETIME_SECONDS = 24 * 60 * 60;
 
 /**
  * Far past anything marimohub's own commands do, since a backstop that competes
@@ -191,25 +331,24 @@ export function readConfig(
 	const image: string | undefined = required(env, 'MARIMOHUB_COMPUTE_IMAGE').split(',')[0]?.trim();
 	if (!image) throw new Error('MARIMOHUB_COMPUTE_IMAGE must contain at least one image');
 
-	return {
+	const config: ArmadaConfig = {
 		url: requiredUrl(env, 'ARMADA_URL'),
+		expose: readExposure(env),
 		queue: required(env, 'ARMADA_QUEUE'),
+		queueByUser: readStringMap(env, 'ARMADA_QUEUE_BY_USER'),
+		queueByProject: readStringMap(env, 'ARMADA_QUEUE_BY_PROJECT'),
 		namespace: env.ARMADA_NAMESPACE ?? 'default',
 		priorityClassName: env.ARMADA_PRIORITY_CLASS,
 		image,
 		sandboxHostname: env.MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME,
 		port: optionalPort(env, 'ARMADA_KERNEL_PORT', 2718),
-		kubeconfigPattern: env.ARMADA_KUBECONFIG_PATTERN,
+		agentImage: required(env, 'ARMADA_AGENT_IMAGE'),
+		agentPort: optionalPort(env, 'ARMADA_AGENT_PORT', 8718),
+		surfacePorts: readSurfacePorts(env),
 		lookoutUrl: optionalUrl(env, 'ARMADA_LOOKOUT_URL'),
 		maxLifetimeSeconds:
 			compute?.sessionMaxLifetimeSeconds ??
 			optionalSeconds(env, 'ARMADA_KERNEL_MAX_LIFETIME_SECONDS', DEFAULT_MAX_LIFETIME_SECONDS),
-		ghostSweepSeconds: optionalSeconds(
-			env,
-			'ARMADA_GHOST_SWEEP_SECONDS',
-			DEFAULT_GHOST_SWEEP_SECONDS,
-			0,
-		),
 		commandMaxSeconds: optionalSeconds(
 			env,
 			'ARMADA_COMMAND_MAX_SECONDS',
@@ -218,4 +357,29 @@ export function readConfig(
 		),
 		auth: readAuth(env),
 	};
+	if (config.agentPort === config.port) {
+		throw new Error(
+			`ARMADA_AGENT_PORT and ARMADA_KERNEL_PORT are both ${String(config.port)}; the agent and the kernel each need a port`,
+		);
+	}
+	for (const port of config.surfacePorts) {
+		if (port === config.agentPort || port === config.port) {
+			throw new Error(
+				`A surface port (MARIMOHUB_SURFACE_*_PORT) is ${String(port)}, which is the ${port === config.port ? 'kernel' : 'agent'} port; each needs its own`,
+			);
+		}
+	}
+	// marimohub creates sandboxes by id alone on paths that exec and destroy,
+	// so once jobs can be in more than one queue, Lookout is the only way to
+	// place one of those after a restart (`src/queues.ts`).
+	const mappedQueues: string[] = [
+		...Object.values(config.queueByUser),
+		...Object.values(config.queueByProject),
+	].filter((queue: string) => queue !== config.queue);
+	if (mappedQueues.length > 0 && config.lookoutUrl === undefined) {
+		throw new Error(
+			'ARMADA_QUEUE_BY_USER / ARMADA_QUEUE_BY_PROJECT name queues other than ARMADA_QUEUE, which needs ARMADA_LOOKOUT_URL: a sandbox addressed by id alone can only be placed through Lookout',
+		);
+	}
+	return config;
 }
