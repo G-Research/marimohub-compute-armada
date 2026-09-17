@@ -129,6 +129,62 @@ plaintext HTTP on the cluster network, over an ingress it is a public HTTPS host
 Restrict the ingress to marimohub's egress address in the latter case, through
 `ARMADA_INGRESS_ANNOTATIONS` or the executor's cluster-wide ingress annotations.
 
+### Without the marimohub image
+
+Each marimohub release also ships `marimohub-linux-x64`, a standalone server binary for
+x86-64 Linux hosts with no Node installed. It loads the adapter the same way the image
+does, so the Dockerfile is optional: put the bundle somewhere on the host and point the
+binary at it. The agent image is still needed, since it runs in the cluster.
+
+```bash
+# The bundle: one self-contained file, built with `bun run build`.
+sudo install -D dist/index.js /etc/marimohub/compute.mjs
+
+# The binary, at the release the Dockerfile names, checked against its published hash.
+V=0.4.6
+curl -fsSLO "https://github.com/marimo-team/marimohub/releases/download/v$V/marimohub-linux-x64"
+curl -fsSLO "https://github.com/marimo-team/marimohub/releases/download/v$V/marimohub-linux-x64.sha256"
+sha256sum -c marimohub-linux-x64.sha256
+sudo install marimohub-linux-x64 /usr/local/bin/marimohub
+
+# marimohub's own settings (storage, auth, exposure) as documented upstream, then:
+export MARIMOHUB_COMPUTE_BACKEND=library
+export MARIMOHUB_COMPUTE_LIBRARY=/etc/marimohub/compute.mjs
+export ARMADA_URL=https://armada.example.com
+export ARMADA_QUEUE=marimohub
+# The two images that run in the cluster, per session: the kernel (marimo and uv)
+# and the agent in front of it. Neither is marimohub itself.
+export MARIMOHUB_COMPUTE_IMAGE=<registry>/marimo-sandbox:<tag>
+export ARMADA_AGENT_IMAGE=<registry>/marimohub-kernel-agent:<tag>
+marimohub
+```
+
+The path in `MARIMOHUB_COMPUTE_LIBRARY` must be absolute. On first start the binary
+unpacks its bundled files to `~/.cache/marimohub-sea/<build-id>` (or
+`MARIMOHUB_SEA_CACHE_DIR`); the directory has to be owned by the running user and not
+reachable through a directory other users can write, so give a service account a home or
+a cache directory of its own. See marimohub's deployment docs for the rest. A bad Armada
+setting fails at startup here too, with the variable named.
+
+The two images need no registry when the cluster is a local kind one, because a kind
+node can be handed an image straight from your Docker daemon. Build both locally, load
+them into the node, and name them by their local tags:
+
+```bash
+docker build -t marimohub-kernel-agent:local agent
+docker build -t marimo-sandbox:local path/to/marimohub/examples/sandbox-image
+kind load docker-image marimohub-kernel-agent:local marimo-sandbox:local --name armada
+
+export ARMADA_AGENT_IMAGE=marimohub-kernel-agent:local
+export MARIMOHUB_COMPUTE_IMAGE=marimo-sandbox:local
+```
+
+A real Armada cluster pulls from a registry its executors can reach, so there the
+images must be pushed and named by their registry path. `dev/run-native.sh` scripts the
+local arrangement end to end, including the load; see
+[docs/CONTRIBUTING.md](docs/CONTRIBUTING.md), which also covers the case where
+`kind load` trips over a multi-platform image.
+
 Verified against `ghcr.io/marimo-team/marimohub:0.4.2`, the release the adapter interface
 is transcribed from; everything added since 0.3.12 is optional, so that release loads it too.
 

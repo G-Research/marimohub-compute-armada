@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Rebuild the adapter, bake it into the marimohub image, and run it against the
 # Armada in the local kind cluster. Assumes Armada is already up (see docs/CONTRIBUTING.md).
+# On a Linux host, dev/run-native.sh does the same without the image.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+# shellcheck source=dev/common.sh
+. dev/common.sh
 
 ARMADACTL=${ARMADACTL:-$HOME/Projects/armada-operator/bin/app/armadactl}
 QUEUE=${ARMADA_QUEUE:-marimohub}
@@ -16,36 +19,12 @@ NODE=${NODE:-armada-worker}
 echo "==> building adapter bundle"
 bun run build
 
-# The agent runs on the worker node, so it is built for the node's architecture
-# and not for marimohub's, which is amd64 under emulation on Apple Silicon.
-echo "==> building the kernel agent image"
-case "$(docker exec "$NODE" uname -m)" in
-aarch64) PLATFORM=linux/arm64 ;;
-x86_64) PLATFORM=linux/amd64 ;;
-*) echo "unknown node architecture"; exit 1 ;;
-esac
-docker build --platform "$PLATFORM" -t "$AGENT_IMAGE" agent
-
-# `kind load docker-image` fails on multi-platform manifests from Docker
-# Desktop's containerd image store ("content digest ... not found"), so the
-# archive goes straight into the node's containerd, for the one platform.
-echo "==> loading it into the kind node"
-docker save "$AGENT_IMAGE" | docker exec -i "$NODE" ctr -n k8s.io images import --platform "$PLATFORM" - >/dev/null
+build_agent_image
 
 echo "==> baking into marimohub image"
 docker build --platform linux/amd64 -t "$IMAGE" .
 
-echo "==> ensuring Armada queue '$QUEUE' exists"
-if ! queue_out=$("$ARMADACTL" create queue "$QUEUE" 2>&1); then
-	# Only an existing queue is benign; anything else (missing binary, auth) is fatal.
-	case "$queue_out" in
-	*"already exists"*) ;;
-	*)
-		echo "$queue_out"
-		exit 1
-		;;
-	esac
-fi
+ensure_queue
 
 echo "==> restarting marimohub"
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
