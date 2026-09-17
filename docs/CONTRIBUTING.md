@@ -106,9 +106,11 @@ whichever one you use.
 
 ### Apple Silicon
 
-Armada publishes amd64-only images, as does marimohub. Both run on an M-series Mac
-through Docker Desktop's binfmt handler, which the containerd inside a kind node
-inherits. The kernel image and the agent image are built native arm64, for the node.
+Armada publishes amd64-only images, as does marimohub and the default kernel image. All
+run on an M-series Mac through Docker Desktop's binfmt handler, which the containerd
+inside a kind node inherits, but a kernel under emulation is too slow to work in, so the
+kernel image is built native arm64 and named in `MARIMOHUB_COMPUTE_IMAGE` (step 2). The
+agent image is always built for the node.
 
 ### 1. Bring up Armada
 
@@ -138,12 +140,17 @@ Confirm Armada works on its own before involving marimohub:
 
 ### 2. Build the kernel image and the agent image
 
-marimohub needs a sandbox image with marimo and uv preinstalled. Build the upstream
-example and load it into the cluster, so no registry is involved:
+marimohub needs a sandbox image with marimo and uv preinstalled. The adapter's default,
+`ghcr.io/marimo-team/marimo-sandbox:latest`, is amd64 and public, so on an amd64 node
+there is nothing to do: the node pulls it on the first session (1.7 GB, a few minutes
+once). On an arm64 node it would run under emulation, and a Python kernel under qemu is
+too slow to be useful, so build the upstream example native, load it into the cluster,
+and name it wherever you start something:
 
 ```bash
 docker build -t marimo-sandbox:local path/to/marimohub/examples/sandbox-image
 kind load docker-image marimo-sandbox:local --name armada
+export MARIMOHUB_COMPUTE_IMAGE=marimo-sandbox:local   # for smoke and both run scripts
 ```
 
 The agent image is built from this repo for the worker node's architecture.
@@ -177,7 +184,7 @@ bun run smoke -- --keep  # leave it running to poke at
 
 ```
 submitting smoke-mtr8nhti to queue "marimohub" at http://armada-control-plane:30001
-  kernel image marimo-sandbox:local
+  kernel image ghcr.io/marimo-team/marimo-sandbox:latest
   agent image  marimohub-kernel-agent:local
   agent   172.18.0.2:32114
 

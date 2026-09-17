@@ -282,6 +282,14 @@ startup since it can only mean a newer marimohub. Left alone on purpose: `resolv
 because a pod's processes see the paths marimohub writes; and `sessionIdleTimeoutMs`, which
 only the Modal adapter uses, since `activeDeadlineSeconds` already bounds a session.
 
+**The kernel image defaults to marimo's published one.** `MARIMOHUB_COMPUTE_IMAGE` unset
+means `ghcr.io/marimo-team/marimo-sandbox:latest`, the image marimohub's own docs point the
+variable at and the one built to its sandbox contract. marimohub's kubernetes adapter also
+defaults when the variable is unset, though to `ghcr.io/marimo-team/marimo:latest`, the
+bare marimo image; that one is not documented against the hub's contract, and the sandbox
+image is what every hub example names, so the divergence is in the value only. A set but
+empty variable is still refused: that is a mistake, not a request for the default.
+
 **Shipped as a bundle baked into the marimohub image.** One `COPY` onto the stock image, with
 the library-mode variables preset. A ConfigMap was rejected: the bundle would pass the
 1 MiB limit the moment a real dependency was imported.

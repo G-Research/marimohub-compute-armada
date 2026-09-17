@@ -323,12 +323,24 @@ const DEFAULT_MAX_LIFETIME_SECONDS = 24 * 60 * 60;
  */
 const DEFAULT_COMMAND_MAX_SECONDS = 6 * 60 * 60;
 
+/**
+ * The kernel image when `MARIMOHUB_COMPUTE_IMAGE` is unset: the one marimohub's
+ * own docs point the variable at, public, and built to its sandbox contract
+ * (`sh`, `git`, `uv`, a writable workspace). amd64 only.
+ */
+export const DEFAULT_IMAGE = 'ghcr.io/marimo-team/marimo-sandbox:latest';
+
 export function readConfig(
 	env: Record<string, string | undefined>,
 	compute?: AdapterFactoryContext['compute'],
 ): ArmadaConfig {
 	// MARIMOHUB_COMPUTE_IMAGE is a comma-separated list; the first is the default.
-	const image: string | undefined = required(env, 'MARIMOHUB_COMPUTE_IMAGE').split(',')[0]?.trim();
+	// Unset, it is marimo's published kernel image, as marimohub's kubernetes
+	// adapter defaults its own; set but empty is a mistake and refused.
+	const image: string | undefined =
+		env.MARIMOHUB_COMPUTE_IMAGE === undefined
+			? DEFAULT_IMAGE
+			: env.MARIMOHUB_COMPUTE_IMAGE.split(',')[0]?.trim();
 	if (!image) throw new Error('MARIMOHUB_COMPUTE_IMAGE must contain at least one image');
 
 	const config: ArmadaConfig = {
