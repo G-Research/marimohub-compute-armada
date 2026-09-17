@@ -83,13 +83,13 @@ Pulsar, Postgres and Redis it depends on.
 ```mermaid
 flowchart TB
   subgraph docker[Docker on your machine]
-    hub["marimohub-armada: marimohub + this adapter, host port 3000"]
+    hub["marimohub-armada: marimohub + this adapter, host port 3337"]
     subgraph kind[kind cluster armada, docker network kind]
       cp[armada-control-plane]
       worker["armada-worker: Armada pods, kernel pods"]
     end
   end
-  hub -->|"host.docker.internal:30001"| cp
+  hub -->|"armada-control-plane:30001"| cp
   hub -->|"agent and kernel NodePorts, 172.18.x.x"| worker
 ```
 
@@ -151,6 +151,13 @@ docker save marimohub-kernel-agent:local |
 The import goes straight into the node's containerd because `kind load` trips over
 multi-platform manifests from Docker Desktop's containerd image store.
 
+Before submitting anything, confirm both images are in the node; a missing one leaves the
+pod in `ImagePullBackOff` until Armada fails the job a couple of minutes later:
+
+```bash
+docker exec armada-worker ctr -n k8s.io images ls -q | grep marimo
+```
+
 If you bring your own kernel image, it must provide `/bin/sh` and `git`
 (see [DECISIONS.md](DECISIONS.md)).
 
@@ -162,7 +169,7 @@ bun run smoke -- --keep  # leave it running to poke at
 ```
 
 ```
-submitting smoke-mtr8nhti to queue "marimohub" at http://host.docker.internal:30001
+submitting smoke-mtr8nhti to queue "marimohub" at http://armada-control-plane:30001
   kernel image marimo-sandbox:local
   agent image  marimohub-kernel-agent:local
   agent   172.18.0.2:32114
@@ -203,7 +210,7 @@ directly.
 
 The script bundles the adapter, builds and imports the agent image, bakes the bundle
 into `marimohub-armada:dev`, creates the `marimohub` queue, starts the container on
-port 3000 joined to the `kind` network with `fs` storage, `dev` auth and `proxy`
+port 3337 joined to the `kind` network with `fs` storage, `dev` auth and `proxy`
 sandbox exposure, and polls `/api/health` until it answers. No credential of any kind
 is mounted. Override with `ARMADA_URL`, `ARMADA_QUEUE`, `ARMADA_NAMESPACE`, `PORT`,
 `IMAGE`, `AGENT_IMAGE`, `CONTAINER`, `ARMADACTL` and `NODE`; `ARMADA_EXPOSE` and the
@@ -212,7 +219,7 @@ two queue maps (step 7) and `MARIMOHUB_SURFACES`.
 
 ### 5. What you should see
 
-marimohub comes up at <http://localhost:3000>, signed in as the dev user. Browsing and
+marimohub comes up at <http://localhost:3337>, signed in as the dev user. Browsing and
 creating notebooks never touch compute. Opening a notebook runs the whole provision
 sequence: the job is submitted, the pod runs, the agent answers, files and environment
 go in, `uv sync` runs, the kernel is started as the agent's own child and its port is
@@ -269,7 +276,7 @@ the cluster a second queue and tell the smoke whose sandbox it is submitting:
 
 ```bash
 ./bin/app/armadactl create queue marimohub-team-b   # in armada-operator; wait ~10s
-ARMADA_LOOKOUT_URL=http://host.docker.internal:30000 \
+ARMADA_LOOKOUT_URL=http://armada-control-plane:30000 \
 ARMADA_QUEUE_BY_PROJECT='{"proj-b":"marimohub-team-b"}' \
 SMOKE_OWNER_PROJECT=proj-b bun run smoke
 ```
@@ -285,13 +292,13 @@ Lookout, then `listActive` no longer showing it. A submit in the first seconds a
 has not refreshed yet; run it again.
 
 The same through the hub, which names the owner from 0.4.0 onwards (the Dockerfile's base
-image is 0.4.2). Map the dev project's id, the `id` in `curl localhost:3000/api/v1/projects`,
+image is 0.4.2). Map the dev project's id, the `id` in `curl localhost:3337/api/v1/projects`,
 restart, and start a session through the API (dev auth accepts a bare request):
 
 ```bash
-ARMADA_LOOKOUT_URL=http://host.docker.internal:30000 \
+ARMADA_LOOKOUT_URL=http://armada-control-plane:30000 \
 ARMADA_QUEUE_BY_PROJECT='{"<project id>":"marimohub-team-b"}' ./dev/run-local.sh
-curl -X POST localhost:3000/api/v1/projects/<pid>/notebooks/<nid>/sessions \
+curl -X POST localhost:3337/api/v1/projects/<pid>/notebooks/<nid>/sessions \
   -H 'content-type: application/json' -d '{}'
 ```
 
@@ -313,8 +320,9 @@ kubectl get pods -n default                  # kernel pods
 docker logs -f marimohub-armada              # marimohub, including adapter errors
 ```
 
-Lookout UI: <http://localhost:30000>. To tear down: `docker rm -f marimohub-armada`,
-then `make kind-delete-cluster` in armada-operator.
+Lookout UI: <http://localhost:30000>. To tear down, `./dev/shutdown.sh` removes the
+marimohub container and deletes the kind cluster; `./dev/shutdown.sh --purge` also drops the
+data volume, the dev images and `dev/tls`.
 
 ## Changing things
 

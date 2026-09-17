@@ -10,7 +10,7 @@ QUEUE=${ARMADA_QUEUE:-marimohub}
 IMAGE=${IMAGE:-marimohub-armada:dev}
 AGENT_IMAGE=${AGENT_IMAGE:-marimohub-kernel-agent:local}
 CONTAINER=${CONTAINER:-marimohub-armada}
-PORT=${PORT:-3000}
+PORT=${PORT:-3337}
 NODE=${NODE:-armada-worker}
 
 echo "==> building adapter bundle"
@@ -76,7 +76,7 @@ docker run -d --name "$CONTAINER" --platform linux/amd64 \
 	-e MARIMOHUB_AUTH_SESSION_SECRET="${MARIMOHUB_AUTH_SESSION_SECRET:-armada-dev-only-proxy-secret}" \
 	-e MARIMOHUB_COMPUTE_IMAGE=marimo-sandbox:local \
 	-e ARMADA_AGENT_IMAGE="$AGENT_IMAGE" \
-	-e ARMADA_URL="${ARMADA_URL:-http://host.docker.internal:30001}" \
+	-e ARMADA_URL="${ARMADA_URL:-http://armada-control-plane:30001}" \
 	-e ARMADA_QUEUE="$QUEUE" \
 	-e ARMADA_NAMESPACE="${ARMADA_NAMESPACE:-default}" \
 	${ARMADA_EXPOSE:+-e ARMADA_EXPOSE="$ARMADA_EXPOSE"} \
