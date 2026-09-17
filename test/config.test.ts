@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { readConfig } from '../src/config.js';
+import { DEFAULT_IMAGE, readConfig } from '../src/config.js';
 import type { ArmadaConfig } from '../src/config.js';
 
 const baseEnv: Record<string, string> = {
@@ -8,6 +8,24 @@ const baseEnv: Record<string, string> = {
 	MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
 	ARMADA_AGENT_IMAGE: 'ghcr.io/example/kernel-agent:1',
 };
+
+describe('MARIMOHUB_COMPUTE_IMAGE', () => {
+	it("is marimo's published sandbox image when unset", () => {
+		const env: Record<string, string> = { ...baseEnv };
+		delete env.MARIMOHUB_COMPUTE_IMAGE;
+		expect(readConfig(env).image).toBe(DEFAULT_IMAGE);
+	});
+
+	it('takes the first of a list', () => {
+		expect(readConfig({ ...baseEnv, MARIMOHUB_COMPUTE_IMAGE: 'a:1, b:2' }).image).toBe('a:1');
+	});
+
+	it('refuses an empty value rather than silently defaulting', () => {
+		expect(() => readConfig({ ...baseEnv, MARIMOHUB_COMPUTE_IMAGE: '' })).toThrow(
+			'at least one image',
+		);
+	});
+});
 
 describe('ARMADA_EXPOSE', () => {
 	it('is a NodePort service unless told otherwise', () => {

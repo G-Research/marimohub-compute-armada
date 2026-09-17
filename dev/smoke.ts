@@ -35,7 +35,6 @@ import type {
 const config: ArmadaConfig = readConfig({
 	ARMADA_URL: 'http://localhost:30001',
 	ARMADA_QUEUE: 'marimohub',
-	MARIMOHUB_COMPUTE_IMAGE: 'marimo-sandbox:local',
 	ARMADA_AGENT_IMAGE: 'marimohub-kernel-agent:local',
 	// A secondary surface, so the pod declares a third port and the provider
 	// advertises multiPort; the checks below look at that port's address.

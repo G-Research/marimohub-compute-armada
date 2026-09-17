@@ -39,7 +39,7 @@ in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `ARMADA_URL`                         | yes      | Armada REST API base URL                              |
 | `ARMADA_QUEUE`                       | yes      | Queue jobs are submitted to                           |
 | `ARMADA_AGENT_IMAGE`                 | yes      | Kernel agent image, run as the init container         |
-| `MARIMOHUB_COMPUTE_IMAGE`            | yes      | Kernel image (first entry of the list)                |
+| `MARIMOHUB_COMPUTE_IMAGE`            | no       | Kernel image, first of the list (default marimo's)    |
 | `ARMADA_NAMESPACE`                   | no       | Pod namespace (default `default`)                     |
 | `ARMADA_LOOKOUT_URL`                 | no       | Lookout base URL; enables `listActive` reconciliation |
 | `ARMADA_PRIORITY_CLASS`              | no       | Use a non-preemptible class for interactive sessions  |
@@ -61,6 +61,8 @@ in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 Configuration is validated at startup, so a missing variable stops marimohub from
 booting rather than failing at the first session.
 
+`MARIMOHUB_COMPUTE_IMAGE` defaults to `ghcr.io/marimo-team/marimo-sandbox:latest`, marimo's
+own kernel image, as marimohub's kubernetes adapter defaults its own. It is public and amd64.
 `ARMADA_AGENT_IMAGE` has no default because the image is not published: build it from
 `agent/` for the architecture of the worker nodes (see Deployment). The agent port is
 exposed the same way as the kernel port, so whatever reaches one reaches the other.
@@ -152,9 +154,8 @@ export MARIMOHUB_COMPUTE_BACKEND=library
 export MARIMOHUB_COMPUTE_LIBRARY=/etc/marimohub/compute.mjs
 export ARMADA_URL=https://armada.example.com
 export ARMADA_QUEUE=marimohub
-# The two images that run in the cluster, per session: the kernel (marimo and uv)
-# and the agent in front of it. Neither is marimohub itself.
-export MARIMOHUB_COMPUTE_IMAGE=<registry>/marimo-sandbox:<tag>
+# The agent image runs in the cluster in front of each kernel; it is the one
+# thing you push yourself. The kernel image defaults to the one marimo publishes.
 export ARMADA_AGENT_IMAGE=<registry>/marimohub-kernel-agent:<tag>
 marimohub
 ```
@@ -166,22 +167,25 @@ reachable through a directory other users can write, so give a service account a
 a cache directory of its own. See marimohub's deployment docs for the rest. A bad Armada
 setting fails at startup here too, with the variable named.
 
-The two images need no registry when the cluster is a local kind one, because a kind
-node can be handed an image straight from your Docker daemon. Build both locally, load
-them into the node, and name them by their local tags:
+The kernel image, `MARIMOHUB_COMPUTE_IMAGE`, is `ghcr.io/marimo-team/marimo-sandbox:latest`
+unless set: marimo's own, public and amd64, with `latest-vscode`, `latest-opencode` and
+`latest-tools` variants for session surfaces. Any cluster whose nodes can pull from
+GitHub's registry can leave it alone; nothing about it is specific to this adapter. Set
+it to your own build of marimohub's `examples/sandbox-image` when the nodes are arm64,
+cannot reach the internet, or you want a pinned marimo.
+
+The agent image is the one thing this adapter adds to the cluster, so it is the one
+thing you must build and push. A real Armada cluster pulls from a registry its
+executors can reach. A local kind cluster needs no registry: a kind node can be handed
+an image straight from your Docker daemon.
 
 ```bash
 docker build -t marimohub-kernel-agent:local agent
-docker build -t marimo-sandbox:local path/to/marimohub/examples/sandbox-image
-kind load docker-image marimohub-kernel-agent:local marimo-sandbox:local --name armada
-
+kind load docker-image marimohub-kernel-agent:local --name armada
 export ARMADA_AGENT_IMAGE=marimohub-kernel-agent:local
-export MARIMOHUB_COMPUTE_IMAGE=marimo-sandbox:local
 ```
 
-A real Armada cluster pulls from a registry its executors can reach, so there the
-images must be pushed and named by their registry path. `dev/run-native.sh` scripts the
-local arrangement end to end, including the load; see
+`dev/run-native.sh` scripts the local arrangement end to end, including the load; see
 [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md), which also covers the case where
 `kind load` trips over a multi-platform image.
 
