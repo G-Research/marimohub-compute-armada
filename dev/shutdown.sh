@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Stop everything the dev loop started: the marimohub container and the kind
-# cluster with Armada in it. Images and the marimohub data volume are kept, so
-# the next `make kind-all` and `dev/run-local.sh` are faster and the notebooks
-# survive; pass --purge to drop those too.
+# cluster with Armada in it. Images, the marimohub data volume, and the binary
+# and data directory of dev/run-native.sh are kept, so the next `make kind-all`
+# and run script are faster and the notebooks survive; pass --purge to drop
+# those too. A native run is a foreground process: Ctrl-C ends it.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -31,7 +32,7 @@ if $PURGE; then
 	echo "==> purging"
 	docker volume rm marimohub-armada-data >/dev/null 2>&1 && echo "    removed volume marimohub-armada-data" || true
 	docker rmi marimohub-armada:dev marimohub-kernel-agent:local marimo-sandbox:local >/dev/null 2>&1 && echo "    removed dev images" || true
-	rm -rf dev/tls && echo "    removed dev/tls"
+	rm -rf dev/tls dev/data dev/bin && echo "    removed dev/tls, dev/data and dev/bin"
 fi
 
 echo "==> left running"

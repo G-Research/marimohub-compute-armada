@@ -4,3 +4,5 @@ dist/
 .DS_Store
 /agent/agent
 /dev/tls/
+/dev/bin/
+/dev/data/

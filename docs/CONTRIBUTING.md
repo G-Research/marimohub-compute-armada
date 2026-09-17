@@ -97,6 +97,13 @@ marimohub runs as an ordinary Docker container, not inside Kubernetes, joined to
 `kind` network so it can reach the NodePort addresses Armada reports. macOS cannot
 route to those addresses, which is why the smoke script runs in a container too.
 
+On a Linux host there is a shorter loop: `dev/run-native.sh` runs marimohub's
+standalone `marimohub-linux-x64` binary on the host itself, pointed at `dist/index.js`,
+with no marimohub image to build and nothing under emulation. The host reaches Armada
+on the port kind maps to `localhost:30001` and the kernel pods on the docker network
+directly. Both scripts start the same configuration, so a session behaves the same
+whichever one you use.
+
 ### Apple Silicon
 
 Armada publishes amd64-only images, as does marimohub. Both run on an M-series Mac
@@ -205,10 +212,11 @@ directly.
 ### 4. Start marimohub with this adapter
 
 ```bash
-./dev/run-local.sh
+./dev/run-local.sh     # in a container, works everywhere
+./dev/run-native.sh    # on the host, Linux x86-64 only
 ```
 
-The script bundles the adapter, builds and imports the agent image, bakes the bundle
+`run-local.sh` bundles the adapter, builds and imports the agent image, bakes the bundle
 into `marimohub-armada:dev`, creates the `marimohub` queue, starts the container on
 port 3337 joined to the `kind` network with `fs` storage, `dev` auth and `proxy`
 sandbox exposure, and polls `/api/health` until it answers. No credential of any kind
@@ -216,6 +224,17 @@ is mounted. Override with `ARMADA_URL`, `ARMADA_QUEUE`, `ARMADA_NAMESPACE`, `POR
 `IMAGE`, `AGENT_IMAGE`, `CONTAINER`, `ARMADACTL` and `NODE`; `ARMADA_EXPOSE` and the
 `ARMADA_INGRESS_*` variables pass through too (step 6), as do `ARMADA_LOOKOUT_URL`, the
 two queue maps (step 7) and `MARIMOHUB_SURFACES`.
+
+`run-native.sh` does the same without the marimohub image: it downloads the release
+binary matching the Dockerfile's base image into `dev/bin/` once (checked against its
+published sha256), builds the bundle and the agent image, creates the queue, and runs
+the binary in the foreground with `MARIMOHUB_COMPUTE_LIBRARY` pointing at
+`dist/index.js`. The log is on the terminal and Ctrl-C stops it. Notebooks live in
+`dev/data/` and the binary unpacks itself under `~/.cache/marimohub-sea/`. The same
+variables apply, except `IMAGE` and `CONTAINER`; `DATA` moves the storage root, and
+since every variable in the environment reaches the process, anything the README lists
+can simply be exported. The two scripts keep separate storage (a Docker volume against
+`dev/data/`), so notebooks made under one are not seen by the other.
 
 ### 5. What you should see
 
@@ -237,6 +256,11 @@ available" with a Retry button; the real error is nested in the server log:
 docker logs marimohub-armada 2>&1 | grep request_error | tail -1 | jq -r '.error.cause.message'
 ```
 
+With `run-native.sh` the log is the terminal: pipe it to a file and `grep` that. A
+start in the first minute after `make kind-all` fails with `Number of nodes in
+cluster: 0`, because the executor has not reported the worker to the scheduler yet;
+Retry, or wait and start again.
+
 The `session_provision` log line reports each step's timing and which succeeded.
 marimohub compensates cleanly on a failed start, so Retry is safe.
 
@@ -248,7 +272,7 @@ Everything above reaches the pod over NodePorts. Production reaches it over an I
 ```bash
 ./dev/ingress-local.sh
 ARMADA_EXPOSE=ingress bun run smoke
-ARMADA_EXPOSE=ingress ./dev/run-local.sh
+ARMADA_EXPOSE=ingress ./dev/run-local.sh    # or ./dev/run-native.sh
 ```
 
 The script installs ingress-nginx from kind's manifest (pinned; its current version
@@ -322,7 +346,8 @@ docker logs -f marimohub-armada              # marimohub, including adapter erro
 
 Lookout UI: <http://localhost:30000>. To tear down, `./dev/shutdown.sh` removes the
 marimohub container and deletes the kind cluster; `./dev/shutdown.sh --purge` also drops the
-data volume, the dev images and `dev/tls`.
+data volume, the dev images, `dev/tls`, and the binary and data of `run-native.sh`
+(`dev/bin`, `dev/data`).
 
 ## Changing things
 
