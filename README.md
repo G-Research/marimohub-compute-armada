@@ -6,6 +6,13 @@ notebook kernels as [Armada](https://armadaproject.io/) jobs.
 Loaded through marimohub's external adapter library mode (`apiVersion: 1`), so it
 needs no changes to marimohub itself.
 
+## Status
+
+Nothing is published yet: no npm package, no marimohub image with the adapter in it, and no
+agent image. To try it, clone this repository and build both images yourself (see
+[Deployment](#deployment)); [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) walks through a
+full run against a local kind cluster. Publishing the agent image is planned, but not soon.
+
 ## How it works
 
 Armada is a batch meta-scheduler: you submit a job to a queue and it places the pod
@@ -54,10 +61,9 @@ in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 Configuration is validated at startup, so a missing variable stops marimohub from
 booting rather than failing at the first session.
 
-`ARMADA_AGENT_IMAGE` has no default because the image is not published anywhere
-public yet: build it from `agent/` for the architecture of the worker nodes (see
-Deployment). The agent port is exposed the same way as the kernel port, so whatever
-reaches one reaches the other.
+`ARMADA_AGENT_IMAGE` has no default because the image is not published: build it from
+`agent/` for the architecture of the worker nodes (see Deployment). The agent port is
+exposed the same way as the kernel port, so whatever reaches one reaches the other.
 
 `ARMADA_EXPOSE` decides how those two ports are reached. `nodeport` asks Armada for a
 NodePort service: plaintext HTTP on the cluster's own network, which is what a local
@@ -132,11 +138,9 @@ is transcribed from; everything added since 0.3.12 is optional, so that release 
   how one session flows through them.
 - [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): toolchain, checks, running the whole
   thing locally, and what to update when you change something.
-- [ARMADA-REVIEW.md](ARMADA-REVIEW.md): every design decision, with evidence cited
-  against the pinned Armada release, and what is still open.
-- [AGENT-DESIGN.md](AGENT-DESIGN.md): the design of the in-pod agent, written by an
-  Armada maintainer; built in full, kept for the reasoning.
+- [docs/DECISIONS.md](docs/DECISIONS.md): why the adapter is shaped the way it is, with
+  the evidence cited against the pinned Armada release, and what is left to a deployment.
 
 ## License
 
-Apache-2.0, see [LICENSE](LICENSE).
+Copyright 2026 G-Research. Apache-2.0, see [LICENSE](LICENSE).

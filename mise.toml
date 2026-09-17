@@ -1,0 +1,14 @@
+# Toolchain for building and checking this project. Run `mise install`.
+#
+# Versions mirror what the repo already pins elsewhere so there is one source
+# of truth per tool: Node in .node-version, Go in agent/go.mod, golangci-lint
+# in .github/workflows/ci.yml. Bump them together.
+[tools]
+# TypeScript adapter: bun build / bun test / bun run <script>. CI uses latest.
+bun = "latest"
+# Build target and the runtime marimohub loads dist/index.js with (package.json engines).
+node = "24"
+# Kernel agent under agent/. Must match the `go` directive in agent/go.mod.
+go = "1.26"
+# `bun run agent:lint` and `bun run fmt`. Must match the version in ci.yml.
+golangci-lint = "2.13.2"

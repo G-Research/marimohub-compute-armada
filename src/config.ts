@@ -59,7 +59,7 @@ export interface ArmadaConfig {
 	port: number;
 	/**
 	 * Image of the kernel agent, which an init container copies into the kernel
-	 * container (AGENT-DESIGN.md). Required: there is no public default yet, and
+	 * container (docs/ARCHITECTURE.md). Required: there is no public default yet, and
 	 * a wrong guess would fail at the first session rather than at startup.
 	 */
 	agentImage: string;
@@ -206,7 +206,7 @@ function readAuth(env: Record<string, string | undefined>): ArmadaAuth {
 /**
  * Ingress settings only mean something under `ARMADA_EXPOSE=ingress`; one set
  * beside a NodePort would be silently ignored, which is the kind of startup
- * mistake decision 15 exists to catch.
+ * mistake startup validation exists to catch.
  */
 function readExposure(env: Record<string, string | undefined>): Exposure {
 	const kind: string = env.ARMADA_EXPOSE ?? 'nodeport';
@@ -319,7 +319,7 @@ const DEFAULT_MAX_LIFETIME_SECONDS = 24 * 60 * 60;
 /**
  * Far past anything marimohub's own commands do, since a backstop that competes
  * with legitimate work is worse than none. The pod's own `activeDeadlineSeconds`
- * (decision 7) is the outer bound; this catches a wedged command long before it.
+ * is the outer bound; this catches a wedged command long before it.
  */
 const DEFAULT_COMMAND_MAX_SECONDS = 6 * 60 * 60;
 

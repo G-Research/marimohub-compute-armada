@@ -3,7 +3,12 @@
 	"version": "0.0.0",
 	"private": true,
 	"description": "marimohub compute adapter running notebook kernels as Armada jobs",
+	"homepage": "https://github.com/G-Research/marimohub-compute-armada#readme",
 	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/G-Research/marimohub-compute-armada.git"
+	},
 	"type": "module",
 	"scripts": {
 		"build": "bun build src/index.ts --target=node --format=esm --sourcemap=linked --outdir=dist",

@@ -12,10 +12,12 @@ How to build, check and run this adapter, and what to update when you change it.
 - **Go 1.26** builds the agent (`agent/go.mod`, standard library only). Any Go that
   honours the `go` directive fetches the right toolchain.
 - **golangci-lint v2.13+** lints and format-checks the agent (`agent/.golangci.yml`).
-  Install it with `brew install golangci-lint`, as the
-  [project recommends](https://golangci-lint.run/docs/welcome/install/local/#homebrew).
   A build older than the module's Go cannot typecheck it, so keep it current.
 - **Docker** and a **kind** cluster with Armada in it, for anything live.
+
+`mise.toml` pins the first four; `mise install` gets them in one go. Homebrew works
+just as well (`brew install golangci-lint`, and Bun, Node and Go from their own formulae
+or installers), as long as the versions match the ones `mise.toml` names.
 
 ## Commands
 
@@ -81,13 +83,13 @@ Pulsar, Postgres and Redis it depends on.
 ```mermaid
 flowchart TB
   subgraph docker[Docker on your machine]
-    hub["marimohub-armada: marimohub + this adapter, host port 3000"]
+    hub["marimohub-armada: marimohub + this adapter, host port 3337"]
     subgraph kind[kind cluster armada, docker network kind]
       cp[armada-control-plane]
       worker["armada-worker: Armada pods, kernel pods"]
     end
   end
-  hub -->|"host.docker.internal:30001"| cp
+  hub -->|"armada-control-plane:30001"| cp
   hub -->|"agent and kernel NodePorts, 172.18.x.x"| worker
 ```
 
@@ -149,8 +151,15 @@ docker save marimohub-kernel-agent:local |
 The import goes straight into the node's containerd because `kind load` trips over
 multi-platform manifests from Docker Desktop's containerd image store.
 
+Before submitting anything, confirm both images are in the node; a missing one leaves the
+pod in `ImagePullBackOff` until Armada fails the job a couple of minutes later:
+
+```bash
+docker exec armada-worker ctr -n k8s.io images ls -q | grep marimo
+```
+
 If you bring your own kernel image, it must provide `/bin/sh` and `git`
-(ARMADA-REVIEW.md, decision 22).
+(see [DECISIONS.md](DECISIONS.md)).
 
 ### 3. Check that placement works
 
@@ -160,7 +169,7 @@ bun run smoke -- --keep  # leave it running to poke at
 ```
 
 ```
-submitting smoke-mtr8nhti to queue "marimohub" at http://host.docker.internal:30001
+submitting smoke-mtr8nhti to queue "marimohub" at http://armada-control-plane:30001
   kernel image marimo-sandbox:local
   agent image  marimohub-kernel-agent:local
   agent   172.18.0.2:32114
@@ -201,7 +210,7 @@ directly.
 
 The script bundles the adapter, builds and imports the agent image, bakes the bundle
 into `marimohub-armada:dev`, creates the `marimohub` queue, starts the container on
-port 3000 joined to the `kind` network with `fs` storage, `dev` auth and `proxy`
+port 3337 joined to the `kind` network with `fs` storage, `dev` auth and `proxy`
 sandbox exposure, and polls `/api/health` until it answers. No credential of any kind
 is mounted. Override with `ARMADA_URL`, `ARMADA_QUEUE`, `ARMADA_NAMESPACE`, `PORT`,
 `IMAGE`, `AGENT_IMAGE`, `CONTAINER`, `ARMADACTL` and `NODE`; `ARMADA_EXPOSE` and the
@@ -210,7 +219,7 @@ two queue maps (step 7) and `MARIMOHUB_SURFACES`.
 
 ### 5. What you should see
 
-marimohub comes up at <http://localhost:3000>, signed in as the dev user. Browsing and
+marimohub comes up at <http://localhost:3337>, signed in as the dev user. Browsing and
 creating notebooks never touch compute. Opening a notebook runs the whole provision
 sequence: the job is submitted, the pod runs, the agent answers, files and environment
 go in, `uv sync` runs, the kernel is started as the agent's own child and its port is
@@ -267,7 +276,7 @@ the cluster a second queue and tell the smoke whose sandbox it is submitting:
 
 ```bash
 ./bin/app/armadactl create queue marimohub-team-b   # in armada-operator; wait ~10s
-ARMADA_LOOKOUT_URL=http://host.docker.internal:30000 \
+ARMADA_LOOKOUT_URL=http://armada-control-plane:30000 \
 ARMADA_QUEUE_BY_PROJECT='{"proj-b":"marimohub-team-b"}' \
 SMOKE_OWNER_PROJECT=proj-b bun run smoke
 ```
@@ -283,13 +292,13 @@ Lookout, then `listActive` no longer showing it. A submit in the first seconds a
 has not refreshed yet; run it again.
 
 The same through the hub, which names the owner from 0.4.0 onwards (the Dockerfile's base
-image is 0.4.2). Map the dev project's id, the `id` in `curl localhost:3000/api/v1/projects`,
+image is 0.4.2). Map the dev project's id, the `id` in `curl localhost:3337/api/v1/projects`,
 restart, and start a session through the API (dev auth accepts a bare request):
 
 ```bash
-ARMADA_LOOKOUT_URL=http://host.docker.internal:30000 \
+ARMADA_LOOKOUT_URL=http://armada-control-plane:30000 \
 ARMADA_QUEUE_BY_PROJECT='{"<project id>":"marimohub-team-b"}' ./dev/run-local.sh
-curl -X POST localhost:3000/api/v1/projects/<pid>/notebooks/<nid>/sessions \
+curl -X POST localhost:3337/api/v1/projects/<pid>/notebooks/<nid>/sessions \
   -H 'content-type: application/json' -d '{}'
 ```
 
@@ -311,8 +320,9 @@ kubectl get pods -n default                  # kernel pods
 docker logs -f marimohub-armada              # marimohub, including adapter errors
 ```
 
-Lookout UI: <http://localhost:30000>. To tear down: `docker rm -f marimohub-armada`,
-then `make kind-delete-cluster` in armada-operator.
+Lookout UI: <http://localhost:30000>. To tear down, `./dev/shutdown.sh` removes the
+marimohub container and deletes the kind cluster; `./dev/shutdown.sh --purge` also drops the
+data volume, the dev images and `dev/tls`.
 
 ## Changing things
 
@@ -320,13 +330,15 @@ then `make kind-delete-cluster` in armada-operator.
   `packages/compute-kubernetes` and `packages/compute-commons` are the reference for
   every sandbox operation, and its compute contract tests are the behavioural
   authority. Check the consumers of a result before choosing its shape.
-- **Every design decision goes in ARMADA-REVIEW.md**, numbered, with the evidence
-  cited against the Armada source at the release in `.armada-version`. A deliberate
-  divergence from upstream is recorded there too. If a decision is superseded, add a
-  note at its head and keep the text.
+- **Every design decision goes in `docs/DECISIONS.md`**, with the evidence cited
+  against the Armada source at the release in `.armada-version`. A deliberate
+  divergence from marimohub's own adapters is recorded there too. When a decision is
+  replaced, rewrite it rather than appending a note: the file records the design as it
+  is, not its history.
 - **Verify live before calling it done.** Unit tests stub the channel; the smoke run
   and a notebook session in a browser are what prove a change against a real Armada.
-  Add what you verified to the list in ARMADA-REVIEW.md.
+  If a change rests on something not yet verified, add it to the list at the end of
+  `docs/DECISIONS.md`.
 - **Keep the docs current.** `docs/ARCHITECTURE.md` when the shape changes, this
   file when the dev loop changes, the README's configuration table when a variable
   is added.

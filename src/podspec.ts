@@ -2,7 +2,7 @@
  * The podspec we submit for one kernel session.
  *
  * Armada validates submissions strictly, and the rules that shape this file are
- * documented in ARMADA-REVIEW.md with citations. The ones that bite:
+ * documented in docs/DECISIONS.md with citations. The ones that bite:
  *
  * - Resource requests must equal limits, and every container must set both,
  *   init containers included. A server may insist an init container's CPU is

@@ -209,7 +209,7 @@ check(
 
 // Abandon two commands on purpose, then look for what they left behind. The
 // agent kills a command's process group when its deadline passes or its
-// caller disconnects (decisions 23, 24 and 28); a timed-out exec and a
+// caller disconnects; a timed-out exec and a
 // cancelled stream are the two ways the adapter abandons one. Both are
 // provoked here before the leak check runs, because a check that never
 // provokes the failure it looks for reports a clean pod either way.

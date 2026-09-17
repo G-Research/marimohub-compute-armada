@@ -440,7 +440,7 @@ export class ArmadaSandbox implements SandboxInstance {
 
 	/**
 	 * The URL is the address Armada assigned, never a hostname we template, so
-	 * `options.hostname` is deliberately ignored (decision 13: Armada names the
+	 * `options.hostname` is deliberately ignored (Armada names the
 	 * host, we read it from the event stream). The scheme follows the submit:
 	 * plain http to a NodePort on the cluster network, https to an Ingress
 	 * hostname when its TLS is on (`ARMADA_EXPOSE`).

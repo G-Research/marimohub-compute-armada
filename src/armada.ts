@@ -367,7 +367,7 @@ export class ArmadaClient {
 	 * Every sandbox with a live job, for marimohub's reconciler.
 	 *
 	 * Asked of Lookout, not the Armada server, because the server has no "list
-	 * the jobs I own" call at all (decision 4). Lookout is the component that
+	 * the jobs I own" call at all. Lookout is the component that
 	 * aggregates jobs across every executor cluster, so this needs no cluster
 	 * inventory, and it sees jobs still QUEUED, which have no pod anywhere yet.
 	 * The answer is scoped by the mark alone, not by queue: a job is this
