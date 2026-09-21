@@ -129,3 +129,59 @@ describe('surface ports', () => {
 		expect(exposedPorts(spec)).toEqual([2718, 8718, 8443, 4096]);
 	});
 });
+
+describe('image pull secrets', () => {
+	it('are absent from the spec unless configured', () => {
+		expect('imagePullSecrets' in buildPodSpec(config, agent)).toBe(false);
+	});
+
+	it('name every configured secret on the pod, since the cluster pulls both images', () => {
+		const pulled: ArmadaConfig = readConfig({
+			...baseEnv,
+			ARMADA_IMAGE_PULL_SECRETS: 'ghcr-pull,quay-pull',
+		});
+		expect(buildPodSpec(pulled, agent).imagePullSecrets).toEqual([
+			{ name: 'ghcr-pull' },
+			{ name: 'quay-pull' },
+		]);
+	});
+});
+
+describe('security context', () => {
+	it('is absent from the spec unless an id is configured', () => {
+		const spec: V1PodSpec = buildPodSpec(config, agent);
+		expect('securityContext' in spec).toBe(false);
+		// Nothing container-level either: the ids belong to the pod as a whole.
+		expect(spec.containers[0]?.securityContext).toBeUndefined();
+		expect(spec.initContainers?.[0]?.securityContext).toBeUndefined();
+	});
+
+	it('is pod-level and carries only the ids that are set', () => {
+		const user: ArmadaConfig = readConfig({ ...baseEnv, ARMADA_RUN_AS_USER: '1000' });
+		expect(buildPodSpec(user, agent).securityContext).toEqual({ runAsUser: 1000 });
+
+		const all: ArmadaConfig = readConfig({
+			...baseEnv,
+			ARMADA_RUN_AS_USER: '1000',
+			ARMADA_RUN_AS_GROUP: '0',
+			ARMADA_FS_GROUP: '2000',
+		});
+		expect(buildPodSpec(all, agent).securityContext).toEqual({
+			runAsUser: 1000,
+			runAsGroup: 0,
+			fsGroup: 2000,
+		});
+	});
+
+	it('leaves the spec exactly what it was when nothing is configured', () => {
+		const spec: V1PodSpec = buildPodSpec(config, agent);
+		expect(Object.keys(spec)).toEqual([
+			'restartPolicy',
+			'terminationGracePeriodSeconds',
+			'activeDeadlineSeconds',
+			'volumes',
+			'initContainers',
+			'containers',
+		]);
+	});
+});

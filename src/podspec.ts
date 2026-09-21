@@ -20,7 +20,7 @@
  * behind. An init container copies it from its own image into a volume, so the
  * operator's kernel image is used unchanged.
  */
-import type { V1PodSpec } from '@kubernetes/client-node';
+import type { V1PodSecurityContext, V1PodSpec } from '@kubernetes/client-node';
 import type { ArmadaConfig } from './config.js';
 import type { ComputeResources, CreateSandboxOptions } from './types.js';
 
@@ -66,12 +66,29 @@ function quantities(resources: ComputeResources | undefined): Record<string, str
 	return requested;
 }
 
+/**
+ * The pod-level `securityContext`, carrying only the ids that are configured,
+ * or nothing when none is so the spec stays exactly what it was before these
+ * existed. Pod-level, not container-level: the init container that copies the
+ * agent must run with the same ids as the kernel container, or the copy is
+ * owned by someone the kernel is not.
+ */
+function securityContext(config: ArmadaConfig): V1PodSecurityContext | undefined {
+	const context: V1PodSecurityContext = {
+		...(config.runAsUser === undefined ? {} : { runAsUser: config.runAsUser }),
+		...(config.runAsGroup === undefined ? {} : { runAsGroup: config.runAsGroup }),
+		...(config.fsGroup === undefined ? {} : { fsGroup: config.fsGroup }),
+	};
+	return Object.keys(context).length === 0 ? undefined : context;
+}
+
 export function buildPodSpec(
 	config: ArmadaConfig,
 	agent: AgentSpec,
 	options?: CreateSandboxOptions,
 ): V1PodSpec {
 	const resources: Record<string, string> = quantities(options?.resources);
+	const context: V1PodSecurityContext | undefined = securityContext(config);
 
 	return {
 		restartPolicy: 'Never',
@@ -80,6 +97,15 @@ export function buildPodSpec(
 		...(config.priorityClassName === undefined
 			? {}
 			: { priorityClassName: config.priorityClassName }),
+		// The worker cluster pulls both images, so the credential is named here.
+		...(config.imagePullSecrets.length === 0
+			? {}
+			: {
+					imagePullSecrets: config.imagePullSecrets.map((name: string): { name: string } => ({
+						name,
+					})),
+				}),
+		...(context === undefined ? {} : { securityContext: context }),
 		volumes: [{ name: AGENT_VOLUME, emptyDir: {} }],
 		initContainers: [
 			{
