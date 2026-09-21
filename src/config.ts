@@ -66,6 +66,26 @@ export interface ArmadaConfig {
 	/** Port the agent listens on inside the pod, exposed next to the kernel's. */
 	agentPort: number;
 	/**
+	 * Names of secrets in `namespace` the pod pulls its images with. Both the
+	 * kernel image and the agent image are pulled by the worker cluster, never by
+	 * marimohub, so a private registry needs a credential that cluster holds and
+	 * the pod names. Empty means anonymous pulls.
+	 */
+	imagePullSecrets: string[];
+	/**
+	 * Pod-level `securityContext` ids, each unset unless the environment says so.
+	 * A cluster may run an admission policy that rejects a pod which does not say
+	 * who it runs as. Pod-level rather than container-level so the init container
+	 * that copies the agent runs with the same ids as the kernel container.
+	 *
+	 * `fsGroup` matters as much as `runAsUser`: the agent's volume is an
+	 * `emptyDir`, mounted root-owned, so a non-root user can only have the agent
+	 * written into it when the volume is group-owned by a group the pod runs with.
+	 */
+	runAsUser?: number | undefined;
+	runAsGroup?: number | undefined;
+	fsGroup?: number | undefined;
+	/**
 	 * Ports of marimohub's enabled secondary surfaces (VS Code, OpenCode),
 	 * declared on every pod and exposed like the kernel's, so `exposePort` can
 	 * answer for them. Read from marimohub's own `MARIMOHUB_SURFACES` and
@@ -153,6 +173,42 @@ function optionalSeconds(
 		throw new Error(`${name} must be a whole number of seconds, got: ${raw}`);
 	}
 	return value;
+}
+
+/**
+ * A uid or gid for the pod's `securityContext`. Absent means the field is
+ * left out and the cluster decides; zero is root, a real answer, so the only
+ * rejects are a non-integer or a negative. No default: a guessed uid is wrong
+ * on every cluster that does not need one, and which uid a kernel image
+ * tolerates is a property of that image.
+ */
+function optionalId(env: Record<string, string | undefined>, name: string): number | undefined {
+	const raw: string | undefined = env[name];
+	if (raw === undefined) return undefined;
+	// Number('') is 0, which would make a blank value root.
+	const value: number = raw.trim() === '' ? Number.NaN : Number(raw);
+	if (!Number.isInteger(value) || value < 0) {
+		throw new Error(`${name} must be a whole number, got: ${raw}`);
+	}
+	return value;
+}
+
+/**
+ * Comma-separated secret names. Set but naming nothing is refused: an empty
+ * list would silently pull anonymously and fail at the first session rather
+ * than at startup.
+ */
+function readImagePullSecrets(env: Record<string, string | undefined>): string[] {
+	const raw: string | undefined = env.ARMADA_IMAGE_PULL_SECRETS;
+	if (raw === undefined) return [];
+	const names: string[] = raw
+		.split(',')
+		.map((name: string) => name.trim())
+		.filter((name: string) => name !== '');
+	if (names.length === 0) {
+		throw new Error('ARMADA_IMAGE_PULL_SECRETS must name at least one secret');
+	}
+	return names;
 }
 
 /**
@@ -356,6 +412,10 @@ export function readConfig(
 		port: optionalPort(env, 'ARMADA_KERNEL_PORT', 2718),
 		agentImage: required(env, 'ARMADA_AGENT_IMAGE'),
 		agentPort: optionalPort(env, 'ARMADA_AGENT_PORT', 8718),
+		imagePullSecrets: readImagePullSecrets(env),
+		runAsUser: optionalId(env, 'ARMADA_RUN_AS_USER'),
+		runAsGroup: optionalId(env, 'ARMADA_RUN_AS_GROUP'),
+		fsGroup: optionalId(env, 'ARMADA_FS_GROUP'),
 		surfacePorts: readSurfacePorts(env),
 		lookoutUrl: optionalUrl(env, 'ARMADA_LOOKOUT_URL'),
 		maxLifetimeSeconds:

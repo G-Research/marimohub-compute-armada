@@ -45,6 +45,10 @@ in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `ARMADA_PRIORITY_CLASS`              | no       | Use a non-preemptible class for interactive sessions  |
 | `ARMADA_KERNEL_PORT`                 | no       | Port marimo serves on (default `2718`)                |
 | `ARMADA_AGENT_PORT`                  | no       | Port the agent listens on (default `8718`)            |
+| `ARMADA_IMAGE_PULL_SECRETS`          | no       | Comma-separated secret names for private registries   |
+| `ARMADA_RUN_AS_USER`                 | no       | Pod `securityContext.runAsUser`, a uid                |
+| `ARMADA_RUN_AS_GROUP`                | no       | Pod `securityContext.runAsGroup`, a gid               |
+| `ARMADA_FS_GROUP`                    | no       | Pod `securityContext.fsGroup`; owns the agent volume  |
 | `ARMADA_COMMAND_MAX_SECONDS`         | no       | Backstop for one exec (default `21600`, `0` off)      |
 | `ARMADA_EXPOSE`                      | no       | `nodeport` (default) or `ingress`, for both ports     |
 | `ARMADA_INGRESS_TLS`                 | no       | `true` (default) or `false`; ingress only             |
@@ -66,6 +70,24 @@ own kernel image, as marimohub's kubernetes adapter defaults its own. It is publ
 `ARMADA_AGENT_IMAGE` has no default because the image is not published: build it from
 `agent/` for the architecture of the worker nodes (see Deployment). The agent port is
 exposed the same way as the kernel port, so whatever reaches one reaches the other.
+
+Both images are pulled by the worker cluster, never by marimohub, so a private registry
+needs a credential the cluster holds: `ARMADA_IMAGE_PULL_SECRETS` names one or more
+secrets in `ARMADA_NAMESPACE`, and every pod lists them as `imagePullSecrets`. A secret's
+registry host must match the image reference's host exactly (`ghcr.io` is not
+`https://ghcr.io/v2/`); a mismatch does not fail at startup, it surfaces later as
+`ImagePullBackOff` on the pod.
+
+A cluster may run an admission policy that rejects a pod which does not say who it runs
+as (the failure is literally `runAsUser not specified`). `ARMADA_RUN_AS_USER`,
+`ARMADA_RUN_AS_GROUP` and `ARMADA_FS_GROUP` fill the pod-level `securityContext`, so the
+init container that copies the agent runs with the same ids as the kernel. None has a
+default: a guessed uid is wrong on every cluster that does not need one, and which uid a
+kernel image tolerates is a property of that image. `ARMADA_FS_GROUP` matters as much as
+`ARMADA_RUN_AS_USER`: the agent's volume is an `emptyDir`, mounted root-owned, so a
+non-root user cannot have the agent written into it unless the volume is group-owned by
+a group the pod runs with. Without `fsGroup`, the init container's `agent install` fails
+with a permission error before the kernel ever starts.
 
 `ARMADA_EXPOSE` decides how those two ports are reached. `nodeport` asks Armada for a
 NodePort service: plaintext HTTP on the cluster's own network, which is what a local

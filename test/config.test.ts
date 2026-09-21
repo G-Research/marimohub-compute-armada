@@ -138,3 +138,67 @@ describe('surface ports', () => {
 		).toThrow('MARIMOHUB_SURFACE_VSCODE_PORT must be a port number');
 	});
 });
+
+describe('ARMADA_IMAGE_PULL_SECRETS', () => {
+	it('is empty when unset, so images are pulled anonymously', () => {
+		expect(readConfig(baseEnv).imagePullSecrets).toEqual([]);
+	});
+
+	it('splits on commas, trims each name and drops empty entries', () => {
+		expect(
+			readConfig({ ...baseEnv, ARMADA_IMAGE_PULL_SECRETS: ' ghcr-pull , , quay-pull' })
+				.imagePullSecrets,
+		).toEqual(['ghcr-pull', 'quay-pull']);
+	});
+
+	it('refuses a value that names nothing rather than silently pulling anonymously', () => {
+		expect(() => readConfig({ ...baseEnv, ARMADA_IMAGE_PULL_SECRETS: '' })).toThrow(
+			'ARMADA_IMAGE_PULL_SECRETS must name at least one secret',
+		);
+		expect(() => readConfig({ ...baseEnv, ARMADA_IMAGE_PULL_SECRETS: ' , ' })).toThrow(
+			'ARMADA_IMAGE_PULL_SECRETS must name at least one secret',
+		);
+	});
+});
+
+describe('security context ids', () => {
+	it('are all unset unless the environment says otherwise', () => {
+		const config: ArmadaConfig = readConfig(baseEnv);
+		expect(config.runAsUser).toBeUndefined();
+		expect(config.runAsGroup).toBeUndefined();
+		expect(config.fsGroup).toBeUndefined();
+	});
+
+	it('read each id independently, zero included', () => {
+		const config: ArmadaConfig = readConfig({
+			...baseEnv,
+			ARMADA_RUN_AS_USER: '1000',
+			ARMADA_RUN_AS_GROUP: '0',
+			ARMADA_FS_GROUP: '2000',
+		});
+		expect(config.runAsUser).toBe(1000);
+		expect(config.runAsGroup).toBe(0);
+		expect(config.fsGroup).toBe(2000);
+
+		expect(readConfig({ ...baseEnv, ARMADA_FS_GROUP: '2000' })).toMatchObject({
+			runAsUser: undefined,
+			runAsGroup: undefined,
+			fsGroup: 2000,
+		});
+	});
+
+	it('reject anything that is not a whole number', () => {
+		expect(() => readConfig({ ...baseEnv, ARMADA_RUN_AS_USER: 'nobody' })).toThrow(
+			'ARMADA_RUN_AS_USER must be a whole number, got: nobody',
+		);
+		expect(() => readConfig({ ...baseEnv, ARMADA_RUN_AS_GROUP: '-1' })).toThrow(
+			'ARMADA_RUN_AS_GROUP must be a whole number, got: -1',
+		);
+		expect(() => readConfig({ ...baseEnv, ARMADA_FS_GROUP: '1.5' })).toThrow(
+			'ARMADA_FS_GROUP must be a whole number, got: 1.5',
+		);
+		expect(() => readConfig({ ...baseEnv, ARMADA_FS_GROUP: '' })).toThrow(
+			'ARMADA_FS_GROUP must be a whole number, got: ',
+		);
+	});
+});
