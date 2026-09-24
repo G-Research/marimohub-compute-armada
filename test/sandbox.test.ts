@@ -752,6 +752,23 @@ describe('failed reads', () => {
 		expect(logged().join('\n')).not.toContain(token);
 	});
 
+	it('mask the token in the path as well as in the reason', async () => {
+		const box: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			channel: {
+				readFileBounded: async (path: string) => ({
+					outcome: 'failed',
+					message: `HTTP 500: ${path} is not a regular file`,
+				}),
+			},
+		});
+		const token: string = agentToken('test-secret-of-at-least-32-characters', 'sandbox-1');
+		await box.sandbox.readFileBounded(`/work/${token}.py`, budget);
+
+		expect(logged()).toEqual([
+			'marimohub-compute-armada: sandbox sandbox-1 could not read /work/<token>.py (READ_FAILED): HTTP 500: /work/<token>.py is not a regular file',
+		]);
+	});
+
 	it('keep to one line when the path or the reason holds a newline', async () => {
 		const { sandbox } = stubSandbox(ok, {
 			channel: {

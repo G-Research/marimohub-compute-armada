@@ -466,7 +466,8 @@ export class ArmadaSandbox implements SandboxInstance {
 	 * session whose notebook is left out commits nothing and is then destroyed,
 	 * so this line is the only trace of edits lost that way. `NOT_FOUND` never
 	 * comes here: capture reads paths that routinely do not exist. The token is
-	 * masked in case a transport error ever quotes a header, and control
+	 * masked anywhere in the line, in case a transport error ever quotes a
+	 * header or a path happens to hold it, and control
 	 * characters are escaped, since a workspace file name may hold a newline.
 	 */
 	private readFailed(
@@ -474,10 +475,8 @@ export class ArmadaSandbox implements SandboxInstance {
 		code: 'READ_FAILED' | 'BACKEND_ERROR',
 		why: string,
 	): ReadFileResult {
-		const said: string = why.replaceAll(this.token, '<token>');
-		console.warn(
-			`marimohub-compute-armada: sandbox ${this.id} could not read ${oneLine(path)} (${code}): ${oneLine(said)}`,
-		);
+		const line: string = `marimohub-compute-armada: sandbox ${this.id} could not read ${oneLine(path)} (${code}): ${oneLine(why)}`;
+		console.warn(line.replaceAll(this.token, '<token>'));
 		return { success: false, content: '', error: { code } };
 	}
 
