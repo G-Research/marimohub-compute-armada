@@ -15,7 +15,8 @@ line.
 The adapter runs inside marimohub's own process with its privileges, and the kernel agent
 (`agent/`) is a command runner reachable over HTTP inside every kernel pod, guarded by a
 per-session token. Anything that lets a caller run a command in a pod without that token,
-reach a pod other than its own, or recover the token from the pod spec, is in scope. So is
+reach a pod other than its own, recover the token from the pod spec, or derive one without
+`ARMADA_AGENT_TOKEN_SECRET`, is in scope. So is
 anything that lets a job set, queue or Lookout answer be confused between two sandboxes or
 two installations. How the agent port is exposed and restricted in a given deployment is
 described in the README's Deployment section and in `docs/DECISIONS.md`.

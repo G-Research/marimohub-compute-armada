@@ -75,15 +75,20 @@ queue) as an annotation, which is what both Lookout queries filter on.
 that reaches into a pod. It has `ready`, which polls the agent's health endpoint until
 the route to the pod works; `run` and `stream`, which execute a shell command and
 collect or forward its output; and typed operations for the rest: `writeFile`,
-`readFile` and `listFiles` carry bytes to and from the agent's `/files` endpoints, and
-`startProcess`, `waitForPort`, `processLogs` and `signalProcess` drive a detached
-process the agent parents.
+`readFile`, `readFileBounded` and `listFiles` carry bytes to and from the agent's
+`/files` endpoints, and `startProcess`, `waitForPort`, `processLogs` and
+`signalProcess` drive a detached process the agent parents.
 
 `src/sandbox.ts` sits above the channel. Running user code is still a shell command
 (`exec`, `execStream`, and the quoted `git clone`), so `src/shell.ts` keeps the env
 prefix and quoting for that, transcribed from marimohub's own Kubernetes adapter.
 Everything else, files and the kernel's lifecycle, goes to the agent's typed endpoints
 rather than through a shell, so no path is quoted and no content is wrapped in base64.
+The provider remembers the job, pod and agent channel of every sandbox it has reached,
+because marimohub makes a fresh instance for each call and each would otherwise resolve the
+pod from the start. A read that fails for any reason but a missing file is the one thing
+it logs, because marimohub drops such a file silently and the edits in it are lost
+([DECISIONS.md](DECISIONS.md)).
 
 ## The agent
 
@@ -115,13 +120,17 @@ It does five things:
   the process group, so stopping the kernel takes whatever it spawned with it.
 - **Reads and writes files.** `/files` carries bytes raw in the request or response
   body and takes the path as a query parameter, so nothing is quoted for a shell or
-  wrapped in base64.
+  wrapped in base64. `/files/bounded` is the read session capture uses: it refuses a
+  symlink anywhere in the path, anything but a regular file, and a file over the
+  caller's byte budget, and answers by the caller's deadline.
 - **Kills what its caller abandoned and checks the caller.** When a request ends,
   because the caller disconnected or the deadline passed, the agent `SIGTERM`s the
   command's process group and `SIGKILL`s it five seconds later; a Kubernetes exec could
   never do this, and it is why `/exec` streams. Every request carries a bearer token,
-  and the pod spec holds only its SHA-256 (`MH_AGENT_TOKEN_SHA256`), because the spec is
-  readable through Armada's API and an env var is inherited by every process in the pod.
+  derived from the sandbox id and `ARMADA_AGENT_TOKEN_SECRET` so that any marimohub
+  process can reach any pod. The pod spec holds only its SHA-256
+  (`MH_AGENT_TOKEN_SHA256`), because the spec is readable through Armada's API and an
+  env var is inherited by every process in the pod.
 - **Is PID 1.** It reaps orphaned zombies, so a crashed kernel is collected rather
   than left looking alive, and it forwards `SIGTERM` to every process when Kubernetes
   stops the container, inside the pod's grace period.
@@ -136,7 +145,7 @@ sequenceDiagram
   participant G as agent (in the pod)
   participant K as marimo (in the pod)
   H->>A: create sandbox, ready()
-  A->>A: mint token, hash it into the pod spec
+  A->>A: derive token from the sandbox id, hash it into the pod spec
   A->>R: submit job: two ports, init container, volume
   R-->>A: event: running
   R-->>A: event: address for 2718, address for 8718
@@ -152,7 +161,7 @@ sequenceDiagram
   A-->>H: the address Armada reported
   H->>K: kernel traffic while the user works
   H->>A: read files back, destroy
-  A->>G: GET /files: bytes in the body
+  A->>G: GET /files/bounded: bytes within a budget and a deadline (GET /files up to v0.4.10)
   A->>R: cancel job
 ```
 

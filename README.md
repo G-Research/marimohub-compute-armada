@@ -39,6 +39,7 @@ in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `ARMADA_URL`                         | yes      | Armada REST API base URL                              |
 | `ARMADA_QUEUE`                       | yes      | Queue jobs are submitted to                           |
 | `ARMADA_AGENT_IMAGE`                 | yes      | Kernel agent image, run as the init container         |
+| `ARMADA_AGENT_TOKEN_SECRET`          | yes      | Key agent tokens derive from; 32+ chars, shared       |
 | `MARIMOHUB_COMPUTE_IMAGE`            | no       | Kernel image, first of the list (default marimo's)    |
 | `ARMADA_NAMESPACE`                   | no       | Pod namespace (default `default`)                     |
 | `ARMADA_LOOKOUT_URL`                 | no       | Lookout base URL; enables `listActive` reconciliation |
@@ -70,6 +71,16 @@ own kernel image, as marimohub's kubernetes adapter defaults its own. It is publ
 `ARMADA_AGENT_IMAGE` has no default because the image is not published: build it from
 `agent/` for the architecture of the worker nodes (see Deployment). The agent port is
 exposed the same way as the kernel port, so whatever reaches one reaches the other.
+
+`ARMADA_AGENT_TOKEN_SECRET` is the key each sandbox's agent token is derived from, with
+the sandbox id. Generate it once (`openssl rand -hex 32`) and give every marimohub process
+running the adapter the same value: marimohub stops and snapshots a session through
+whichever process gets there, and a process with a different secret is refused by the
+pod. Changing it cuts every running session off from its agent, so their edits can no
+longer be saved; rotate it when no sessions are running. The same holds once for the
+upgrade that introduced it: pods started by an earlier version carry a random token no
+process can derive, so upgrade with no sessions running, or expect those sessions' last
+edits to be lost when they end.
 
 Both images are pulled by the worker cluster, never by marimohub, so a private registry
 needs a credential the cluster holds: `ARMADA_IMAGE_PULL_SECRETS` names one or more
@@ -148,7 +159,8 @@ Two images:
   nodes (or both, with `buildx`); it runs there, not where marimohub runs.
 
 The agent authenticates every request with a per-session token whose hash travels in
-the pod spec. It is exposed exactly as the kernel port is: over a NodePort that is
+the pod spec; the token is derived from `ARMADA_AGENT_TOKEN_SECRET`, so that secret is
+what guards every agent. It is exposed exactly as the kernel port is: over a NodePort that is
 plaintext HTTP on the cluster network, over an ingress it is a public HTTPS hostname.
 Restrict the ingress to marimohub's egress address in the latter case, through
 `ARMADA_INGRESS_ANNOTATIONS` or the executor's cluster-wide ingress annotations.
@@ -179,6 +191,11 @@ export ARMADA_QUEUE=marimohub
 # The agent image runs in the cluster in front of each kernel; it is the one
 # thing you push yourself. The kernel image defaults to the one marimo publishes.
 export ARMADA_AGENT_IMAGE=<registry>/marimohub-kernel-agent:<tag>
+# The key agent tokens derive from: generated once, then kept, because every
+# process running the adapter needs the same one, across restarts too.
+[ -f ~/.config/marimohub/agent-token-secret ] ||
+  (umask 077 && mkdir -p ~/.config/marimohub && openssl rand -hex 32 >~/.config/marimohub/agent-token-secret)
+export ARMADA_AGENT_TOKEN_SECRET="$(cat ~/.config/marimohub/agent-token-secret)"
 marimohub
 ```
 

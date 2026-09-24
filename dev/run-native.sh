@@ -62,6 +62,10 @@ mkdir -p "$DATA"
 
 # Same settings as dev/run-local.sh: `fs` storage, `dev` auth and `proxy`
 # sandbox exposure, so a session behaves the same whichever script started it.
+# This process runs marimohub's maintenance loops, without which no session is
+# ever snapshotted or reaped for idleness, and it snapshots every 5s rather than
+# every 2 minutes, so an edit reaches dev/data while you watch; the sweep that
+# fires the snapshot runs as often, or its 60s default would set the pace.
 # The proxy is not needed for routing here (the browser could reach the
 # NodePort address itself) but it keeps the kernel same-origin with the app.
 #
@@ -81,9 +85,13 @@ exec env \
 	MARIMOHUB_SANDBOX_EXPOSURE=proxy \
 	MARIMOHUB_SANDBOX_PROXY_ACK_UNTRUSTED=true \
 	MARIMOHUB_AUTH_SESSION_SECRET="${MARIMOHUB_AUTH_SESSION_SECRET:-armada-dev-only-proxy-secret}" \
+	MARIMOHUB_RUN_MAINTENANCE=true \
+	MARIMOHUB_SESSION_SNAPSHOT_INTERVAL_SECONDS="${MARIMOHUB_SESSION_SNAPSHOT_INTERVAL_SECONDS:-5}" \
+	MARIMOHUB_SESSION_SWEEP_INTERVAL_SECONDS="${MARIMOHUB_SESSION_SWEEP_INTERVAL_SECONDS:-5}" \
 	MARIMOHUB_COMPUTE_BACKEND=library \
 	MARIMOHUB_COMPUTE_LIBRARY="$PWD/dist/index.js" \
 	ARMADA_AGENT_IMAGE="$AGENT_IMAGE" \
+	ARMADA_AGENT_TOKEN_SECRET="${ARMADA_AGENT_TOKEN_SECRET:-armada-dev-only-agent-token-secret}" \
 	ARMADA_URL="${ARMADA_URL:-http://localhost:30001}" \
 	ARMADA_QUEUE="$QUEUE" \
 	ARMADA_NAMESPACE="${ARMADA_NAMESPACE:-default}" \

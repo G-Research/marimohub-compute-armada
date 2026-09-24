@@ -38,10 +38,26 @@ type agent struct {
 	// kept after exit, so a dead process still answers for its status and log.
 	mu      sync.Mutex
 	started map[int]*startedProcess
+	// How a bounded read opens its path: openNoFollow, or a stand-in a test
+	// uses for a filesystem that stalls.
+	openBounded func(path string) (*os.File, error)
+	// One slot per bounded read still running, released when the read itself
+	// ends rather than when its request is answered, so reads stuck on a
+	// stalled filesystem cannot pile up goroutines and descriptors unbounded.
+	boundedReads chan struct{}
 }
 
+// maxBoundedReads is how many bounded reads may be running at once, stalled
+// ones included. marimohub reads at most eight files per session at a time.
+const maxBoundedReads = 64
+
 func newAgent(tokenHash []byte) *agent {
-	return &agent{tokenHash: tokenHash, started: map[int]*startedProcess{}}
+	return &agent{
+		tokenHash:    tokenHash,
+		started:      map[int]*startedProcess{},
+		openBounded:  openNoFollow,
+		boundedReads: make(chan struct{}, maxBoundedReads),
+	}
 }
 
 func (a *agent) routes() http.Handler {
@@ -57,6 +73,7 @@ func (a *agent) routes() http.Handler {
 	mux.HandleFunc("POST /process/waitport", a.authenticated(a.waitPort))
 	mux.HandleFunc("PUT /files", a.authenticated(a.writeFile))
 	mux.HandleFunc("GET /files", a.authenticated(a.readFile))
+	mux.HandleFunc("GET /files/bounded", a.authenticated(a.readFileBounded))
 	mux.HandleFunc("GET /files/list", a.authenticated(a.listFiles))
 	return mux
 }

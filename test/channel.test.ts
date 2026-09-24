@@ -1,11 +1,12 @@
 import { afterAll, afterEach, describe, expect, it } from 'bun:test';
-import { AgentChannel, CommandTimeoutError } from '../src/channel.js';
+import { AgentChannel, CommandTimeoutError, boundedReadGiveUpMs } from '../src/channel.js';
 import type {
 	AgentEndpoint,
 	CommandResult,
 	ListFilesOutcome,
 	PortWait,
 	ProcessStatus,
+	ReadBudget,
 	ReadFileOutcome,
 } from '../src/channel.js';
 import { toExecResult } from '../src/sandbox.js';
@@ -50,6 +51,8 @@ const received: Received[] = [];
 const requests: ApiRequest[] = [];
 /** In-memory files behind `/files`, path to bytes. */
 const files: Map<string, Uint8Array<ArrayBuffer>> = new Map();
+/** Makes the fake hold a bounded read past any deadline a test sets. */
+let stallBounded = false;
 /** Scripted JSON answer for the next process/list request, by path. */
 let answers: Record<string, { status: number; body: unknown }> = {};
 
@@ -133,6 +136,29 @@ const server: ReturnType<typeof Bun.serve> = Bun.serve({
 			}
 			return new Response(bytes, { headers: { 'content-type': 'application/octet-stream' } });
 		}
+		if (path === '/files/bounded') {
+			if (stallBounded) {
+				await Bun.sleep(5_000);
+				return new Response('too late');
+			}
+			const answer: Response | undefined = scripted(path);
+			if (answer !== undefined) return answer;
+			const bytes: Uint8Array<ArrayBuffer> | undefined = files.get(filePath);
+			if (bytes === undefined) {
+				return Response.json(
+					{ error: `no such file: ${filePath}`, code: 'not_found' },
+					{ status: 404 },
+				);
+			}
+			const maxBytes: number = Number(url.searchParams.get('maxBytes'));
+			if (bytes.byteLength > maxBytes) {
+				return Response.json(
+					{ error: `${filePath} is over the budget of ${String(maxBytes)}`, code: 'read_failed' },
+					{ status: 500 },
+				);
+			}
+			return new Response(bytes, { headers: { 'content-type': 'application/octet-stream' } });
+		}
 		return scripted(path) ?? Response.json({ error: `unscripted path ${path}` }, { status: 500 });
 	},
 });
@@ -148,6 +174,7 @@ afterEach(() => {
 	requests.length = 0;
 	files.clear();
 	answers = {};
+	stallBounded = false;
 });
 
 function endpoint(token = 'token-1'): AgentEndpoint {
@@ -351,6 +378,87 @@ describe('files', () => {
 
 		await channel().listFiles('/work', false);
 		expect(requests[1]?.query).toEqual({ path: '/work' });
+	});
+});
+
+describe('bounded reads', () => {
+	const budget: ReadBudget = { maxBytes: 4, timeoutMs: 5_000 };
+
+	it('sends the budget beside the path and reads back the bytes', async () => {
+		const bytes: Uint8Array = new Uint8Array([0, 159, 146, 150]);
+		await channel().writeFile("/work/it's.bin", bytes);
+		const read: ReadFileOutcome = await channel().readFileBounded("/work/it's.bin", budget);
+
+		expect(read).toEqual({ outcome: 'ok', bytes });
+		expect(requests[1]?.path).toBe('/files/bounded');
+		expect(requests[1]?.query).toEqual({
+			path: "/work/it's.bin",
+			maxBytes: '4',
+			timeoutMs: '5000',
+		});
+	});
+
+	it('maps the agent refusal codes as a plain read does', async () => {
+		expect(await channel().readFileBounded('/work/missing.py', budget)).toEqual({
+			outcome: 'not-found',
+		});
+
+		await channel().writeFile('/work/big.py', 'print(1)\n');
+		const over: ReadFileOutcome = await channel().readFileBounded('/work/big.py', budget);
+		expect(over.outcome).toBe('failed');
+		expect(over.outcome === 'failed' && over.message).toContain('over the budget of 4');
+	});
+
+	it('refuses a body past the budget even when the agent sends one', async () => {
+		answers['/files/bounded'] = { status: 200, body: 'print(1)\n' };
+		const read: ReadFileOutcome = await channel().readFileBounded('/work/notebook.py', budget);
+
+		expect(read).toEqual({
+			outcome: 'failed',
+			message: 'the agent sent more than the budget of 4 bytes',
+		});
+	});
+
+	it('gives up at the deadline when the agent does not answer', async () => {
+		stallBounded = true;
+		const started: number = Date.now();
+		const message: string = await rejection(
+			channel().readFileBounded('/work/notebook.py', { maxBytes: 4, timeoutMs: 200 }),
+		);
+
+		// The deadline plus the second the agent gets to answer it first.
+		expect(Date.now() - started).toBeLessThan(2_500);
+		expect(message).toContain('could not read /work/notebook.py');
+	});
+
+	it('throws on a refusal without a known code, such as an agent that predates the route', async () => {
+		answers['/files/bounded'] = { status: 404, body: '404 page not found' };
+		expect(await rejection(channel().readFileBounded('/x', budget))).toContain(
+			'HTTP 404: 404 page not found',
+		);
+		expect(await rejection(channel('nope').readFileBounded('/x', budget))).toContain(
+			'HTTP 401: wrong token',
+		);
+	});
+	it('gives the agent a second past its deadline, but never past what a timer holds', () => {
+		expect(boundedReadGiveUpMs(10_000)).toBe(11_000);
+		// Node fires a timer past 2^31 - 1 after 1ms; Bun does not, so this is
+		// asserted on the number rather than by waiting for the abort.
+		expect(boundedReadGiveUpMs(2 ** 31 - 1)).toBe(2 ** 31 - 1);
+		expect(boundedReadGiveUpMs(2 ** 31 - 500)).toBe(2 ** 31 - 1);
+	});
+
+	it('reports the agent answer to its own deadline, not an abort', async () => {
+		answers['/files/bounded'] = {
+			status: 500,
+			body: { error: 'reading /work/notebook.py: deadline of 200ms passed', code: 'read_failed' },
+		};
+		expect(
+			await channel().readFileBounded('/work/notebook.py', { maxBytes: 4, timeoutMs: 200 }),
+		).toEqual({
+			outcome: 'failed',
+			message: 'HTTP 500: reading /work/notebook.py: deadline of 200ms passed',
+		});
 	});
 });
 

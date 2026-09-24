@@ -2,12 +2,22 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func fileURL(endpoint string, path string, recursive bool) string {
@@ -178,4 +188,266 @@ func TestListTellsAFileFromAMissingDirectory(t *testing.T) {
 	if refusal := decode[apiError](t, absent); absent.StatusCode != http.StatusNotFound || refusal.Code != "not_found" {
 		t.Errorf("absent: status %d code %q, want 404 not_found", absent.StatusCode, refusal.Code)
 	}
+}
+
+func boundedURL(path string, maxBytes string, timeoutMs string) string {
+	query := url.Values{"path": []string{path}, "maxBytes": []string{maxBytes}, "timeoutMs": []string{timeoutMs}}
+	return "/files/bounded?" + query.Encode()
+}
+
+// boundedDir is a directory for bounded reads, with no symlink on the way to
+// it, so a TMPDIR that runs through one does not fail every read.
+func boundedDir(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("bounded reads open with openat, which only the Linux build has")
+	}
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// readBoundedFile asks for a bounded read with a generous deadline.
+func readBoundedFile(t *testing.T, server *httptest.Server, path string, maxBytes int) *http.Response {
+	t.Helper()
+	return request(t, server, http.MethodGet, boundedURL(path, strconv.Itoa(maxBytes), "5000"), nil)
+}
+
+// wantRefusal checks a bounded read was refused with the code, and returns the message.
+func wantRefusal(t *testing.T, response *http.Response, status int, code string) string {
+	t.Helper()
+	refusal := decode[apiError](t, response)
+	if response.StatusCode != status || refusal.Code != code {
+		t.Errorf("status %d code %q (%s), want %d %s", response.StatusCode, refusal.Code, refusal.Error, status, code)
+	}
+	return refusal.Error
+}
+
+func TestBoundedReadReturnsAFileAtTheCapByteForByte(t *testing.T) {
+	server := testServer(t)
+	path := filepath.Join(boundedDir(t), "notebook.py")
+	content := []byte{0x00, 0x9f, 'a', '\n'}
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	read := readBoundedFile(t, server, path, len(content))
+	defer func() { _ = read.Body.Close() }()
+	if read.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", read.StatusCode)
+	}
+	data, err := io.ReadAll(read.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, content) {
+		t.Errorf("read %v, want %v", data, content)
+	}
+}
+
+func TestBoundedReadRefusesAFileOneByteOverTheCap(t *testing.T) {
+	server := testServer(t)
+	path := filepath.Join(boundedDir(t), "notebook.py")
+	if err := os.WriteFile(path, []byte("12345"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	message := wantRefusal(t, readBoundedFile(t, server, path, 4), http.StatusInternalServerError, "read_failed")
+	if !strings.Contains(message, "budget of 4") {
+		t.Errorf("message %q does not name the budget", message)
+	}
+}
+
+func TestBoundedReadDoesNotAllocateASparseFileUpFront(t *testing.T) {
+	path := filepath.Join(boundedDir(t), "sparse.bin")
+	// A gigabyte on paper and nothing on disk: a budget that covers the
+	// claimed size must not turn into an allocation of it.
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, 1<<30); err != nil {
+		t.Fatal(err)
+	}
+	// Already done, so the read stops at its first chunk and what is left to
+	// measure is the buffer allocated before it.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := testAgent().readBounded(ctx, path, 1<<31); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want the cancelled read", err)
+	}
+	runtime.ReadMemStats(&after)
+	// The capped buffer, perhaps twice over as bytes.Buffer grows it, and far
+	// below the gigabyte the file claims.
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 4*maxPreallocBytes {
+		t.Errorf("allocated %d bytes for a file that holds none", allocated)
+	}
+}
+
+func TestBoundedReadReadsAnEmptyFileWithAZeroBudget(t *testing.T) {
+	server := testServer(t)
+	path := filepath.Join(boundedDir(t), "empty.py")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	read := readBoundedFile(t, server, path, 0)
+	_ = read.Body.Close()
+	if read.StatusCode != http.StatusOK {
+		t.Errorf("status %d, want 200", read.StatusCode)
+	}
+}
+
+func TestBoundedReadRefusesASymlinkedFile(t *testing.T) {
+	server := testServer(t)
+	dir := boundedDir(t)
+	target := filepath.Join(dir, "target.py")
+	if err := os.WriteFile(target, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "notebook.py")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	wantRefusal(t, readBoundedFile(t, server, link, 100), http.StatusInternalServerError, "read_failed")
+
+	// Dangling, it still exists: a read failure, as plain reads count it.
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	wantRefusal(t, readBoundedFile(t, server, link, 100), http.StatusInternalServerError, "read_failed")
+}
+
+func TestBoundedReadRefusesAPathThroughASymlinkedDirectory(t *testing.T) {
+	server := testServer(t)
+	dir := boundedDir(t)
+	real := filepath.Join(dir, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "notebook.py"), []byte("print(1)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(dir, "workspace")); err != nil {
+		t.Fatal(err)
+	}
+	wantRefusal(t, readBoundedFile(t, server, filepath.Join(dir, "workspace", "notebook.py"), 100), http.StatusInternalServerError, "read_failed")
+}
+
+func TestBoundedReadRefusesADirectoryAndAFIFO(t *testing.T) {
+	server := testServer(t)
+	dir := boundedDir(t)
+	wantRefusal(t, readBoundedFile(t, server, dir, 100), http.StatusInternalServerError, "read_failed")
+
+	// Nothing writes to the FIFO, so a blocking open or read would hang the
+	// request until the deadline instead of answering at once.
+	fifo := filepath.Join(dir, "notebook.py")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	message := wantRefusal(t, readBoundedFile(t, server, fifo, 100), http.StatusInternalServerError, "read_failed")
+	if !strings.Contains(message, "not a regular file") {
+		t.Errorf("message %q, want the file type refused", message)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Errorf("took %s: the FIFO blocked", elapsed)
+	}
+}
+
+func TestBoundedReadTellsAbsentFromRefused(t *testing.T) {
+	server := testServer(t)
+	dir := boundedDir(t)
+	wantRefusal(t, readBoundedFile(t, server, filepath.Join(dir, "missing.py"), 100), http.StatusNotFound, "not_found")
+	wantRefusal(t, readBoundedFile(t, server, filepath.Join(dir, "gone", "missing.py"), 100), http.StatusNotFound, "not_found")
+}
+
+func TestBoundedReadRefusesABadPathOrBudgetBeforeOpening(t *testing.T) {
+	a := testAgent()
+	var opened atomic.Bool
+	a.openBounded = func(path string) (*os.File, error) {
+		opened.Store(true)
+		return openNoFollow(path)
+	}
+	server := testAgentServer(t, a)
+
+	for _, target := range []string{
+		boundedURL("notebook.py", "100", "5000"),
+		boundedURL("/workspace/../etc/passwd", "100", "5000"),
+		boundedURL("/workspace/notebook.py/", "100", "5000"),
+		boundedURL("/workspace/notebook.py/.", "100", "5000"),
+		boundedURL("/", "100", "5000"),
+		boundedURL("/workspace/notebook.py", "-1", "5000"),
+		boundedURL("/workspace/notebook.py", "9007199254740992", "5000"),
+		boundedURL("/workspace/notebook.py", "1.5", "5000"),
+		boundedURL("/workspace/notebook.py", "", "5000"),
+		boundedURL("/workspace/notebook.py", "100", "0"),
+		boundedURL("/workspace/notebook.py", "100", "2147483648"),
+		boundedURL("/workspace/notebook.py", "100", ""),
+	} {
+		response := request(t, server, http.MethodGet, target, nil)
+		if refusal := decode[apiError](t, response); response.StatusCode != http.StatusBadRequest || refusal.Code != "read_failed" {
+			t.Errorf("%s: status %d code %q, want 400 read_failed", target, response.StatusCode, refusal.Code)
+		}
+	}
+	if opened.Load() {
+		t.Error("a refused request still opened its path")
+	}
+}
+
+func TestBoundedReadAnswersAtTheDeadlineWhileTheOpenStalls(t *testing.T) {
+	a, release := stalledAgent(t, maxBoundedReads)
+	server := testAgentServer(t, a)
+
+	started := time.Now()
+	response := request(t, server, http.MethodGet, boundedURL("/workspace/notebook.py", "100", "200"), nil)
+	message := wantRefusal(t, response, http.StatusInternalServerError, "read_failed")
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Errorf("answered after %s, want about 200ms", elapsed)
+	}
+	if !strings.Contains(message, "deadline of 200ms") {
+		t.Errorf("message %q does not name the deadline", message)
+	}
+	release()
+}
+
+func TestBoundedReadsStuckOnAStalledFilesystemAreCapped(t *testing.T) {
+	a, release := stalledAgent(t, 1)
+	server := testAgentServer(t, a)
+
+	// The first read times out but stays stuck in its open, holding the slot.
+	wantRefusal(t, request(t, server, http.MethodGet, boundedURL("/workspace/notebook.py", "100", "50"), nil), http.StatusInternalServerError, "read_failed")
+	message := wantRefusal(t, request(t, server, http.MethodGet, boundedURL("/workspace/notebook.py", "100", "5000"), nil), http.StatusServiceUnavailable, "read_failed")
+	if !strings.Contains(message, "already running") {
+		t.Errorf("message %q, want the cap named", message)
+	}
+
+	// Once the stuck read ends, its slot is free again.
+	release()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(a.boundedReads) > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(a.boundedReads) != 0 {
+		t.Error("the stalled read never gave its slot back")
+	}
+}
+
+// stalledAgent has room for `slots` bounded reads, each of which blocks in its
+// open until release is called, as on a hung network filesystem.
+func stalledAgent(t *testing.T, slots int) (*agent, func()) {
+	t.Helper()
+	a := testAgent()
+	a.boundedReads = make(chan struct{}, slots)
+	stalled := make(chan struct{})
+	a.openBounded = func(string) (*os.File, error) {
+		<-stalled
+		return nil, errors.New("released")
+	}
+	var once sync.Once
+	release := func() { once.Do(func() { close(stalled) }) }
+	t.Cleanup(release)
+	return a, release
 }
