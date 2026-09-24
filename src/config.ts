@@ -66,6 +66,15 @@ export interface ArmadaConfig {
 	/** Port the agent listens on inside the pod, exposed next to the kernel's. */
 	agentPort: number;
 	/**
+	 * Key each sandbox's agent token is derived from, with the sandbox id
+	 * (`agentToken` in `sandbox.ts`). marimohub reaches a sandbox through a new
+	 * instance on every path after the first, in another process after a restart
+	 * too, so the token cannot be a random value one instance keeps. Every
+	 * marimohub process running the adapter must share it; changing it cuts every
+	 * running sandbox off from its agent.
+	 */
+	agentTokenSecret: string;
+	/**
 	 * Names of secrets in `namespace` the pod pulls its images with. Both the
 	 * kernel image and the agent image are pulled by the worker cluster, never by
 	 * marimohub, so a private registry needs a credential that cluster holds and
@@ -122,6 +131,19 @@ export interface ArmadaConfig {
 	 * which is exactly the behaviour before this existed.
 	 */
 	lookoutUrl?: string | undefined;
+}
+
+/** Shortest `ARMADA_AGENT_TOKEN_SECRET` accepted; `openssl rand -hex 32`, as the error suggests, prints 64. */
+const MIN_TOKEN_SECRET_LENGTH = 32;
+
+function readTokenSecret(env: Record<string, string | undefined>): string {
+	const secret: string = required(env, 'ARMADA_AGENT_TOKEN_SECRET');
+	if (secret.length < MIN_TOKEN_SECRET_LENGTH) {
+		throw new Error(
+			`ARMADA_AGENT_TOKEN_SECRET must be at least ${String(MIN_TOKEN_SECRET_LENGTH)} characters; generate one with \`openssl rand -hex 32\``,
+		);
+	}
+	return secret;
 }
 
 function required(env: Record<string, string | undefined>, name: string): string {
@@ -412,6 +434,7 @@ export function readConfig(
 		port: optionalPort(env, 'ARMADA_KERNEL_PORT', 2718),
 		agentImage: required(env, 'ARMADA_AGENT_IMAGE'),
 		agentPort: optionalPort(env, 'ARMADA_AGENT_PORT', 8718),
+		agentTokenSecret: readTokenSecret(env),
 		imagePullSecrets: readImagePullSecrets(env),
 		runAsUser: optionalId(env, 'ARMADA_RUN_AS_USER'),
 		runAsGroup: optionalId(env, 'ARMADA_RUN_AS_GROUP'),

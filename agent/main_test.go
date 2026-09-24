@@ -20,8 +20,17 @@ const testToken = "not-very-secret"
 
 func testServer(t *testing.T) *httptest.Server {
 	t.Helper()
+	return testAgentServer(t, testAgent())
+}
+
+func testAgent() *agent {
 	sum := sha256.Sum256([]byte(testToken))
-	server := httptest.NewServer(newAgent(sum[:]).routes())
+	return newAgent(sum[:])
+}
+
+func testAgentServer(t *testing.T, a *agent) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(a.routes())
 	t.Cleanup(server.Close)
 	return server
 }

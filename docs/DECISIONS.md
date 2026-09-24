@@ -69,6 +69,16 @@ Lookout's job, below.
 **Submission is lazy.** marimohub's `create(id, options)` is synchronous, so the job is
 submitted on first use, in the optional `ready()` method that marimohub awaits.
 
+**A reached sandbox is remembered by the provider.** marimohub keeps no instance: every
+call after provisioning, each periodic snapshot, the teardown and a surface's readiness
+check among them, starts from a fresh `create(id)`. Each of those used to resubmit the job
+(deduped by Armada), wait for its running event, look up the agent's address and poll the
+agent before doing its work. The provider now keeps the job, pod and agent channel of every
+sandbox this process has reached, and a fresh instance adopts them after a single look at
+the agent's health; a pod that no longer answers is dropped and resolved from the start, and
+`destroy` forgets it. This is per process by nature: after a restart the first call pays the
+full resolution once, which is why the agent token has to be derived rather than kept.
+
 **`activeDeadlineSeconds` is always set.** Armada assigns a default deadline to any pod
 that does not set one, and the shipped default is 72 hours, 336 for GPU jobs
 (`config/server/config.yaml:65`, `:67`). A kernel that inherits an operator's default is
@@ -144,8 +154,24 @@ fallback is one `COPY` line in the kernel image.
 **The pod carries a hash of the token, never the token.** The pod spec is not secret:
 `GetJobDetails` returns it with `expandJobSpec` (`pkg/api/job.proto:47`), Lookout renders
 it, and an env var is inherited by every process the agent starts, `os.environ` in a
-notebook included. The adapter mints 32 random bytes per sandbox, puts their SHA-256 in the
-spec, and the agent compares hashes in constant time.
+notebook included. The adapter puts the token's SHA-256 in the spec, and the agent compares
+hashes in constant time.
+
+**The token is derived from the sandbox id, not minted.** It is
+`HMAC-SHA256(ARMADA_AGENT_TOKEN_SECRET, sandboxId)`. marimohub keeps no sandbox instance
+between calls: teardown (`packages/core/src/services/runtime/SessionRetirer.ts:220`), the
+snapshot sweep (`sessionLifecycle.ts:190`) and every other path after provisioning call
+`create(id)` again, possibly in another process or after a restart. A token minted at
+random per instance was therefore known to the provisioning instance alone. Every later
+instance resubmitted with a token of its own; Armada deduped the submit to the running job
+on `clientId`, and the pod refused the new token with 401. So no session was ever captured:
+each teardown read nothing back and then destroyed the pod. A cache of tokens in the provider
+would have fixed only the case where marimohub had not restarted in between, which is how
+the first case was found. The cost is one required secret that every marimohub process
+shares. Whoever holds it can compute the token of any sandbox of that installation, where
+before a leak exposed a single pod, and changing it cuts every running sandbox off from its
+agent. It is a variable of its own rather than marimohub's `MARIMOHUB_AUTH_SESSION_SECRET`,
+which the adapter could read, so that rotating user sessions never strands running kernels.
 
 **Never kill by heuristic.** A kernel pod legitimately holds the kernel and whatever the
 notebook spawned: a `subprocess.Popen`, a training run, a dev server. None is distinguishable
@@ -243,6 +269,56 @@ order mark is preserved. Divergences: an absent path is `NOT_FOUND` rather than 
 blanket `READ_FAILED`, because session capture reads four fixed paths of which several
 routinely do not exist; a dangling symlink counts as present; a bare relative filename
 creates no spurious parent directory (upstream's `lastIndexOf` fallback does).
+
+**Bounded reads are refused in the agent, not by a Python trampoline.** From `main` f4e5ef8
+(2026-09-23, in no release as of v0.4.10), marimohub captures a session only through the
+optional `readFileBounded`; an adapter without it gets one warning and no capture at all,
+periodic snapshot and teardown alike (`supportsBoundedReads`,
+`packages/core/src/services/runtime/sandboxFiles.ts:37`). The first-party adapters share a
+reader that has only `exec` to work with, so it ships a `python3 -I -c` script that walks
+the path (`packages/compute-commons/src/boundedRead.ts`). The agent has a file API of its
+own, so `GET /files/bounded` does the same walk in Go (`agent/files_linux.go`): every
+component opened with `openat` relative to the last, `O_NOFOLLOW` so a symlink anywhere
+fails, `O_DIRECTORY` on all but the last, and `O_NONBLOCK` so a FIFO cannot hang the open.
+`fstat` on the opened file rejects anything not regular or over `maxBytes`, and the read
+takes `maxBytes + 1` bytes so a file that grew in between fails too. The deadline is the
+agent's: the read runs aside and the request is answered when `timeoutMs` passes, even
+while a syscall blocks. A read stuck that way keeps one of 64 slots until it ends, so a hung
+network filesystem cannot pile up goroutines and descriptors; past that the agent refuses
+new bounded reads until one finishes. The kernel image needs no Python for any of it. It is a route of
+its own rather than parameters on `GET /files` so that an agent image older than the
+adapter answers 404, which the channel reports as `BACKEND_ERROR`, instead of an unbounded
+read that follows symlinks. Upgrading marimohub past v0.4.10 therefore means rebuilding
+the agent image along with the bundle. The adapter validates the budget before anything
+else, as upstream's contract test requires (`computeContract.ts:233`), holds the body to
+`maxBytes` itself, and abandons the request a second after the deadline, so that the
+agent's own "deadline passed" is what gets reported rather than a bare abort. Divergences: an absent path
+is `NOT_FOUND` rather than `READ_FAILED`, for the reason `readFile` gives above; the
+deadline covers the read, not reaching a pod this process has not reached yet, which every
+call does first; and the Linux build alone can open this way, since Go's `syscall` package
+has no `openat` elsewhere, so on other systems the agent refuses and its tests skip.
+
+**`readFileBounded` always reports base64.** The hazard that makes `readFile` choose
+by the bytes does not apply: the bounded read's one consumer, `readBoundedBytes`
+(`sandboxFiles.ts:456`), decodes by `encoding` and then checks the decoded size against the
+budget. base64 is right for every file, which a guess from the bytes is not, and it is what
+the reference reader answers. An `encoding` that did not match the content would make that
+check drop the file without a word, which is the data loss the method exists to prevent.
+
+**A failed read is logged, the one line the adapter writes.** Everywhere else the adapter
+reports through thrown errors and typed results and prints nothing. A read that fails is
+the exception, because marimohub drops that failure without a trace: `readSessionArtifacts`
+leaves out what it cannot read, `commitSession` then has no code and returns `null`
+(`packages/core/src/services/content/NotebookService.ts:833`), capture counts that as
+success, and teardown destroys the pod. An agent unreachable at stop time costs the whole
+session's edits and leaves the same state behind as a notebook nobody touched. This line
+is how the per-instance agent token was found (see "The token is derived from the sandbox
+id" above): every capture had been failing with 401. So `readFile` and `readFileBounded`
+write one `console.warn` per `READ_FAILED` or `BACKEND_ERROR`, naming the sandbox, the path, the code and the reason,
+which is how marimohub's own core reports skipped files throughout `sandboxFiles.ts`.
+`NOT_FOUND` stays quiet, since session capture reads four fixed paths of which several
+routinely do not exist and a warning there would fire on every healthy session. The
+agent's token is masked in the line, in case a transport error ever quotes a header.
 
 **Listing a file is `NOT_A_DIRECTORY`**, never an empty success
 (`computeContract.ts:260`). `includeHidden` filters on an entry's own name, so a recursive

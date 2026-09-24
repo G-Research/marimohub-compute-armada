@@ -5,12 +5,15 @@ import type { AgentEndpoint, ControlChannel } from './channel.js';
 import type { ArmadaConfig } from './config.js';
 import { QueueDirectory } from './queues.js';
 import { ArmadaSandbox } from './sandbox.js';
+import type { Placements } from './sandbox.js';
 import type { ActiveSandbox, CreateSandboxOptions, SandboxId, SandboxProvider } from './types.js';
 
 export class ArmadaCompute implements SandboxProvider {
 	private readonly armada: ArmadaClient;
 	/** Which queue each sandbox is in, shared by every sandbox this provider makes. */
 	private readonly queues: QueueDirectory;
+	/** The job, pod and agent channel of each sandbox reached, shared the same way. */
+	private readonly placements: Placements = new Map();
 
 	/**
 	 * Present only when `ARMADA_LOOKOUT_URL` is configured, because marimohub
@@ -47,7 +50,15 @@ export class ArmadaCompute implements SandboxProvider {
 	}
 
 	create(id: SandboxId, options?: CreateSandboxOptions): ArmadaSandbox {
-		return new ArmadaSandbox(id, this.config, this.armada, openAgent, this.queues, options);
+		return new ArmadaSandbox(
+			id,
+			this.config,
+			this.armada,
+			openAgent,
+			this.queues,
+			this.placements,
+			options,
+		);
 	}
 
 	/** Kernels are reached directly at their Armada ingress, so nothing is proxied. */

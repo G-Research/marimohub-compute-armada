@@ -17,7 +17,9 @@
  * starts a detached process as the agent's own child, so liveness and the exit
  * status are exact, and waits for its port in-pod. `/files` carries bytes raw
  * in request and response bodies, so no path is quoted for a shell and no
- * content is wrapped in base64.
+ * content is wrapped in base64. `/files/bounded` is the read marimohub's
+ * session capture asks for: the agent refuses symlinks, anything but a regular
+ * file, and a file over a byte budget, and answers by a deadline.
  */
 import type { PodLocation } from './armada.js';
 import { readNdjson } from './ndjson.js';
@@ -83,6 +85,15 @@ export type ReadFileOutcome =
 	| { outcome: 'not-found' }
 	| { outcome: 'failed'; message: string };
 
+/**
+ * What a bounded read may cost. Both are whole numbers: the sandbox validates
+ * marimohub's budget and rounds the deadline up before it gets here.
+ */
+export interface ReadBudget {
+	maxBytes: number;
+	timeoutMs: number;
+}
+
 /** How a listing ended, on the same terms as {@link ReadFileOutcome}. */
 export type ListFilesOutcome =
 	| { outcome: 'ok'; entries: AgentFileEntry[] }
@@ -101,6 +112,8 @@ export interface ControlChannel {
 	/** Write bytes to a path, creating parent directories. */
 	writeFile(path: string, content: string | Uint8Array): Promise<void>;
 	readFile(path: string): Promise<ReadFileOutcome>;
+	/** A regular file reached through no symlink, within the budget, or a failure. */
+	readFileBounded(path: string, budget: ReadBudget): Promise<ReadFileOutcome>;
 	listFiles(path: string, recursive: boolean): Promise<ListFilesOutcome>;
 	/** Start a detached process the agent parents, returning its pid. */
 	startProcess(command: readonly string[], cwd?: string): Promise<number>;
@@ -138,6 +151,12 @@ interface AgentEvent {
 const READY_POLL_MS = 250;
 /** Past the agent's own deadline, the client gives up on its own. */
 const TIMEOUT_SLACK_MS = 10_000;
+/**
+ * The same for a bounded read, kept short because the budget is the caller's:
+ * long enough that the agent's own "deadline passed" arrives first and is what
+ * gets reported, rather than an abort that says nothing.
+ */
+const BOUNDED_READ_SLACK_MS = 1_000;
 
 function asEvent(value: unknown): AgentEvent {
 	if (typeof value !== 'object' || value === null) {
@@ -429,10 +448,46 @@ export class AgentChannel implements ControlChannel {
 		if (response.ok) {
 			return { outcome: 'ok', bytes: new Uint8Array(await response.arrayBuffer()) };
 		}
+		return this.readRefused(what, response);
+	}
+
+	/** A refused read: `not_found` and `read_failed` are the pod's answers, anything else a failure to ask. */
+	private async readRefused(what: string, response: Response): Promise<ReadFileOutcome> {
 		const refusal: AgentRefusal = await refusalOf(response);
 		if (refusal.code === 'not_found') return { outcome: 'not-found' };
 		if (refusal.code === 'read_failed') return { outcome: 'failed', message: refusal.message };
 		throw this.failure(what, new Error(refusal.message));
+	}
+
+	/**
+	 * The agent enforces the budget where the file is; this side holds it to
+	 * the same terms, so an agent that misbehaves cannot exceed it either. The
+	 * request is abandoned shortly after the deadline, if the agent's own answer
+	 * to it has not arrived, and a body that runs past `maxBytes` is cancelled
+	 * at the first byte over.
+	 */
+	async readFileBounded(path: string, budget: ReadBudget): Promise<ReadFileOutcome> {
+		const what = `read ${path}`;
+		const response: Response = await this.request(
+			what,
+			'GET',
+			`${filePath('/files/bounded', path)}&maxBytes=${String(budget.maxBytes)}&timeoutMs=${String(budget.timeoutMs)}`,
+			{ signal: AbortSignal.timeout(budget.timeoutMs + BOUNDED_READ_SLACK_MS) },
+		);
+		if (!response.ok) return this.readRefused(what, response);
+		let bytes: Uint8Array | undefined;
+		try {
+			bytes = await readAtMost(bodyOf(response), budget.maxBytes);
+		} catch (cause) {
+			throw this.failure(what, cause);
+		}
+		if (bytes === undefined) {
+			return {
+				outcome: 'failed',
+				message: `the agent sent more than the budget of ${String(budget.maxBytes)} bytes`,
+			};
+		}
+		return { outcome: 'ok', bytes };
 	}
 
 	async listFiles(path: string, recursive: boolean): Promise<ListFilesOutcome> {
@@ -594,6 +649,29 @@ function filePath(endpoint: string, path: string): string {
 function bodyOf(response: Response): ReadableStream<Uint8Array> {
 	if (response.body === null) throw new Error('the response had no body');
 	return response.body;
+}
+
+/** The whole body, or undefined as soon as it runs past `maxBytes`. */
+async function readAtMost(
+	body: ReadableStream<Uint8Array>,
+	maxBytes: number,
+): Promise<Uint8Array | undefined> {
+	const reader: ReadableStreamDefaultReader<Uint8Array> = body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	// oxlint-disable no-await-in-loop -- a stream is read one chunk at a time
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		total += value.byteLength;
+		if (total > maxBytes) {
+			await reader.cancel();
+			return undefined;
+		}
+		chunks.push(value);
+	}
+	// oxlint-enable no-await-in-loop
+	return Buffer.concat(chunks);
 }
 
 /** Closing a stream that a cancel already closed throws, and means nothing. */

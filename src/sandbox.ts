@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import type { ArmadaClient, PodLocation, SubmittedJob } from './armada.js';
 import type { ArmadaConfig } from './config.js';
 import type {
@@ -9,6 +9,7 @@ import type {
 	ListFilesOutcome,
 	PortProbe,
 	PortWait,
+	ReadBudget,
 	ReadFileOutcome,
 } from './channel.js';
 import { CommandTimeoutError } from './channel.js';
@@ -16,6 +17,7 @@ import { buildPodSpec } from './podspec.js';
 import type { QueueDirectory } from './queues.js';
 import { assertEnvName, gitCloneCommand, withEnvPrefix } from './shell.js';
 import type {
+	BoundedReadOptions,
 	CreateSandboxOptions,
 	ExecOptions,
 	ExecResult,
@@ -54,6 +56,50 @@ function decodeUtf8(bytes: Uint8Array): string | undefined {
 function reason(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
+
+/**
+ * Whether a bounded read's budget is one marimohub's port allows
+ * (`BoundedReadOptions`), checked as its reference reader checks it
+ * (`packages/compute-commons/src/boundedRead.ts`): a nonnegative safe integer
+ * of bytes whose base64 size is safe too, and a positive deadline a timer can
+ * hold.
+ */
+export function isValidBudget(options: BoundedReadOptions): boolean {
+	return (
+		Number.isSafeInteger(options.maxBytes) &&
+		options.maxBytes >= 0 &&
+		Number.isSafeInteger(4 * Math.ceil(options.maxBytes / 3)) &&
+		Number.isFinite(options.timeoutMs) &&
+		options.timeoutMs > 0 &&
+		options.timeoutMs <= 2 ** 31 - 1
+	);
+}
+
+/**
+ * The bearer token a sandbox's agent expects: an HMAC of the sandbox id under
+ * `ARMADA_AGENT_TOKEN_SECRET`. Derived rather than minted, because marimohub
+ * reaches a sandbox through a fresh `create(id)` on every path after the
+ * first, teardown and the snapshot sweep included, and in another process after
+ * a restart; each of them has to arrive at the token the pod was started with.
+ */
+export function agentToken(secret: string, id: SandboxId): string {
+	return createHmac('sha256', secret).update(id).digest('hex');
+}
+
+/**
+ * Where a sandbox this process has reached lives: its job, its pod, and the
+ * channel to its agent. marimohub builds a new instance for every call after
+ * provisioning (each snapshot, the teardown, a surface check), and without this
+ * each would resubmit the job, wait for its running event and poll the agent
+ * again before doing anything. The provider holds one map for all of them.
+ */
+export interface Placement {
+	job: SubmittedJob;
+	pod: PodLocation;
+	channel: ControlChannel;
+}
+
+export type Placements = Map<SandboxId, Placement>;
 
 /** Each write is one request to the agent; cap how many are in flight. */
 const WRITE_CONCURRENCY = 8;
@@ -128,7 +174,7 @@ export class ArmadaSandbox implements SandboxInstance {
 	/** The agent in the pod, once `ready` has reached it. */
 	private channel?: ControlChannel | undefined;
 	/** The bearer token this sandbox's agent expects. The pod carries only its hash. */
-	private token?: string;
+	private readonly token: string;
 	/** Settled by `queue()`, and fixed for the life of the sandbox once it is. */
 
 	/**
@@ -146,8 +192,11 @@ export class ArmadaSandbox implements SandboxInstance {
 		private readonly armada: ArmadaClient,
 		private readonly openChannel: (endpoint: AgentEndpoint) => ControlChannel,
 		private readonly queues: QueueDirectory,
+		private readonly placements: Placements,
 		private readonly options?: CreateSandboxOptions,
-	) {}
+	) {
+		this.token = agentToken(config.agentTokenSecret, id);
+	}
 
 	/**
 	 * Submit the job, block until its pod is running, and reach the agent in it.
@@ -155,13 +204,31 @@ export class ArmadaSandbox implements SandboxInstance {
 	 * Idempotent: marimohub calls this before each use, and the submission dedupes
 	 * on `clientId` anyway, so a second call on a started sandbox does nothing.
 	 *
-	 * The token is minted here and never leaves this process except in request
+	 * The token ({@link agentToken}) never leaves this process except in request
 	 * headers to the one pod that knows its hash. The pod spec, which anyone with
-	 * read access to the job can fetch, carries the hash alone.
+	 * read access to the job can fetch, carries the hash alone. A resubmit that
+	 * Armada dedupes to the running job carries the same hash, since the token
+	 * depends on the id alone.
+	 *
+	 * A sandbox another instance in this process already reached is taken from
+	 * {@link Placements} after one look at the agent's health, which is what
+	 * tells a live pod from one that has since gone; a gone one is resolved
+	 * again from the start.
 	 */
 	async ready(): Promise<void> {
 		if (this.channel !== undefined) return;
-		this.token ??= randomBytes(32).toString('hex');
+		const known: Placement | undefined = this.placements.get(this.id);
+		if (known !== undefined) {
+			try {
+				await known.channel.ready(0);
+				this.job = known.job;
+				this.pod = known.pod;
+				this.channel = known.channel;
+				return;
+			} catch {
+				this.placements.delete(this.id);
+			}
+		}
 		const tokenSha256: string = createHash('sha256').update(this.token).digest('hex');
 		this.job ??= await this.armada.submit(
 			this.id,
@@ -174,6 +241,7 @@ export class ArmadaSandbox implements SandboxInstance {
 		const channel: ControlChannel = this.openChannel({ url, token: this.token, pod: this.pod });
 		await channel.ready(AGENT_READY_TIMEOUT_MS);
 		this.channel = channel;
+		this.placements.set(this.id, { job: this.job, pod: this.pod, channel });
 	}
 
 	/** Where the pod landed, once it has. For reporting, not for reaching it. */
@@ -199,9 +267,12 @@ export class ArmadaSandbox implements SandboxInstance {
 	 * remedy is the same either way: start the surface again. Only the probe is
 	 * treated that way: a sandbox this process has not reached cannot have a
 	 * surface listening, and is not submitted or waited for to find that out.
+	 * One another instance reached counts as reached, since marimohub asks
+	 * through a fresh instance.
 	 */
 	async isPortReady(port: number, options?: Omit<WaitForPortOptions, 'timeout'>): Promise<boolean> {
-		const channel: ControlChannel | undefined = this.channel;
+		const channel: ControlChannel | undefined =
+			this.channel ?? this.placements.get(this.id)?.channel;
 		if (channel === undefined) return false;
 		try {
 			const wait: PortWait = await channel.waitForPort(
@@ -304,22 +375,101 @@ export class ArmadaSandbox implements SandboxInstance {
 	 * from "could not be read". The agent's `not_found` carries it.
 	 */
 	async readFile(path: string): Promise<ReadFileResult> {
-		let read: ReadFileOutcome;
-		try {
-			read = await (await this.open()).readFile(path);
-		} catch {
-			return { success: false, content: '', error: { code: 'BACKEND_ERROR' } };
+		return this.readThrough(
+			path,
+			async (channel: ControlChannel): Promise<ReadFileOutcome> => channel.readFile(path),
+			(bytes: Uint8Array): ReadFileResult => {
+				const text: string | undefined = decodeUtf8(bytes);
+				return text === undefined
+					? { success: true, content: Buffer.from(bytes).toString('base64'), encoding: 'base64' }
+					: { success: true, content: text, encoding: 'utf-8' };
+			},
+		);
+	}
+
+	/**
+	 * The read marimohub's session capture makes from `main` f4e5ef8 on, and
+	 * without which it captures nothing at all. The agent does the refusing
+	 * where the file is (`agent/files.go`): no symlink anywhere in the path,
+	 * regular files only, at most `maxBytes`, answered by the deadline. A
+	 * budget marimohub's port does not allow is refused here, before the job is
+	 * submitted or the agent asked, as upstream's contract test requires.
+	 *
+	 * Always base64, as upstream's reference reader answers. The guess
+	 * `readFile` makes from the bytes is there for a consumer that ignores
+	 * `encoding`; the bounded read's consumer (`readBoundedBytes`) decodes by
+	 * it and then re-checks the size, so base64 is exact and never wrong.
+	 *
+	 * The deadline bounds the read, not reaching the pod: a sandbox this
+	 * process has not reached yet is resolved first, as for every other call.
+	 */
+	async readFileBounded(path: string, options: BoundedReadOptions): Promise<ReadFileResult> {
+		if (!isValidBudget(options)) {
+			return this.readFailed(
+				path,
+				'READ_FAILED',
+				`maxBytes ${String(options.maxBytes)} and timeoutMs ${String(options.timeoutMs)} are not a valid budget`,
+			);
 		}
-		if (read.outcome === 'not-found') {
+		const budget: ReadBudget = {
+			maxBytes: options.maxBytes,
+			timeoutMs: Math.ceil(options.timeoutMs),
+		};
+		return this.readThrough(
+			path,
+			async (channel: ControlChannel): Promise<ReadFileOutcome> =>
+				channel.readFileBounded(path, budget),
+			(bytes: Uint8Array): ReadFileResult => ({
+				success: true,
+				content: Buffer.from(bytes).toString('base64'),
+				encoding: 'base64',
+			}),
+		);
+	}
+
+	/**
+	 * One read through the agent, as marimohub's result: the bytes as `encode`
+	 * words them, `NOT_FOUND` quietly, and any other failure through
+	 * {@link readFailed}, with a channel that cannot be reached a `BACKEND_ERROR`.
+	 */
+	private async readThrough(
+		path: string,
+		read: (channel: ControlChannel) => Promise<ReadFileOutcome>,
+		encode: (bytes: Uint8Array) => ReadFileResult,
+	): Promise<ReadFileResult> {
+		let outcome: ReadFileOutcome;
+		try {
+			outcome = await read(await this.open());
+		} catch (error) {
+			return this.readFailed(path, 'BACKEND_ERROR', reason(error));
+		}
+		if (outcome.outcome === 'not-found') {
 			return { success: false, content: '', error: { code: 'NOT_FOUND' } };
 		}
-		if (read.outcome === 'failed') {
-			return { success: false, content: '', error: { code: 'READ_FAILED' } };
+		if (outcome.outcome === 'failed') {
+			return this.readFailed(path, 'READ_FAILED', outcome.message);
 		}
-		const text: string | undefined = decodeUtf8(read.bytes);
-		return text === undefined
-			? { success: true, content: Buffer.from(read.bytes).toString('base64'), encoding: 'base64' }
-			: { success: true, content: text, encoding: 'utf-8' };
+		return encode(outcome.bytes);
+	}
+
+	/**
+	 * A failed read, reported as marimohub expects and said once on stderr. A
+	 * file marimohub cannot read back it leaves out without a word, and a
+	 * session whose notebook is left out commits nothing and is then destroyed,
+	 * so this line is the only trace of edits lost that way. `NOT_FOUND` never
+	 * comes here: capture reads paths that routinely do not exist. The token is
+	 * masked in case a transport error ever quotes a header.
+	 */
+	private readFailed(
+		path: string,
+		code: 'READ_FAILED' | 'BACKEND_ERROR',
+		why: string,
+	): ReadFileResult {
+		const said: string = why.replaceAll(this.token, '<token>');
+		console.warn(
+			`marimohub-compute-armada: sandbox ${this.id} could not read ${path} (${code}): ${said}`,
+		);
+		return { success: false, content: '', error: { code } };
 	}
 
 	/**
@@ -463,6 +613,7 @@ export class ArmadaSandbox implements SandboxInstance {
 		if (this.job === undefined) await this.armada.cancelSet(this.id, await this.queue());
 		else await this.armada.cancel(this.job);
 		this.queues.forget(this.id);
+		this.placements.delete(this.id);
 		this.pod = undefined;
 		this.channel = undefined;
 	}

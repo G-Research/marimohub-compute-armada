@@ -6,3 +6,6 @@ dist/
 /dev/tls/
 /dev/bin/
 /dev/data/
+# The standalone server, as the README downloads it into the working directory.
+/marimohub-linux-x64
+/marimohub-linux-x64.sha256

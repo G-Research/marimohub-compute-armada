@@ -12,6 +12,7 @@ const baseEnv: Record<string, string | undefined> = {
 	ARMADA_QUEUE: 'marimohub',
 	MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
 	ARMADA_AGENT_IMAGE: 'ghcr.io/example/kernel-agent:1',
+	ARMADA_AGENT_TOKEN_SECRET: 'test-secret-of-at-least-32-characters',
 };
 
 function tokenFile(contents: string): string {

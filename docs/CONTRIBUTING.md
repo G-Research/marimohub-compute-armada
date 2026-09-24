@@ -226,7 +226,13 @@ directly.
 `run-local.sh` bundles the adapter, builds and imports the agent image, bakes the bundle
 into `marimohub-armada:dev`, creates the `marimohub` queue, starts the container on
 port 3337 joined to the `kind` network with `fs` storage, `dev` auth and `proxy`
-sandbox exposure, and polls `/api/health` until it answers. No credential of any kind
+sandbox exposure, and polls `/api/health` until it answers. It sets
+`MARIMOHUB_RUN_MAINTENANCE=true`, since marimohub runs its session lifecycle (the
+periodic snapshot, idle reaping) only on a replica that asks to, and a single dev
+process is that replica. Sessions are snapshotted every 5 seconds instead of
+marimohub's 2 minutes, with the lifecycle sweep that fires the snapshot at the same
+pace, so an edit saved in the editor reaches storage within seconds; `MARIMOHUB_SESSION_SNAPSHOT_INTERVAL_SECONDS` and
+`MARIMOHUB_SESSION_SWEEP_INTERVAL_SECONDS` override both. No credential of any kind
 is mounted. Override with `ARMADA_URL`, `ARMADA_QUEUE`, `ARMADA_NAMESPACE`, `PORT`,
 `IMAGE`, `AGENT_IMAGE`, `CONTAINER`, `ARMADACTL` and `NODE`; `ARMADA_EXPOSE` and the
 `ARMADA_INGRESS_*` variables pass through too (step 6), as do `ARMADA_LOOKOUT_URL`, the

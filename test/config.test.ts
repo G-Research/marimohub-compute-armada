@@ -7,6 +7,7 @@ const baseEnv: Record<string, string> = {
 	ARMADA_QUEUE: 'marimohub',
 	MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
 	ARMADA_AGENT_IMAGE: 'ghcr.io/example/kernel-agent:1',
+	ARMADA_AGENT_TOKEN_SECRET: 'test-secret-of-at-least-32-characters',
 };
 
 describe('MARIMOHUB_COMPUTE_IMAGE', () => {
@@ -200,5 +201,20 @@ describe('security context ids', () => {
 		expect(() => readConfig({ ...baseEnv, ARMADA_FS_GROUP: '' })).toThrow(
 			'ARMADA_FS_GROUP must be a whole number, got: ',
 		);
+	});
+});
+
+describe('ARMADA_AGENT_TOKEN_SECRET', () => {
+	it('is required, since every sandbox token derives from it', () => {
+		const env: Record<string, string> = { ...baseEnv };
+		delete env.ARMADA_AGENT_TOKEN_SECRET;
+		expect(() => readConfig(env)).toThrow('Missing required env var: ARMADA_AGENT_TOKEN_SECRET');
+	});
+
+	it('refuses a secret too short to be one', () => {
+		expect(() => readConfig({ ...baseEnv, ARMADA_AGENT_TOKEN_SECRET: 'changeme' })).toThrow(
+			'at least 32 characters',
+		);
+		expect(readConfig(baseEnv).agentTokenSecret).toBe('test-secret-of-at-least-32-characters');
 	});
 });

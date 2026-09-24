@@ -7,6 +7,9 @@
  * 2495463, the earlier transcription point). Every member added since 0.3.12
  * is optional, so the file serves 0.3.12 as well. Branded ids
  * (`ProjectId`, `UserId`, `Millis`) are plain `string` and `number` here.
+ * `BoundedReadOptions` and `readFileBounded` come later, from `main` f4e5ef8
+ * (2026-09-23), which is in no release as of v0.4.10: from that commit on,
+ * marimohub captures nothing from a sandbox whose adapter lacks the method.
  * Replace this file with `import type { … } from '@marimo-hub/core'` once the
  * packages ship (or pin a git sha): the shapes are frozen under `apiVersion: 1`.
  */
@@ -41,6 +44,14 @@ export interface ReadFileFailure {
 }
 
 export type ReadFileResult = ReadFileSuccess | ReadFileFailure;
+
+/** The budget of a bounded read, which marimohub's session capture passes. */
+export interface BoundedReadOptions {
+	/** Nonnegative safe integer whose base64 size is also a safe integer. */
+	maxBytes: number;
+	/** Positive, at most 2^31 - 1 ms; fractional milliseconds round up. */
+	timeoutMs: number;
+}
 
 export interface FileInfo {
 	name: string;
@@ -140,6 +151,8 @@ export interface SandboxInstance {
 	exec(cmd: string, options?: ExecOptions): Promise<ExecResult>;
 	execStream(cmd: string, options?: ExecStreamOptions): Promise<ReadableStream>;
 	readFile(path: string): Promise<ReadFileResult>;
+	/** Reject symlinks/nonregular files; cap transport bytes and cancel on deadline/overflow. */
+	readFileBounded?(path: string, options: BoundedReadOptions): Promise<ReadFileResult>;
 	listFiles(path: string, options?: ListFilesOptions): Promise<ListFilesResult>;
 	writeFiles(files: readonly SandboxFileWrite[]): Promise<void>;
 	gitCheckout(repo: string, options?: GitCheckoutOptions): Promise<void>;

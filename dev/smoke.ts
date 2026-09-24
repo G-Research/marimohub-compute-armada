@@ -36,6 +36,7 @@ const config: ArmadaConfig = readConfig({
 	ARMADA_URL: 'http://localhost:30001',
 	ARMADA_QUEUE: 'marimohub',
 	ARMADA_AGENT_IMAGE: 'marimohub-kernel-agent:local',
+	ARMADA_AGENT_TOKEN_SECRET: 'armada-dev-only-agent-token-secret',
 	// A secondary surface, so the pod declares a third port and the provider
 	// advertises multiPort; the checks below look at that port's address.
 	MARIMOHUB_SURFACES: 'vscode',
@@ -93,6 +94,7 @@ const sandbox: ArmadaSandbox = new ArmadaSandbox(
 		return agent;
 	},
 	queues,
+	new Map(),
 	owner === undefined ? undefined : { owner },
 );
 

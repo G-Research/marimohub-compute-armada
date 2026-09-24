@@ -1,17 +1,25 @@
-import { describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
+import type { Mock } from 'bun:test';
 import type { ArmadaClient, PodLocation } from '../src/armada.js';
+import type { V1Container, V1EnvVar, V1PodSpec } from '@kubernetes/client-node';
+import { createHash } from 'node:crypto';
 import { readConfig } from '../src/config.js';
 import type { ArmadaConfig } from '../src/config.js';
 import { CommandTimeoutError } from '../src/channel.js';
 import type {
+	AgentEndpoint,
 	CommandResult,
 	ControlChannel,
 	PortProbe,
+	ReadBudget,
+	ReadFileOutcome,
 	RunOptions,
 	StreamOptions,
 } from '../src/channel.js';
 import { QueueDirectory } from '../src/queues.js';
-import { ArmadaSandbox } from '../src/sandbox.js';
+import { AGENT_TOKEN_HASH_ENV } from '../src/podspec.js';
+import { ArmadaSandbox, agentToken } from '../src/sandbox.js';
+import type { Placements } from '../src/sandbox.js';
 import type {
 	ExecResult,
 	FileInfo,
@@ -26,6 +34,7 @@ const baseEnv: Record<string, string> = {
 	ARMADA_QUEUE: 'marimohub',
 	MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
 	ARMADA_AGENT_IMAGE: 'ghcr.io/example/kernel-agent:1',
+	ARMADA_AGENT_TOKEN_SECRET: 'test-secret-of-at-least-32-characters',
 };
 
 const pod: PodLocation = {
@@ -33,6 +42,22 @@ const pod: PodLocation = {
 	podName: 'armada-job-0',
 	podNamespace: 'default',
 };
+
+/** A failed read logs a line; caught here, so every test stays quiet and the log tests can read it. */
+let warn: Mock<typeof console.warn>;
+
+beforeEach(() => {
+	warn = spyOn(console, 'warn').mockImplementation((): void => {});
+});
+
+afterEach(() => {
+	warn.mockRestore();
+});
+
+/** Every line logged in this test. */
+function logged(): string[] {
+	return warn.mock.calls.map((args: unknown[]): string => args.map(String).join(' '));
+}
 
 /** The rejection reason as a string, so failures assert on the message plainly. */
 async function rejection(promise: Promise<unknown>): Promise<string> {
@@ -61,9 +86,16 @@ function scriptOf(call: ExecCall | undefined): string {
 interface Recorded {
 	calls: ExecCall[];
 	submitted: string[];
+	/** The agent token hash each submitted pod spec carried. */
+	tokenHashes: string[];
+	/** The timeout of every agent readiness check. */
+	readies: number[];
 	cancelled: string[];
 	writes: { path: string; content: string | Uint8Array }[];
 	reads: string[];
+	boundedReads: { path: string; budget: ReadBudget }[];
+	/** Every endpoint a channel was opened to, which carries the minted token. */
+	endpoints: AgentEndpoint[];
 	lists: { path: string; recursive: boolean }[];
 	starts: { command: readonly string[]; cwd: string | undefined }[];
 	signals: { pid: number; signal: string }[];
@@ -85,6 +117,7 @@ function stubSandbox(
 		env?: Record<string, string>;
 		channel?: Partial<ControlChannel>;
 		queues?: QueueDirectory;
+		placements?: Placements;
 		owner?: SandboxOwner;
 	} = {},
 ): Recorded & { sandbox: ArmadaSandbox } {
@@ -92,9 +125,13 @@ function stubSandbox(
 	const recorded: Recorded = {
 		calls: [],
 		submitted: [],
+		tokenHashes: [],
+		readies: [],
 		cancelled: [],
 		writes: [],
 		reads: [],
+		boundedReads: [],
+		endpoints: [],
 		lists: [],
 		starts: [],
 		signals: [],
@@ -102,8 +139,13 @@ function stubSandbox(
 	};
 	// oxlint-disable-next-line no-unsafe-type-assertion -- a stub of a class with private fields; structural typing cannot satisfy it
 	const armada: ArmadaClient = {
-		submit: async (_id: string, _spec: unknown, queue: string) => {
+		submit: async (_id: string, spec: V1PodSpec, queue: string) => {
 			recorded.submitted.push(queue);
+			recorded.tokenHashes.push(
+				spec.containers
+					.flatMap((container: V1Container): V1EnvVar[] => container.env ?? [])
+					.find((env: V1EnvVar): boolean => env.name === AGENT_TOKEN_HASH_ENV)?.value ?? '',
+			);
 			return { jobId: 'job-1', jobSetId: 'set-1', queue };
 		},
 		waitForRunning: async () => pod,
@@ -116,7 +158,9 @@ function stubSandbox(
 		},
 	} as unknown as ArmadaClient;
 	const channel: ControlChannel = {
-		ready: async (): Promise<void> => {},
+		ready: async (timeoutMs: number): Promise<void> => {
+			recorded.readies.push(timeoutMs);
+		},
 		run: async (command: readonly string[], runOptions?: RunOptions): Promise<CommandResult> => {
 			const call: ExecCall = {
 				command,
@@ -145,6 +189,10 @@ function stubSandbox(
 			recorded.reads.push(path);
 			return { outcome: 'ok', bytes: new Uint8Array() };
 		},
+		readFileBounded: async (path: string, budget: ReadBudget): Promise<ReadFileOutcome> => {
+			recorded.boundedReads.push({ path, budget });
+			return { outcome: 'ok', bytes: new Uint8Array() };
+		},
 		listFiles: async (path: string, recursive: boolean) => {
 			recorded.lists.push({ path, recursive });
 			return { outcome: 'ok', entries: [] };
@@ -169,13 +217,97 @@ function stubSandbox(
 			'sandbox-1',
 			settings,
 			armada,
-			() => channel,
+			(endpoint: AgentEndpoint): ControlChannel => {
+				recorded.endpoints.push(endpoint);
+				return channel;
+			},
 			options.queues ?? new QueueDirectory(settings, undefined),
+			options.placements ?? new Map(),
 			options.owner === undefined ? undefined : { owner: options.owner },
 		),
 		...recorded,
 	};
 }
+
+describe('the agent token', () => {
+	it('is the same for every instance of a sandbox, as marimohub makes a new one per call', async () => {
+		const first: Recorded & { sandbox: ArmadaSandbox } = stubSandbox();
+		const second: Recorded & { sandbox: ArmadaSandbox } = stubSandbox();
+		await first.sandbox.ready();
+		await second.sandbox.ready();
+
+		const token: string | undefined = first.endpoints[0]?.token;
+		expect(token).toBe(agentToken('test-secret-of-at-least-32-characters', 'sandbox-1'));
+		expect(second.endpoints[0]?.token).toBe(token);
+		// The pod, submitted or deduped, carries the hash of that same token.
+		const hash: string = createHash('sha256')
+			.update(token ?? '')
+			.digest('hex');
+		expect([...first.tokenHashes, ...second.tokenHashes]).toEqual([hash, hash]);
+	});
+
+	it('differs between sandboxes and between secrets', () => {
+		const secret = 'test-secret-of-at-least-32-characters';
+		expect(agentToken(secret, 'sandbox-1')).not.toBe(agentToken(secret, 'sandbox-2'));
+		expect(agentToken(secret, 'sandbox-1')).not.toBe(
+			agentToken('another-secret-of-at-least-32-chars', 'sandbox-1'),
+		);
+	});
+});
+
+describe('placements', () => {
+	it('lets a later instance reuse a reached sandbox after one health look, submitting nothing', async () => {
+		const placements: Placements = new Map();
+		const first: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, { placements });
+		await first.sandbox.ready();
+		const later: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, { placements });
+		await later.sandbox.readFile('/work/notebook.py');
+
+		expect(first.submitted).toHaveLength(1);
+		expect(later.submitted).toEqual([]);
+		expect(later.endpoints).toEqual([]);
+		// The first instance's channel answered, with a single look at its health.
+		expect(first.readies).toEqual([30_000, 0]);
+		expect(first.reads).toEqual(['/work/notebook.py']);
+	});
+
+	it('resolves the sandbox again when the pod it knew no longer answers', async () => {
+		const placements: Placements = new Map();
+		const gone: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			placements,
+			channel: {
+				ready: async (timeoutMs: number): Promise<void> => {
+					if (timeoutMs === 0) throw new Error('no answer');
+				},
+			},
+		});
+		await gone.sandbox.ready();
+		const later: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, { placements });
+		await later.sandbox.ready();
+
+		expect(later.submitted).toHaveLength(1);
+		expect(later.endpoints).toHaveLength(1);
+		expect(placements.size).toBe(1);
+	});
+
+	it('answers isPortReady for a sandbox another instance reached', async () => {
+		const placements: Placements = new Map();
+		const first: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, { placements });
+		await first.sandbox.ready();
+
+		expect(await stubSandbox(ok, { placements }).sandbox.isPortReady(8443)).toBe(true);
+		expect(first.waits).toHaveLength(1);
+	});
+
+	it('forgets a sandbox once it is destroyed', async () => {
+		const placements: Placements = new Map();
+		const { sandbox } = stubSandbox(ok, { placements });
+		await sandbox.ready();
+		await sandbox.destroy();
+
+		expect(placements.size).toBe(0);
+	});
+});
 
 describe('destroy', () => {
 	it('cancels the submitted job when this process submitted it', async () => {
@@ -472,6 +604,174 @@ describe('readFile', () => {
 			content: '',
 			error: { code: 'BACKEND_ERROR' },
 		});
+	});
+});
+
+describe('readFileBounded', () => {
+	const budget: { maxBytes: number; timeoutMs: number } = { maxBytes: 1024, timeoutMs: 10_000 };
+
+	it('reports the bytes as base64 whatever they are, and sends the budget', async () => {
+		const bytes: Uint8Array = new TextEncoder().encode('print(1)\n');
+		const { sandbox, boundedReads } = stubSandbox(ok, {
+			channel: {
+				readFileBounded: async (path: string, sent: ReadBudget): Promise<ReadFileOutcome> => {
+					boundedReads.push({ path, budget: sent });
+					return { outcome: 'ok', bytes };
+				},
+			},
+		});
+		const result: ReadFileResult = await sandbox.readFileBounded("/work/it's.py", budget);
+
+		expect(result).toEqual({
+			success: true,
+			content: Buffer.from(bytes).toString('base64'),
+			encoding: 'base64',
+		});
+		expect(boundedReads).toEqual([{ path: "/work/it's.py", budget }]);
+	});
+
+	it('rounds a fractional deadline up, as the port says', async () => {
+		const { sandbox, boundedReads } = stubSandbox();
+		await sandbox.readFileBounded('/work/notebook.py', { maxBytes: 0, timeoutMs: 0.5 });
+
+		expect(boundedReads[0]?.budget).toEqual({ maxBytes: 0, timeoutMs: 1 });
+	});
+
+	it('refuses an invalid budget with no request to the agent, nor a submit', async () => {
+		const { sandbox, calls, reads, boundedReads, submitted } = stubSandbox();
+		const legacyRead: Mock<typeof sandbox.readFile> = spyOn(sandbox, 'readFile');
+		const exec: Mock<typeof sandbox.exec> = spyOn(sandbox, 'exec');
+		// upstream's contract cases (computeContract.ts, "bounded reads reject invalid budgets"), then the rest of the port's bounds
+		for (const options of [
+			{ maxBytes: -1, timeoutMs: 100 },
+			{ maxBytes: Number.NaN, timeoutMs: 100 },
+			{ maxBytes: Infinity, timeoutMs: 100 },
+			{ maxBytes: 10, timeoutMs: 0 },
+			{ maxBytes: 1.5, timeoutMs: 100 },
+			{ maxBytes: Number.MAX_SAFE_INTEGER, timeoutMs: 100 },
+			{ maxBytes: 10, timeoutMs: -1 },
+			{ maxBytes: 10, timeoutMs: Number.NaN },
+			{ maxBytes: 10, timeoutMs: Infinity },
+			{ maxBytes: 10, timeoutMs: 2 ** 31 },
+		]) {
+			// oxlint-disable-next-line no-await-in-loop -- one case at a time keeps a failure readable
+			expect(await sandbox.readFileBounded('/work/notebook.py', options)).toEqual({
+				success: false,
+				content: '',
+				error: { code: 'READ_FAILED' },
+			});
+		}
+		expect(boundedReads).toEqual([]);
+		expect(reads).toEqual([]);
+		expect(calls).toEqual([]);
+		expect(submitted).toEqual([]);
+		expect(legacyRead).not.toHaveBeenCalled();
+		expect(exec).not.toHaveBeenCalled();
+	});
+
+	it('accepts the edges of a valid budget', async () => {
+		const { sandbox, boundedReads } = stubSandbox();
+		await sandbox.readFileBounded('/work/a', { maxBytes: 0, timeoutMs: 2 ** 31 - 1 });
+
+		expect(boundedReads).toHaveLength(1);
+	});
+
+	it('maps absent, refused and unreachable as readFile does', async () => {
+		const { sandbox: absent } = stubSandbox(ok, {
+			channel: { readFileBounded: async () => ({ outcome: 'not-found' }) },
+		});
+		expect(await absent.readFileBounded('/work/missing.py', budget)).toEqual({
+			success: false,
+			content: '',
+			error: { code: 'NOT_FOUND' },
+		});
+
+		const { sandbox: refused } = stubSandbox(ok, {
+			channel: {
+				readFileBounded: async () => ({ outcome: 'failed', message: 'is a symlink' }),
+			},
+		});
+		expect(await refused.readFileBounded('/work/link.py', budget)).toEqual({
+			success: false,
+			content: '',
+			error: { code: 'READ_FAILED' },
+		});
+
+		const { sandbox: unreachable } = stubSandbox(ok, {
+			channel: {
+				readFileBounded: async () => {
+					throw new Error('agent unreachable');
+				},
+			},
+		});
+		expect(await unreachable.readFileBounded('/work/notebook.py', budget)).toEqual({
+			success: false,
+			content: '',
+			error: { code: 'BACKEND_ERROR' },
+		});
+	});
+});
+
+describe('failed reads', () => {
+	const budget: { maxBytes: number; timeoutMs: number } = { maxBytes: 1024, timeoutMs: 10_000 };
+
+	it('log one line naming the path and reason when the agent refuses', async () => {
+		const { sandbox } = stubSandbox(ok, {
+			channel: {
+				readFile: async () => ({ outcome: 'failed', message: 'HTTP 500: permission denied' }),
+				readFileBounded: async () => ({ outcome: 'failed', message: 'HTTP 500: is a symlink' }),
+			},
+		});
+		await sandbox.readFile('/work/notebook.py');
+		await sandbox.readFileBounded('/work/pyproject.toml', budget);
+
+		expect(logged()).toEqual([
+			'marimohub-compute-armada: sandbox sandbox-1 could not read /work/notebook.py (READ_FAILED): HTTP 500: permission denied',
+			'marimohub-compute-armada: sandbox sandbox-1 could not read /work/pyproject.toml (READ_FAILED): HTTP 500: is a symlink',
+		]);
+	});
+
+	it('log one line when the agent cannot be reached, without the token', async () => {
+		const box: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			channel: {
+				readFileBounded: async () => {
+					// A transport error that quoted the request's header.
+					throw new Error(
+						`connection reset (Authorization: Bearer ${box.endpoints[0]?.token ?? ''})`,
+					);
+				},
+			},
+		});
+		await box.sandbox.readFileBounded('/work/notebook.py', budget);
+
+		const token: string = box.endpoints[0]?.token ?? '';
+		expect(token).not.toBe('');
+		expect(logged()).toEqual([
+			'marimohub-compute-armada: sandbox sandbox-1 could not read /work/notebook.py (BACKEND_ERROR): connection reset (Authorization: Bearer <token>)',
+		]);
+		expect(logged().join('\n')).not.toContain(token);
+	});
+
+	it('log one line for a budget refused before any request', async () => {
+		const { sandbox } = stubSandbox();
+		await sandbox.readFileBounded('/work/notebook.py', { maxBytes: -1, timeoutMs: 100 });
+
+		expect(logged()).toHaveLength(1);
+		expect(logged()[0]).toContain('could not read /work/notebook.py (READ_FAILED)');
+	});
+
+	it('stay quiet for a path that is not there, and for a read that worked', async () => {
+		const { sandbox } = stubSandbox(ok, {
+			channel: {
+				readFile: async () => ({ outcome: 'not-found' }),
+				readFileBounded: async () => ({ outcome: 'not-found' }),
+			},
+		});
+		await sandbox.readFile('/work/__marimo__/notebook.html');
+		await sandbox.readFileBounded('/work/__marimo__/notebook.html', budget);
+		await stubSandbox().sandbox.readFileBounded('/work/notebook.py', budget);
+
+		expect(logged()).toEqual([]);
 	});
 });
 

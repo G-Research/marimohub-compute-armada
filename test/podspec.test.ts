@@ -10,6 +10,7 @@ const baseEnv: Record<string, string> = {
 	ARMADA_QUEUE: 'marimohub',
 	MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
 	ARMADA_AGENT_IMAGE: 'ghcr.io/example/kernel-agent:1',
+	ARMADA_AGENT_TOKEN_SECRET: 'test-secret-of-at-least-32-characters',
 };
 const config: ArmadaConfig = readConfig(baseEnv);
 const agent: AgentSpec = { tokenSha256: 'ab'.repeat(32) };
@@ -120,6 +121,7 @@ describe('surface ports', () => {
 			ARMADA_QUEUE: 'marimohub',
 			MARIMOHUB_COMPUTE_IMAGE: 'ghcr.io/example/marimo-sandbox:latest',
 			ARMADA_AGENT_IMAGE: 'ghcr.io/example/kernel-agent:1',
+			ARMADA_AGENT_TOKEN_SECRET: 'test-secret-of-at-least-32-characters',
 			MARIMOHUB_SURFACES: 'vscode,opencode',
 		});
 		const spec: V1PodSpec = buildPodSpec(surfaced, agent);
