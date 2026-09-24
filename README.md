@@ -191,8 +191,11 @@ export ARMADA_QUEUE=marimohub
 # The agent image runs in the cluster in front of each kernel; it is the one
 # thing you push yourself. The kernel image defaults to the one marimo publishes.
 export ARMADA_AGENT_IMAGE=<registry>/marimohub-kernel-agent:<tag>
-# Generated once and kept: every process running the adapter needs the same one.
-export ARMADA_AGENT_TOKEN_SECRET=<openssl rand -hex 32>
+# The key agent tokens derive from: generated once, then kept, because every
+# process running the adapter needs the same one, across restarts too.
+[ -f ~/.config/marimohub/agent-token-secret ] ||
+  (umask 077 && mkdir -p ~/.config/marimohub && openssl rand -hex 32 >~/.config/marimohub/agent-token-secret)
+export ARMADA_AGENT_TOKEN_SECRET="$(cat ~/.config/marimohub/agent-token-secret)"
 marimohub
 ```
 

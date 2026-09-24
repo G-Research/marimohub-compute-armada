@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, it } from 'bun:test';
-import { AgentChannel, CommandTimeoutError } from '../src/channel.js';
+import { AgentChannel, CommandTimeoutError, boundedReadGiveUpMs } from '../src/channel.js';
 import type {
 	AgentEndpoint,
 	CommandResult,
@@ -440,6 +440,14 @@ describe('bounded reads', () => {
 			'HTTP 401: wrong token',
 		);
 	});
+	it('gives the agent a second past its deadline, but never past what a timer holds', () => {
+		expect(boundedReadGiveUpMs(10_000)).toBe(11_000);
+		// Node fires a timer past 2^31 - 1 after 1ms; Bun does not, so this is
+		// asserted on the number rather than by waiting for the abort.
+		expect(boundedReadGiveUpMs(2 ** 31 - 1)).toBe(2 ** 31 - 1);
+		expect(boundedReadGiveUpMs(2 ** 31 - 500)).toBe(2 ** 31 - 1);
+	});
+
 	it('reports the agent answer to its own deadline, not an abort', async () => {
 		answers['/files/bounded'] = {
 			status: 500,

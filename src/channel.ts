@@ -157,6 +157,8 @@ const TIMEOUT_SLACK_MS = 10_000;
  * gets reported, rather than an abort that says nothing.
  */
 const BOUNDED_READ_SLACK_MS = 1_000;
+/** The longest delay a timer honours; past it Node fires almost at once. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
 
 function asEvent(value: unknown): AgentEvent {
 	if (typeof value !== 'object' || value === null) {
@@ -472,7 +474,7 @@ export class AgentChannel implements ControlChannel {
 			what,
 			'GET',
 			`${filePath('/files/bounded', path)}&maxBytes=${String(budget.maxBytes)}&timeoutMs=${String(budget.timeoutMs)}`,
-			{ signal: AbortSignal.timeout(budget.timeoutMs + BOUNDED_READ_SLACK_MS) },
+			{ signal: AbortSignal.timeout(boundedReadGiveUpMs(budget.timeoutMs)) },
 		);
 		if (!response.ok) return this.readRefused(what, response);
 		let bytes: Uint8Array | undefined;
@@ -649,6 +651,16 @@ function filePath(endpoint: string, path: string): string {
 function bodyOf(response: Response): ReadableStream<Uint8Array> {
 	if (response.body === null) throw new Error('the response had no body');
 	return response.body;
+}
+
+/**
+ * When the client abandons a bounded read: the slack past the agent's deadline,
+ * but never past what a timer holds. Node fires an overflowing timer after 1ms,
+ * which would abort every read whose deadline is within a second of the
+ * largest the port allows.
+ */
+export function boundedReadGiveUpMs(timeoutMs: number): number {
+	return Math.min(timeoutMs + BOUNDED_READ_SLACK_MS, MAX_TIMER_MS);
 }
 
 /** The whole body, or undefined as soon as it runs past `maxBytes`. */

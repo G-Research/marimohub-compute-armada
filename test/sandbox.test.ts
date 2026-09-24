@@ -752,6 +752,19 @@ describe('failed reads', () => {
 		expect(logged().join('\n')).not.toContain(token);
 	});
 
+	it('keep to one line when the path or the reason holds a newline', async () => {
+		const { sandbox } = stubSandbox(ok, {
+			channel: {
+				readFileBounded: async () => ({ outcome: 'failed', message: 'first\nsecond' }),
+			},
+		});
+		await sandbox.readFileBounded('/work/odd\nname.py', budget);
+
+		expect(logged()).toEqual([
+			'marimohub-compute-armada: sandbox sandbox-1 could not read /work/odd\\nname.py (READ_FAILED): first\\nsecond',
+		]);
+	});
+
 	it('log one line for a budget refused before any request', async () => {
 		const { sandbox } = stubSandbox();
 		await sandbox.readFileBounded('/work/notebook.py', { maxBytes: -1, timeoutMs: 100 });

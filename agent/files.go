@@ -87,6 +87,11 @@ func (a *agent) readFile(w http.ResponseWriter, r *http.Request) {
 // budget the caller can name exactly.
 const maxSafeInteger = 1<<53 - 1
 
+// maxPreallocBytes caps how much of a file's reported size a bounded read
+// allocates before reading. It covers marimohub's own per-file budget, 25 MB,
+// so a file it captures is still read into one buffer.
+const maxPreallocBytes = 32 << 20
+
 // maxTimeoutMs is the largest delay a JavaScript timer honours, and the
 // largest deadline marimohub's bounded-read contract allows.
 const maxTimeoutMs = 1<<31 - 1
@@ -115,8 +120,12 @@ func (a *agent) readFileBounded(w http.ResponseWriter, r *http.Request) {
 		writeCodedError(w, http.StatusBadRequest, "read_failed", "timeoutMs must be an integer from 1 to 2^31-1")
 		return
 	}
-	if !strings.HasPrefix(path, "/") || slices.Contains(strings.Split(path, "/"), "..") {
-		writeCodedError(w, http.StatusBadRequest, "read_failed", "path must be absolute, without ..: "+path)
+	// The last component must name the file: `openNoFollow` skips empty and
+	// `.` components, so `/a/file/` or `/a/file/.` would otherwise open
+	// `/a/file` where the kernel would refuse the trailing part.
+	names := strings.Split(path, "/")
+	if last := names[len(names)-1]; !strings.HasPrefix(path, "/") || slices.Contains(names, "..") || last == "" || last == "." {
+		writeCodedError(w, http.StatusBadRequest, "read_failed", "path must be absolute, name a file and have no ..: "+path)
 		return
 	}
 
@@ -182,9 +191,11 @@ func (a *agent) readBounded(ctx context.Context, path string, maxBytes int64) ([
 	if info.Size() > maxBytes {
 		return nil, fmt.Errorf("%s is %d bytes, over the budget of %d", path, info.Size(), maxBytes)
 	}
-	// Sized from fstat, with room to see one byte past it and no regrowth.
+	// Sized from fstat, with room to see one byte past it and no regrowth, up
+	// to a point: a sparse file can claim a size it never fills, so past that
+	// the buffer grows with what is actually read.
 	var data bytes.Buffer
-	data.Grow(int(info.Size()) + bytes.MinRead)
+	data.Grow(int(min(info.Size(), maxPreallocBytes)) + bytes.MinRead)
 	if _, err := data.ReadFrom(io.LimitReader(contextReader{ctx, file}, maxBytes+1)); err != nil {
 		return nil, err
 	}

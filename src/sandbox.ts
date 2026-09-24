@@ -53,6 +53,14 @@ function decodeUtf8(bytes: Uint8Array): string | undefined {
 	}
 }
 
+/** Control characters escaped as JSON would, so a value cannot break a log line. */
+function oneLine(text: string): string {
+	// oxlint-disable-next-line no-control-regex -- matching control characters is the point
+	return text.replace(/[\u0000-\u001f\u007f]/g, (char: string): string =>
+		JSON.stringify(char).slice(1, -1),
+	);
+}
+
 function reason(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -458,7 +466,8 @@ export class ArmadaSandbox implements SandboxInstance {
 	 * session whose notebook is left out commits nothing and is then destroyed,
 	 * so this line is the only trace of edits lost that way. `NOT_FOUND` never
 	 * comes here: capture reads paths that routinely do not exist. The token is
-	 * masked in case a transport error ever quotes a header.
+	 * masked in case a transport error ever quotes a header, and control
+	 * characters are escaped, since a workspace file name may hold a newline.
 	 */
 	private readFailed(
 		path: string,
@@ -467,7 +476,7 @@ export class ArmadaSandbox implements SandboxInstance {
 	): ReadFileResult {
 		const said: string = why.replaceAll(this.token, '<token>');
 		console.warn(
-			`marimohub-compute-armada: sandbox ${this.id} could not read ${path} (${code}): ${said}`,
+			`marimohub-compute-armada: sandbox ${this.id} could not read ${oneLine(path)} (${code}): ${oneLine(said)}`,
 		);
 		return { success: false, content: '', error: { code } };
 	}

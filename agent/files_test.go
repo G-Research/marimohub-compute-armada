@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -258,6 +259,34 @@ func TestBoundedReadRefusesAFileOneByteOverTheCap(t *testing.T) {
 	}
 }
 
+func TestBoundedReadDoesNotAllocateASparseFileUpFront(t *testing.T) {
+	path := filepath.Join(boundedDir(t), "sparse.bin")
+	// A gigabyte on paper and nothing on disk: a budget that covers the
+	// claimed size must not turn into an allocation of it.
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, 1<<30); err != nil {
+		t.Fatal(err)
+	}
+	// Already done, so the read stops at its first chunk and what is left to
+	// measure is the buffer allocated before it.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := testAgent().readBounded(ctx, path, 1<<31); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want the cancelled read", err)
+	}
+	runtime.ReadMemStats(&after)
+	// The capped buffer, perhaps twice over as bytes.Buffer grows it, and far
+	// below the gigabyte the file claims.
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 4*maxPreallocBytes {
+		t.Errorf("allocated %d bytes for a file that holds none", allocated)
+	}
+}
+
 func TestBoundedReadReadsAnEmptyFileWithAZeroBudget(t *testing.T) {
 	server := testServer(t)
 	path := filepath.Join(boundedDir(t), "empty.py")
@@ -347,6 +376,9 @@ func TestBoundedReadRefusesABadPathOrBudgetBeforeOpening(t *testing.T) {
 	for _, target := range []string{
 		boundedURL("notebook.py", "100", "5000"),
 		boundedURL("/workspace/../etc/passwd", "100", "5000"),
+		boundedURL("/workspace/notebook.py/", "100", "5000"),
+		boundedURL("/workspace/notebook.py/.", "100", "5000"),
+		boundedURL("/", "100", "5000"),
 		boundedURL("/workspace/notebook.py", "-1", "5000"),
 		boundedURL("/workspace/notebook.py", "9007199254740992", "5000"),
 		boundedURL("/workspace/notebook.py", "1.5", "5000"),
