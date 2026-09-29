@@ -27,12 +27,22 @@ export class ArmadaCompute implements SandboxProvider {
 	 * Every pod declares the enabled surfaces' ports next to the kernel's and
 	 * Armada exposes them all, so a second port has an address exactly when a
 	 * surface is configured. marimohub refuses to start a surface otherwise.
+	 *
+	 * The profile flags are what make marimohub (0.4.13 onwards) offer compute
+	 * profiles at all and pass their `resources` to `create`.
 	 */
-	readonly capabilities: { multiPort: boolean };
+	readonly capabilities: { multiPort: boolean; computeProfiles: boolean; gpuProfiles: boolean };
 
 	constructor(private readonly config: ArmadaConfig) {
 		this.armada = new ArmadaClient(config);
-		this.capabilities = { multiPort: config.surfacePorts.length > 0 };
+		this.capabilities = {
+			multiPort: config.surfacePorts.length > 0,
+			// CPU and memory become the kernel container's requests and limits.
+			computeProfiles: true,
+			// A GPU count alone would put an `A100` profile on any GPU node, so GPU
+			// profiles are offered only once each type maps to a node selector.
+			gpuProfiles: Object.keys(config.gpuNodeSelectors).length > 0,
+		};
 		// `findQueue` answers `undefined` by itself when Lookout is not configured.
 		this.queues = new QueueDirectory(config, async (id: SandboxId): Promise<string | undefined> =>
 			this.armada.findQueue(id),

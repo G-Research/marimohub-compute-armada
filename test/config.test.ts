@@ -218,3 +218,68 @@ describe('ARMADA_AGENT_TOKEN_SECRET', () => {
 		expect(readConfig(baseEnv).agentTokenSecret).toBe('test-secret-of-at-least-32-characters');
 	});
 });
+
+describe('ARMADA_GPU_NODE_SELECTORS', () => {
+	const a100: string = '{"A100": {"nvidia.com/gpu.product": "NVIDIA-A100-SXM4-80GB"}}';
+
+	it('is empty when unset, which leaves GPU profiles off', () => {
+		expect(readConfig(baseEnv).gpuNodeSelectors).toEqual({});
+	});
+
+	it('upper-cases each type, as marimohub does with the type a profile names', () => {
+		const config: ArmadaConfig = readConfig({
+			...baseEnv,
+			ARMADA_GPU_NODE_SELECTORS:
+				'{"h100": {"nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3", "pool": "gpu"}}',
+		});
+		expect(config.gpuNodeSelectors).toEqual({
+			H100: { 'nvidia.com/gpu.product': 'NVIDIA-H100-80GB-HBM3', pool: 'gpu' },
+		});
+	});
+
+	it('rejects anything but an object of non-empty label maps', () => {
+		for (const value of [
+			'nope',
+			'[]',
+			'{"A100": "NVIDIA-A100"}',
+			'{"A100": {}}',
+			'{"A100": {"k": ""}}',
+		]) {
+			expect(() => readConfig({ ...baseEnv, ARMADA_GPU_NODE_SELECTORS: value })).toThrow(
+				'ARMADA_GPU_NODE_SELECTORS',
+			);
+		}
+	});
+
+	it('refuses a map that names nothing rather than silently turning GPUs off', () => {
+		expect(() => readConfig({ ...baseEnv, ARMADA_GPU_NODE_SELECTORS: '{}' })).toThrow(
+			'must map at least one GPU type',
+		);
+	});
+
+	it('refuses at startup a profile whose GPU type it does not map', () => {
+		expect(() =>
+			readConfig({
+				...baseEnv,
+				ARMADA_GPU_NODE_SELECTORS: a100,
+				MARIMOHUB_COMPUTE_PROFILES: 'small:cpu=1;mem=2Gi,gpu:cpu=8;mem=32Gi;gpu=h100:2',
+			}),
+		).toThrow('names GPU type H100, which ARMADA_GPU_NODE_SELECTORS does not map; it maps A100');
+	});
+
+	it('accepts profiles whose GPU types are all mapped, in any case', () => {
+		expect(() =>
+			readConfig({
+				...baseEnv,
+				ARMADA_GPU_NODE_SELECTORS: a100,
+				MARIMOHUB_COMPUTE_PROFILES: 'small:cpu=1,gpu:gpu=a100;cpu=8, big:gpu=A100:4',
+			}),
+		).not.toThrow();
+	});
+
+	it('leaves GPU profiles to marimohub when unset, which strips them and says so', () => {
+		expect(() =>
+			readConfig({ ...baseEnv, MARIMOHUB_COMPUTE_PROFILES: 'gpu:cpu=8;gpu=H100' }),
+		).not.toThrow();
+	});
+});
