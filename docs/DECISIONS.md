@@ -121,6 +121,40 @@ can flush, and the agent forwards `SIGTERM` and waits 25s inside that.
 GPU needs nothing Armada-specific: an ordinary `nvidia.com/gpu` request, and the server adds
 the toleration itself (`config/server/config.yaml:55`).
 
+## Compute profiles
+
+**The adapter declares profile support; marimohub does the rest.** marimohub offers compute
+profiles (the per-notebook picker, the editor override, `resources` on `create`) only to a
+backend it knows applies them. For a library adapter that knowledge comes from
+`capabilities.computeProfiles` and `capabilities.gpuProfiles` on the provider
+(marimo-team/marimohub#419, released in 0.4.13); a marimohub without them sends no
+`resources` at all. CPU and memory are always applied, so `computeProfiles` is always on.
+They land as the kernel container's requests and limits, equal as Armada requires, and
+memory is written as `Gi` or `Mi` rather than marimohub's byte count so it reads in
+Lookout the way the profile was written.
+
+**A GPU type is placement, and GPUs are off until it can be placed.** The count is an
+ordinary `nvidia.com/gpu` request (the server adds the toleration, above). The type
+(`A100`, `H100`) is a node label, and which label and which values are the cluster's
+business, so `ARMADA_GPU_NODE_SELECTORS` maps each type to a `nodeSelector`.
+`gpuProfiles` is on exactly when that map is set. Without it marimohub strips GPUs from
+every profile and warns at startup, which beats scheduling an `A100` profile on whatever
+GPU is free. With it, `readConfig` refuses a profile whose type the map does not name,
+reading marimohub's own `MARIMOHUB_COMPUTE_PROFILES` for the types as it reads the surface
+variables, and the pod spec refuses one again as the backstop. A plain `nodeSelector`, not
+node affinity: Armada rejects the preferred kind (`submit_request.go:182`) and the required
+kind says nothing more here.
+
+**Only tracked labels can be selected on.** An executor reports a node's labels to the
+scheduler filtered to its `kubernetes.trackedNodeLabels`
+(`internal/executor/utilisation/cluster_utilisation.go:114`, `:387`), which ship as
+`kubernetes.io/hostname` alone (`config/executor/config.yaml:46`), and the field's own
+comment says only those can be referenced in a job's `nodeSelector`
+(`internal/executor/configuration/types.go:108`). The scheduler treats a selector on a label
+it never saw as unmatched (`internal/scheduler/nodedb/nodematching.go:215`), so the job is
+not refused: it stays queued. The adapter cannot see executor configuration, so this is
+documented for the operator rather than checked.
+
 ## Reaching the pod
 
 **An agent in the pod, not a Kubernetes credential.** Armada's API is submit, cancel,
@@ -436,6 +470,9 @@ possible to apply without choosing.
   and priority settings above are applied.
 - That an ingress controller other than ingress-nginx serves a class-less Ingress, carries
   the websocket, and routes to a ClusterIP service.
+- That compute profiles work end to end: a profile picked in marimohub 0.4.13 reaching the
+  pod's requests, and a GPU profile's `nodeSelector` scheduling on a real GPU cluster whose
+  executors track the label. The mapping is unit-tested; neither was run live.
 - That `listActive` answers against a real Lookout under auth. The tests stub its responses;
   the local cluster's Lookout runs anonymous.
 - That an actual VS Code or OpenCode surface session works. The port and readiness mechanics

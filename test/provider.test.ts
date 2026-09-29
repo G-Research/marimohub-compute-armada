@@ -50,13 +50,33 @@ describe('queue maps', () => {
 
 describe('multiPort capability', () => {
 	it('is off with no surface configured, so marimohub refuses to start one', () => {
-		expect(new ArmadaCompute(readConfig(baseEnv)).capabilities).toEqual({ multiPort: false });
+		expect(new ArmadaCompute(readConfig(baseEnv)).capabilities.multiPort).toBe(false);
 	});
 
 	it('is on exactly when a surface port is declared on every pod', () => {
 		const provider: ArmadaCompute = new ArmadaCompute(
 			readConfig({ ...baseEnv, MARIMOHUB_SURFACES: 'vscode' }),
 		);
-		expect(provider.capabilities).toEqual({ multiPort: true });
+		expect(provider.capabilities.multiPort).toBe(true);
+	});
+});
+
+describe('compute profile capabilities', () => {
+	it('apply CPU and memory always, and GPUs only with a node selector map', () => {
+		expect(new ArmadaCompute(readConfig(baseEnv)).capabilities).toEqual({
+			multiPort: false,
+			computeProfiles: true,
+			gpuProfiles: false,
+		});
+	});
+
+	it('apply GPUs once each type maps to a node selector', () => {
+		const provider: ArmadaCompute = new ArmadaCompute(
+			readConfig({
+				...baseEnv,
+				ARMADA_GPU_NODE_SELECTORS: '{"A100": {"nvidia.com/gpu.product": "NVIDIA-A100-SXM4-80GB"}}',
+			}),
+		);
+		expect(provider.capabilities.gpuProfiles).toBe(true);
 	});
 });

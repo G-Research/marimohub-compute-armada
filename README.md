@@ -57,6 +57,7 @@ in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `ARMADA_INGRESS_ANNOTATIONS`         | no       | JSON object put on every job's Ingress                |
 | `ARMADA_QUEUE_BY_USER`               | no       | JSON object, marimohub user id to queue               |
 | `ARMADA_QUEUE_BY_PROJECT`            | no       | JSON object, marimohub project id to queue            |
+| `ARMADA_GPU_NODE_SELECTORS`          | no       | JSON object, GPU type to node selector; enables GPUs  |
 | `MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME` | no       | Public kernel hostname                                |
 | `ARMADA_AUTH_USERNAME`               | no       | Basic auth, set with the password                     |
 | `ARMADA_AUTH_PASSWORD`               | no       | Basic auth, set with the username                     |
@@ -125,6 +126,29 @@ Lookout by job set for a sandbox it has never seen, since marimohub addresses sa
 id alone on several paths. A queue map therefore requires `ARMADA_LOOKOUT_URL`, and a
 call Lookout cannot answer fails rather than guesses; marimohub retries it.
 
+Compute profiles (`MARIMOHUB_COMPUTE_PROFILES`, marimohub 0.4.13 onwards) let editors
+pick hardware per notebook: when creating it, later through "Change compute profile", or
+for one edit session. The adapter tells marimohub it applies them, and a profile's CPU
+and memory become the kernel container's requests and limits, which Armada requires to
+be equal. So a kernel that outgrows its profile's memory is OOM-killed, and every session
+is charged its full profile against the queue's fair share, idle or not. Offer a short
+list of sizes rather than one large default. Users can only pick when
+`MARIMOHUB_COMPUTE_PROFILE_OVERRIDE=editors`.
+
+```bash
+MARIMOHUB_COMPUTE_PROFILES='small:cpu=1;mem=4Gi,large:cpu=4;mem=32Gi,a100:cpu=8;mem=64Gi;gpu=A100'
+MARIMOHUB_COMPUTE_PROFILE_OVERRIDE=editors
+ARMADA_GPU_NODE_SELECTORS='{"A100": {"nvidia.com/gpu.product": "NVIDIA-A100-SXM4-80GB"}}'
+```
+
+A profile's GPU count becomes an `nvidia.com/gpu` request. Its type is placement, so
+GPU profiles are only on when `ARMADA_GPU_NODE_SELECTORS` maps every type the profiles
+name to a `nodeSelector`; without the map, marimohub drops the GPUs from every profile
+and says so at startup, and a type the map misses stops startup. The label values are
+the cluster's (`kubectl get nodes -L nvidia.com/gpu.product`), and every label used must
+be in each executor's `kubernetes.trackedNodeLabels`: the scheduler only sees tracked
+labels, so a selector on any other stays queued for good.
+
 Session surfaces (VS Code or OpenCode inside the sandbox, `MARIMOHUB_SURFACES`) need a
 port each next to the kernel's. The adapter reads marimohub's own `MARIMOHUB_SURFACES`
 and `MARIMOHUB_SURFACE_<ID>_PORT` settings, declares those ports on every pod so Armada
@@ -177,7 +201,7 @@ binary at it. The agent image is still needed, since it runs in the cluster.
 sudo install -D dist/index.js /etc/marimohub/compute.mjs
 
 # The binary, at the release the Dockerfile names, checked against its published hash.
-V=0.4.6
+V=0.4.13
 curl -fsSLO "https://github.com/marimo-team/marimohub/releases/download/v$V/marimohub-linux-x64"
 curl -fsSLO "https://github.com/marimo-team/marimohub/releases/download/v$V/marimohub-linux-x64.sha256"
 sha256sum -c marimohub-linux-x64.sha256

@@ -218,9 +218,18 @@ export interface SandboxProvider {
 	/**
 	 * `multiPort`: every sandbox exposes the ports of the enabled surfaces next
 	 * to the kernel's. marimohub refuses to start a surface without it.
+	 *
+	 * `computeProfiles`: the provider applies `resources.cpu` and
+	 * `resources.memoryBytes`. `gpuProfiles`: it applies `resources.gpu` too, and
+	 * implies `computeProfiles`. marimohub only offers compute profiles to a
+	 * library adapter that sets one of them; without, it sends no `resources`
+	 * at all. Added in marimo-team/marimohub#419, released in 0.4.13; an older
+	 * marimohub ignores both.
 	 */
 	readonly capabilities?: {
 		multiPort: boolean;
+		computeProfiles?: boolean;
+		gpuProfiles?: boolean;
 	};
 	create(id: SandboxId, options?: CreateSandboxOptions): SandboxInstance;
 	proxy(request: Request): Promise<Response | null>;

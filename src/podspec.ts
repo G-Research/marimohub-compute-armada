@@ -49,21 +49,62 @@ const TERMINATION_GRACE_SECONDS = 30;
 /** Copying one small binary needs next to nothing, but Armada insists it be stated. */
 const AGENT_INSTALL_RESOURCES: Record<string, string> = { cpu: '100m', memory: '64Mi' };
 
+const MI: number = 1024 ** 2;
+const GI: number = 1024 ** 3;
+
+/**
+ * marimohub hands memory over in bytes. Kubernetes takes a byte count as is, but
+ * `8Gi` is what an operator reads in Lookout and `kubectl`. marimohub's profiles
+ * are whole `Mi` at least (`mem=<n><Mi|Gi|Ti>`); anything else stays bytes,
+ * rounded up so a fraction is never refused.
+ */
+function memoryQuantity(bytes: number): string {
+	if (bytes % GI === 0) return `${String(bytes / GI)}Gi`;
+	if (bytes % MI === 0) return `${String(bytes / MI)}Mi`;
+	return String(Math.ceil(bytes));
+}
+
+/** `A100:2` is two of that type, `A100` one. The type is upper-cased by marimohub. */
+function parseGpu(gpu: string): { type: string; count: string } {
+	const [type = '', count = '1'] = gpu.split(':');
+	return { type: type.toUpperCase(), count };
+}
+
 function quantities(resources: ComputeResources | undefined): Record<string, string> {
 	const requested: Record<string, string> = {
 		cpu: resources?.cpu === undefined ? DEFAULT_CPU : String(resources.cpu),
-		memory: resources?.memoryBytes === undefined ? DEFAULT_MEMORY : String(resources.memoryBytes),
+		memory:
+			resources?.memoryBytes === undefined ? DEFAULT_MEMORY : memoryQuantity(resources.memoryBytes),
 	};
 
+	// Armada schedules the count as an ordinary resource and adds the GPU
+	// toleration itself; the type is placement, which `gpuNodeSelector` answers.
 	if (resources?.gpu !== undefined && resources.gpu !== '') {
-		// `A100:2` means two of that type. Armada schedules the count as an ordinary
-		// resource; the type would need a cluster-specific node label, so it is not
-		// mapped yet.
-		const [, count = '1'] = resources.gpu.split(':');
-		requested['nvidia.com/gpu'] = count;
+		requested['nvidia.com/gpu'] = parseGpu(resources.gpu).count;
 	}
 
 	return requested;
+}
+
+/**
+ * Where a GPU of the requested type is, from `ARMADA_GPU_NODE_SELECTORS`, or
+ * nothing when no GPU is asked for. A type the map does not name fails the
+ * submission: `readConfig` already refuses a profile like that at startup, so
+ * this is the backstop, and a pod on the wrong GPU is not an answer.
+ */
+function gpuNodeSelector(
+	config: ArmadaConfig,
+	resources: ComputeResources | undefined,
+): Record<string, string> | undefined {
+	if (resources?.gpu === undefined || resources.gpu === '') return undefined;
+	const { type } = parseGpu(resources.gpu);
+	const selector: Record<string, string> | undefined = config.gpuNodeSelectors[type];
+	if (selector === undefined) {
+		throw new Error(
+			`GPU type ${type} has no node selector in ARMADA_GPU_NODE_SELECTORS, so a pod cannot be placed on it`,
+		);
+	}
+	return selector;
 }
 
 /**
@@ -88,6 +129,10 @@ export function buildPodSpec(
 	options?: CreateSandboxOptions,
 ): V1PodSpec {
 	const resources: Record<string, string> = quantities(options?.resources);
+	const nodeSelector: Record<string, string> | undefined = gpuNodeSelector(
+		config,
+		options?.resources,
+	);
 	const context: V1PodSecurityContext | undefined = securityContext(config);
 
 	return {
@@ -97,6 +142,9 @@ export function buildPodSpec(
 		...(config.priorityClassName === undefined
 			? {}
 			: { priorityClassName: config.priorityClassName }),
+		// A plain selector: Armada rejects the preferred kind of node affinity, and
+		// only matches labels the executor tracks (docs/DECISIONS.md).
+		...(nodeSelector === undefined ? {} : { nodeSelector }),
 		// The worker cluster pulls both images, so the credential is named here.
 		...(config.imagePullSecrets.length === 0
 			? {}

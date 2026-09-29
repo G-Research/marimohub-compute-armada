@@ -13,6 +13,13 @@ const baseEnv: Record<string, string> = {
 	ARMADA_AGENT_TOKEN_SECRET: 'test-secret-of-at-least-32-characters',
 };
 const config: ArmadaConfig = readConfig(baseEnv);
+const gpuConfig: ArmadaConfig = readConfig({
+	...baseEnv,
+	ARMADA_GPU_NODE_SELECTORS: JSON.stringify({
+		A100: { 'nvidia.com/gpu.product': 'NVIDIA-A100-SXM4-80GB' },
+		H100: { 'nvidia.com/gpu.product': 'NVIDIA-H100-80GB-HBM3' },
+	}),
+});
 const agent: AgentSpec = { tokenSha256: 'ab'.repeat(32) };
 
 describe('podspec', () => {
@@ -73,23 +80,53 @@ describe('podspec', () => {
 	});
 
 	it('takes the image and resources marimohub asks for', () => {
-		const spec: V1PodSpec = buildPodSpec(config, agent, {
+		const spec: V1PodSpec = buildPodSpec(gpuConfig, agent, {
 			image: 'other:tag',
-			resources: { cpu: 4, memoryBytes: 8589934592, gpu: 'A100:2' },
+			resources: { cpu: 4, memoryBytes: 8 * 1024 ** 3, gpu: 'A100:2' },
 		});
 		const container: V1Container | undefined = spec.containers[0];
 
 		expect(container?.image).toBe('other:tag');
 		expect(container?.resources?.requests).toEqual({
 			cpu: '4',
-			memory: '8589934592',
+			memory: '8Gi',
 			'nvidia.com/gpu': '2',
 		});
+		expect(container?.resources?.limits).toEqual(container?.resources?.requests ?? {});
+	});
+
+	it('states memory in the largest unit that divides it, and bytes otherwise', () => {
+		const memory: (memoryBytes: number) => string | undefined = (
+			memoryBytes: number,
+		): string | undefined =>
+			buildPodSpec(config, agent, { resources: { memoryBytes } }).containers[0]?.resources
+				?.requests?.['memory'];
+
+		expect(memory(2 * 1024 ** 3)).toBe('2Gi');
+		expect(memory(1.5 * 1024 ** 3)).toBe('1536Mi');
+		expect(memory(1000.5)).toBe('1001');
 	});
 
 	it('defaults a gpu without a count to one', () => {
-		const spec: V1PodSpec = buildPodSpec(config, agent, { resources: { gpu: 'A100' } });
+		const spec: V1PodSpec = buildPodSpec(gpuConfig, agent, { resources: { gpu: 'A100' } });
 		expect(spec.containers[0]?.resources?.requests?.['nvidia.com/gpu']).toBe('1');
+	});
+
+	it('places a GPU pod with the node selector its type maps to', () => {
+		expect(buildPodSpec(gpuConfig, agent, { resources: { gpu: 'H100:2' } }).nodeSelector).toEqual({
+			'nvidia.com/gpu.product': 'NVIDIA-H100-80GB-HBM3',
+		});
+		// No GPU asked for, no selector: a CPU profile may land on any node.
+		expect('nodeSelector' in buildPodSpec(gpuConfig, agent, { resources: { cpu: 2 } })).toBe(false);
+	});
+
+	it('refuses a GPU type with no node selector rather than place it on any GPU', () => {
+		expect(() => buildPodSpec(gpuConfig, agent, { resources: { gpu: 'L4' } })).toThrow(
+			'GPU type L4 has no node selector',
+		);
+		expect(() => buildPodSpec(config, agent, { resources: { gpu: 'A100' } })).toThrow(
+			'GPU type A100 has no node selector',
+		);
 	});
 
 	it('exposes every port the pod declares, and only those', () => {

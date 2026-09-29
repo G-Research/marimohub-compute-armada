@@ -104,6 +104,14 @@ export interface ArmadaConfig {
 	 */
 	surfacePorts: number[];
 	/**
+	 * GPU type, as a compute profile names it, to the `nodeSelector` that puts a
+	 * pod on a node with that GPU. Keys are upper-cased, as marimohub upper-cases
+	 * the type. Empty means GPU profiles are not offered: without a mapping the
+	 * type could only be dropped, and an `A100` profile landing on whatever GPU
+	 * is free is worse than marimohub saying at startup that GPUs are ignored.
+	 */
+	gpuNodeSelectors: Record<string, Record<string, string>>;
+	/**
 	 * Hard cap on one session, submitted as `activeDeadlineSeconds`. Armada gives
 	 * any pod without one the server default, 72 hours as shipped, so a kernel must
 	 * always carry its own.
@@ -391,6 +399,68 @@ function readSurfacePorts(env: Record<string, string | undefined>): number[] {
 	return ports;
 }
 
+/**
+ * `ARMADA_GPU_NODE_SELECTORS`: a JSON object of GPU type to a non-empty object
+ * of node label to value. Set but naming nothing is refused, as an empty map
+ * would silently turn GPU profiles off.
+ */
+function readGpuNodeSelectors(
+	env: Record<string, string | undefined>,
+): Record<string, Record<string, string>> {
+	const name: string = 'ARMADA_GPU_NODE_SELECTORS';
+	const raw: string | undefined = env[name];
+	if (raw === undefined) return {};
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		throw new Error(`${name} must be a JSON object, got: ${raw}`);
+	}
+	if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+		throw new Error(`${name} must be a JSON object, got: ${raw}`);
+	}
+	const selectors: Record<string, Record<string, string>> = {};
+	for (const [type, selector] of Object.entries(parsed)) {
+		const invalid: Error = new Error(
+			`${name}: ${type} must be an object of node label to value, like {"nvidia.com/gpu.product": "NVIDIA-A100-SXM4-80GB"}`,
+		);
+		if (typeof selector !== 'object' || selector === null || Array.isArray(selector)) {
+			throw invalid;
+		}
+		const labels: Record<string, string> = {};
+		for (const [label, value] of Object.entries(selector)) {
+			if (!label.trim() || typeof value !== 'string' || !value.trim()) throw invalid;
+			labels[label] = value;
+		}
+		if (Object.keys(labels).length === 0) throw invalid;
+		selectors[type.toUpperCase()] = labels;
+	}
+	if (Object.keys(selectors).length === 0) {
+		throw new Error(`${name} must map at least one GPU type`);
+	}
+	return selectors;
+}
+
+/**
+ * The GPU types marimohub's `MARIMOHUB_COMPUTE_PROFILES` names, upper-cased as
+ * marimohub stores them. marimohub validates the variable in full
+ * (`packages/config/src/computeProfiles.ts`), so this only has to find the
+ * `gpu=<type>[:<count>]` entries in `name:key=value;…,…`.
+ */
+function profileGpuTypes(env: Record<string, string | undefined>): string[] {
+	const types: string[] = [];
+	for (const profile of (env.MARIMOHUB_COMPUTE_PROFILES ?? '').split(',')) {
+		const body: string = profile.slice(profile.indexOf(':') + 1);
+		for (const pair of body.split(';')) {
+			const [key = '', value = ''] = pair.split('=');
+			if (key.trim() !== 'gpu') continue;
+			const type: string = value.split(':')[0]?.trim().toUpperCase() ?? '';
+			if (type !== '') types.push(type);
+		}
+	}
+	return types;
+}
+
 /** A day, when neither marimohub nor the environment says otherwise. */
 const DEFAULT_MAX_LIFETIME_SECONDS = 24 * 60 * 60;
 
@@ -440,6 +510,7 @@ export function readConfig(
 		runAsGroup: optionalId(env, 'ARMADA_RUN_AS_GROUP'),
 		fsGroup: optionalId(env, 'ARMADA_FS_GROUP'),
 		surfacePorts: readSurfacePorts(env),
+		gpuNodeSelectors: readGpuNodeSelectors(env),
 		lookoutUrl: optionalUrl(env, 'ARMADA_LOOKOUT_URL'),
 		maxLifetimeSeconds:
 			compute?.sessionMaxLifetimeSeconds ??
@@ -461,6 +532,19 @@ export function readConfig(
 		if (port === config.agentPort || port === config.port) {
 			throw new Error(
 				`A surface port (MARIMOHUB_SURFACE_*_PORT) is ${String(port)}, which is the ${port === config.port ? 'kernel' : 'agent'} port; each needs its own`,
+			);
+		}
+	}
+	// With a mapping configured, GPU profiles are on, and a profile whose type it
+	// does not name would fail every session started on it. Without one, marimohub
+	// strips GPUs from every profile itself and says so at startup.
+	if (Object.keys(config.gpuNodeSelectors).length > 0) {
+		const unmapped: string[] = profileGpuTypes(env).filter(
+			(type: string) => config.gpuNodeSelectors[type] === undefined,
+		);
+		if (unmapped.length > 0) {
+			throw new Error(
+				`MARIMOHUB_COMPUTE_PROFILES names GPU type ${[...new Set(unmapped)].join(', ')}, which ARMADA_GPU_NODE_SELECTORS does not map; it maps ${Object.keys(config.gpuNodeSelectors).join(', ')}`,
 			);
 		}
 	}
