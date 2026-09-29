@@ -62,7 +62,7 @@ describe('multiPort capability', () => {
 });
 
 describe('compute profile capabilities', () => {
-	it('apply CPU and memory always, and GPUs only without a node selector map', () => {
+	it('apply CPU and memory always, and GPUs only with a node selector map', () => {
 		expect(new ArmadaCompute(readConfig(baseEnv)).capabilities).toEqual({
 			multiPort: false,
 			computeProfiles: true,
