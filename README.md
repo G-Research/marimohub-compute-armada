@@ -200,6 +200,7 @@ What configuration decides:
 | Exposure                | `ARMADA_EXPOSE`: a NodePort service or an Ingress                                |
 | Ingress settings        | `ARMADA_INGRESS_TLS`, `ARMADA_INGRESS_CERT_NAME`, `ARMADA_INGRESS_ANNOTATIONS`   |
 | Ports                   | `ARMADA_KERNEL_PORT`, `ARMADA_AGENT_PORT`, `MARIMOHUB_SURFACE_<ID>_PORT`         |
+| Surfaces                | `MARIMOHUB_SURFACES`, which picks the surfaces whose ports are declared          |
 | Resources               | The compute profile's CPU, memory and GPU count                                  |
 | Node selector           | `ARMADA_GPU_NODE_SELECTORS`, the entry for the profile's GPU type                |
 | Priority class          | `ARMADA_PRIORITY_CLASS`                                                          |
@@ -244,8 +245,9 @@ each command. So those credentials:
 - cross the network as plain HTTP under `ARMADA_EXPOSE=nodeport`, readable by anyone who
   can watch the cluster network; use `ingress` with TLS where that matters;
 - are visible to every process in the kernel container, as on any marimohub backend;
-- never appear in the adapter's own error messages, which name the program run and never
-  its arguments.
+- never appear in the adapter's own error messages. Those name the command marimohub
+  asked for at most, never the `export` statements put in front of it, so a credential
+  written into the command itself would still show.
 
 What a notebook prints stays out of Lookout as well. The kernel's output goes to a log file
 inside the pod and command output goes back over the agent, so the container log, which is
