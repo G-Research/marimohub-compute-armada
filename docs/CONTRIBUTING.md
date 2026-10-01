@@ -246,8 +246,11 @@ the binary in the foreground with `MARIMOHUB_COMPUTE_LIBRARY` pointing at
 `dev/data/` and the binary unpacks itself under `~/.cache/marimohub-sea/`. The same
 variables apply, except `IMAGE` and `CONTAINER`; `DATA` moves the storage root, and
 since every variable in the environment reaches the process, anything the README lists
-can simply be exported. The two scripts keep separate storage (a Docker volume against
-`dev/data/`), so notebooks made under one are not seen by the other.
+can simply be exported. It also offers three compute profiles (`small`, `medium` and
+`large`, up to 4 CPUs and 8Gi) that editors can pick per notebook; set
+`MARIMOHUB_COMPUTE_PROFILES` or `MARIMOHUB_COMPUTE_PROFILE_OVERRIDE` to change them.
+The two scripts keep separate storage (a Docker volume against `dev/data/`), so
+notebooks made under one are not seen by the other.
 
 ### 5. What you should see
 

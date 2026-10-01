@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { SANDBOX_MARK } from './armada.js';
 import type { ArmadaAuth } from './auth.js';
 import type { AdapterFactoryContext } from './types.js';
 
@@ -111,6 +112,14 @@ export interface ArmadaConfig {
 	 * is free is worse than marimohub saying at startup that GPUs are ignored.
 	 */
 	gpuNodeSelectors: Record<string, Record<string, string>>;
+	/**
+	 * Fixed labels and annotations for every kernel pod, for whatever the cluster
+	 * reads them with: cost allocation, admission policies, `kubectl -l`. Armada
+	 * copies a job's labels and annotations onto its pod, and Lookout shows the
+	 * annotations. Empty unless the environment sets them.
+	 */
+	podLabels: Record<string, string>;
+	podAnnotations: Record<string, string>;
 	/**
 	 * Hard cap on one session, submitted as `activeDeadlineSeconds`. Armada gives
 	 * any pod without one the server default, 72 hours as shipped, so a kernel must
@@ -332,11 +341,13 @@ function readExposure(env: Record<string, string | undefined>): Exposure {
 
 /**
  * A JSON object of non-empty strings: an Ingress annotation map, or an owner
- * to queue map. Absent is the empty map.
+ * to queue map. Absent is the empty map. `allowEmpty` keeps empty and blank
+ * values, which Kubernetes accepts on pod labels and annotations.
  */
 function readStringMap(
 	env: Record<string, string | undefined>,
 	name: string,
+	allowEmpty: boolean = false,
 ): Record<string, string> {
 	const raw: string | undefined = env[name];
 	if (raw === undefined) return {};
@@ -351,8 +362,8 @@ function readStringMap(
 	}
 	const map: Record<string, string> = {};
 	for (const [key, value] of Object.entries(parsed)) {
-		if (typeof value !== 'string' || !value.trim()) {
-			throw new Error(`${name}: ${key} must be a non-empty string`);
+		if (typeof value !== 'string' || (!allowEmpty && !value.trim())) {
+			throw new Error(`${name}: ${key} must be a ${allowEmpty ? '' : 'non-empty '}string`);
 		}
 		map[key] = value;
 	}
@@ -441,6 +452,61 @@ function readGpuNodeSelectors(
 	return selectors;
 }
 
+/** A label value, and the name half of a label or annotation key. */
+const K8S_NAME: RegExp = /^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$/;
+
+/** The optional prefix of a key: a lowercase DNS subdomain. */
+const K8S_PREFIX: RegExp = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/;
+
+/** Kubernetes' qualified-name rule, which label and annotation keys both follow. */
+function isQualifiedName(key: string): boolean {
+	const slash: number = key.lastIndexOf('/');
+	if (slash === -1) return K8S_NAME.test(key);
+	const prefix: string = key.slice(0, slash);
+	return prefix.length <= 253 && K8S_PREFIX.test(prefix) && K8S_NAME.test(key.slice(slash + 1));
+}
+
+/**
+ * Keys an operator may not set. Armada stamps `armada_*` labels and annotations
+ * on every pod over whatever the job carries, and `armadaproject.io/` is where
+ * its scheduling switches live (`failFast`, gangs), which a tag must not flip.
+ * `marimohub/sandbox` is what `listActive` recognises our jobs by.
+ */
+function isReservedKey(key: string): boolean {
+	return key.startsWith('armada_') || key.startsWith('armadaproject.io/') || key === SANDBOX_MARK;
+}
+
+/**
+ * `ARMADA_POD_LABELS` or `ARMADA_POD_ANNOTATIONS`. Armada does not check either
+ * at submit, so a key or label value Kubernetes refuses would be accepted, and
+ * then fail every session when the executor creates the pod. Checked here, it
+ * stops startup instead.
+ */
+function readPodMetadata(
+	env: Record<string, string | undefined>,
+	name: string,
+	kind: 'label' | 'annotation',
+): Record<string, string> {
+	const map: Record<string, string> = readStringMap(env, name, true);
+	for (const [key, value] of Object.entries(map)) {
+		if (!isQualifiedName(key)) {
+			throw new Error(
+				`${name}: ${key} is not a valid ${kind} key, which is an optional DNS subdomain prefix and a slash, then up to 63 letters, digits, '-', '_' or '.'`,
+			);
+		}
+		if (isReservedKey(key)) {
+			throw new Error(`${name}: ${key} is reserved for Armada or for the adapter itself`);
+		}
+		// An empty label value is valid, and how a label that only marks something is set.
+		if (kind === 'label' && value !== '' && !K8S_NAME.test(value)) {
+			throw new Error(
+				`${name}: the value of ${key} is not a valid label value, which is empty or up to 63 letters, digits, '-', '_' or '.', starting and ending with a letter or digit`,
+			);
+		}
+	}
+	return map;
+}
+
 /**
  * The GPU types marimohub's `MARIMOHUB_COMPUTE_PROFILES` names, upper-cased as
  * marimohub stores them. marimohub validates the variable in full
@@ -511,6 +577,8 @@ export function readConfig(
 		fsGroup: optionalId(env, 'ARMADA_FS_GROUP'),
 		surfacePorts: readSurfacePorts(env),
 		gpuNodeSelectors: readGpuNodeSelectors(env),
+		podLabels: readPodMetadata(env, 'ARMADA_POD_LABELS', 'label'),
+		podAnnotations: readPodMetadata(env, 'ARMADA_POD_ANNOTATIONS', 'annotation'),
 		lookoutUrl: optionalUrl(env, 'ARMADA_LOOKOUT_URL'),
 		maxLifetimeSeconds:
 			compute?.sessionMaxLifetimeSeconds ??

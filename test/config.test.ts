@@ -162,6 +162,82 @@ describe('ARMADA_IMAGE_PULL_SECRETS', () => {
 	});
 });
 
+describe('ARMADA_POD_LABELS and ARMADA_POD_ANNOTATIONS', () => {
+	it('are empty when unset', () => {
+		const config: ArmadaConfig = readConfig(baseEnv);
+		expect(config.podLabels).toEqual({});
+		expect(config.podAnnotations).toEqual({});
+	});
+
+	it('read a JSON object of tags, prefixed keys included', () => {
+		const config: ArmadaConfig = readConfig({
+			...baseEnv,
+			ARMADA_POD_LABELS: '{"team": "quant", "example.com/cost-center": "cc-1234"}',
+			ARMADA_POD_ANNOTATIONS: '{"example.com/owner": "Quant Research <quant@example.com>"}',
+		});
+		expect(config.podLabels).toEqual({ team: 'quant', 'example.com/cost-center': 'cc-1234' });
+		expect(config.podAnnotations).toEqual({
+			'example.com/owner': 'Quant Research <quant@example.com>',
+		});
+	});
+
+	it('reject a key Kubernetes would refuse, rather than failing every pod later', () => {
+		for (const key of ['', 'has space', '-team', 'Example.com/team', 'a'.repeat(64), 'a/']) {
+			const tags: string = JSON.stringify({ [key]: 'x' });
+			expect(() => readConfig({ ...baseEnv, ARMADA_POD_LABELS: tags })).toThrow(
+				'ARMADA_POD_LABELS',
+			);
+			expect(() => readConfig({ ...baseEnv, ARMADA_POD_ANNOTATIONS: tags })).toThrow(
+				'ARMADA_POD_ANNOTATIONS',
+			);
+		}
+	});
+
+	it('reject a label value Kubernetes would refuse, but not the same annotation value', () => {
+		for (const value of ['quant@example.com', 'two words', 'a'.repeat(64), '-quant']) {
+			const tags: string = JSON.stringify({ owner: value });
+			expect(() => readConfig({ ...baseEnv, ARMADA_POD_LABELS: tags })).toThrow(
+				'not a valid label value',
+			);
+			expect(readConfig({ ...baseEnv, ARMADA_POD_ANNOTATIONS: tags }).podAnnotations).toEqual({
+				owner: value,
+			});
+		}
+	});
+
+	it("reject Armada's keys and the sandbox mark", () => {
+		for (const key of ['armada_queue_id', 'armadaproject.io/failFast', 'marimohub/sandbox']) {
+			const tags: string = JSON.stringify({ [key]: 'x' });
+			expect(() => readConfig({ ...baseEnv, ARMADA_POD_LABELS: tags })).toThrow('reserved');
+			expect(() => readConfig({ ...baseEnv, ARMADA_POD_ANNOTATIONS: tags })).toThrow('reserved');
+		}
+	});
+
+	it('accept an empty label value and an empty or blank annotation value, as Kubernetes does', () => {
+		const config: ArmadaConfig = readConfig({
+			...baseEnv,
+			ARMADA_POD_LABELS: '{"example.com/gpu-pool": ""}',
+			ARMADA_POD_ANNOTATIONS: '{"example.com/empty": "", "example.com/blank": " "}',
+		});
+		expect(config.podLabels).toEqual({ 'example.com/gpu-pool': '' });
+		expect(config.podAnnotations).toEqual({ 'example.com/empty': '', 'example.com/blank': ' ' });
+		expect(() => readConfig({ ...baseEnv, ARMADA_POD_LABELS: '{"team": " "}' })).toThrow(
+			'not a valid label value',
+		);
+	});
+
+	it('reject anything but a JSON object of strings', () => {
+		for (const value of ['nope', '[]', '{"team": 1}', '{"team": null}']) {
+			expect(() => readConfig({ ...baseEnv, ARMADA_POD_LABELS: value })).toThrow(
+				'ARMADA_POD_LABELS',
+			);
+			expect(() => readConfig({ ...baseEnv, ARMADA_POD_ANNOTATIONS: value })).toThrow(
+				'ARMADA_POD_ANNOTATIONS',
+			);
+		}
+	});
+});
+
 describe('security context ids', () => {
 	it('are all unset unless the environment says otherwise', () => {
 		const config: ArmadaConfig = readConfig(baseEnv);

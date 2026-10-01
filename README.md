@@ -55,6 +55,8 @@ in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `ARMADA_INGRESS_TLS`                 | no       | `true` (default) or `false`; ingress only             |
 | `ARMADA_INGRESS_CERT_NAME`           | no       | TLS secret name prefix (default `<namespace>-`)       |
 | `ARMADA_INGRESS_ANNOTATIONS`         | no       | JSON object put on every job's Ingress                |
+| `ARMADA_POD_LABELS`                  | no       | JSON object of labels put on every kernel pod         |
+| `ARMADA_POD_ANNOTATIONS`             | no       | JSON object of annotations put on every kernel pod    |
 | `ARMADA_QUEUE_BY_USER`               | no       | JSON object, marimohub user id to queue               |
 | `ARMADA_QUEUE_BY_PROJECT`            | no       | JSON object, marimohub project id to queue            |
 | `ARMADA_GPU_NODE_SELECTORS`          | no       | JSON object, GPU type to node selector; enables GPUs  |
@@ -113,6 +115,19 @@ record for the controller; and the TLS secret, `<namespace>-` (or
 certificate for `*.<namespace>.<suffix>` that marimohub trusts (`NODE_EXTRA_CA_CERTS` for
 a private CA). `ARMADA_INGRESS_ANNOTATIONS` lands on every job's Ingress: a source
 allowlist for the agent's hostname, or a longer websocket read timeout, go there.
+
+`ARMADA_POD_LABELS` and `ARMADA_POD_ANNOTATIONS` tag every kernel pod with fixed values,
+for cost allocation, admission policies or `kubectl -l`. Armada copies them from the job
+onto the pod, and Lookout shows the annotations. Armada does not check them at submit, so
+the adapter applies Kubernetes' rules at startup: a key or a label value the cluster would
+refuse stops marimohub rather than failing every session. Keys starting with `armada_` or
+`armadaproject.io/`, and `marimohub/sandbox`, are reserved. The pod's Service and Ingress
+do not get these labels.
+
+```bash
+ARMADA_POD_LABELS='{"team": "quant", "example.com/cost-center": "cc-1234"}'
+ARMADA_POD_ANNOTATIONS='{"example.com/contact": "quant@example.com"}'
+```
 
 `ARMADA_QUEUE` takes every sandbox unless its owner maps elsewhere. Armada computes fair
 share and priority per queue, so a queue per team or per user is how tenants are told
