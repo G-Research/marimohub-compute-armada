@@ -283,11 +283,11 @@ environment from configuration. Adding such an option needs a decision here firs
 Credentials marimohub hands a session travel through the agent, at command time, and the
 README lists everything a submission carries so an operator can be briefed on it.
 
-**Free-text values are checked for shape, not content.** `ARMADA_POD_LABELS`,
-`ARMADA_POD_ANNOTATIONS` and `ARMADA_INGRESS_ANNOTATIONS` are copied into the submission
-as written. Recognising a credential by its look would be guesswork that misses the ones
-that matter and refuses legitimate values, so the adapter does not try; it documents that
-these are public instead.
+**Configured values are checked for shape, not content.** Every configured value in the
+submission is copied in as written, the free-form `ARMADA_POD_LABELS`,
+`ARMADA_POD_ANNOTATIONS` and `ARMADA_INGRESS_ANNOTATIONS` most of all. Recognising a
+credential by its look would be guesswork that misses the ones that matter and refuses
+legitimate values, so the adapter does not try; it documents that they are public instead.
 
 **Messages name the program, never its arguments.** The pod's environment is fixed at
 submission, so the session environment is exported inline (`sh -lc "export K='v'; …"`), as

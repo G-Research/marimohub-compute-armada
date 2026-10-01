@@ -186,29 +186,48 @@ which is what a server running `anonymousAuth: true` expects. Prefer
 Armada keeps every job submission and serves it back whole: its API returns the pod spec,
 and Lookout shows the submission to everyone who can open the job. Once submitted, nothing
 takes it back. Treat every value below as readable by everyone with Lookout access, for
-good, and never put a credential in one.
+good, and never put a credential in one. The two tables are the whole submission
+(`src/armada.ts` builds it, `src/podspec.ts` the pod spec in it).
 
-| In every submission          | Comes from                                                                         |
-| ---------------------------- | ---------------------------------------------------------------------------------- |
-| Kernel and agent images      | `MARIMOHUB_COMPUTE_IMAGE` (the one marimohub asks for), `ARMADA_AGENT_IMAGE`       |
-| Pod labels                   | `ARMADA_POD_LABELS`                                                                |
-| Pod annotations              | `ARMADA_POD_ANNOTATIONS`, plus `marimohub/sandbox` set to `ARMADA_QUEUE`           |
-| Ingress annotations          | `ARMADA_INGRESS_ANNOTATIONS`                                                       |
-| Node selector                | `ARMADA_GPU_NODE_SELECTORS`, the entry for the profile's GPU type                  |
-| Resources                    | The compute profile's CPU, memory and GPU count                                    |
-| Names                        | The queue, `ARMADA_NAMESPACE`, `ARMADA_PRIORITY_CLASS`, `ARMADA_INGRESS_CERT_NAME` |
-| Pull secrets                 | `ARMADA_IMAGE_PULL_SECRETS`, the secret names only                                 |
-| Numbers                      | Ports, `ARMADA_RUN_AS_*`, `ARMADA_FS_GROUP`, `ARMADA_KERNEL_MAX_LIFETIME_SECONDS`  |
-| Job set id and client id     | The sandbox id                                                                     |
-| One pod environment variable | `MH_AGENT_TOKEN_SHA256`, the SHA-256 of the agent token, never the token           |
+What configuration decides:
 
-Three of these take whatever an operator types: `ARMADA_POD_ANNOTATIONS`,
-`ARMADA_INGRESS_ANNOTATIONS`, and `ARMADA_POD_LABELS` within the label character set. The
-adapter cannot tell a credential from any other string, so it checks their shape and
-nothing else. Some ingress annotations invite a credential: an ingress-nginx
-`configuration-snippet` that sets an `Authorization` header, or an `auth-url` with a key
-in its query string. Name a Kubernetes Secret instead (`nginx.ingress.kubernetes.io/auth-secret`),
-the way `ARMADA_IMAGE_PULL_SECRETS` does for registries.
+| In the submission       | Comes from                                                                       |
+| ----------------------- | -------------------------------------------------------------------------------- |
+| Queue and namespace     | `ARMADA_QUEUE` (or the owner's entry in `ARMADA_QUEUE_BY_*`), `ARMADA_NAMESPACE` |
+| Kernel and agent images | `MARIMOHUB_COMPUTE_IMAGE` (the one marimohub asks for), `ARMADA_AGENT_IMAGE`     |
+| Pod labels              | `ARMADA_POD_LABELS`                                                              |
+| Pod annotations         | `ARMADA_POD_ANNOTATIONS`                                                         |
+| Exposure                | `ARMADA_EXPOSE`: a NodePort service or an Ingress                                |
+| Ingress settings        | `ARMADA_INGRESS_TLS`, `ARMADA_INGRESS_CERT_NAME`, `ARMADA_INGRESS_ANNOTATIONS`   |
+| Ports                   | `ARMADA_KERNEL_PORT`, `ARMADA_AGENT_PORT`, `MARIMOHUB_SURFACE_<ID>_PORT`         |
+| Resources               | The compute profile's CPU, memory and GPU count                                  |
+| Node selector           | `ARMADA_GPU_NODE_SELECTORS`, the entry for the profile's GPU type                |
+| Priority class          | `ARMADA_PRIORITY_CLASS`                                                          |
+| Pull secrets            | `ARMADA_IMAGE_PULL_SECRETS`, the secret names only                               |
+| Pod security context    | `ARMADA_RUN_AS_USER`, `ARMADA_RUN_AS_GROUP`, `ARMADA_FS_GROUP`                   |
+| Deadline                | marimohub's session lifetime, else `ARMADA_KERNEL_MAX_LIFETIME_SECONDS`          |
+
+What the adapter fixes:
+
+| In the submission                       | Value                                                                     |
+| --------------------------------------- | ------------------------------------------------------------------------- |
+| Job set id, client id, external job URI | The sandbox id                                                            |
+| Annotations                             | `armadaproject.io/failFast: "true"`, `marimohub/sandbox` set to the queue |
+| One pod environment variable            | `MH_AGENT_TOKEN_SHA256`, the SHA-256 of the agent token, never the token  |
+| Pod lifecycle                           | Restart policy `Never`, a 30s grace period                                |
+| Agent install                           | The `mh-agent` volume and the init container that copies the agent in     |
+| Container commands                      | `/agent install …` and `/mh-agent/agent --port <ARMADA_AGENT_PORT>`       |
+| Ingress service                         | `useClusterIP: true`                                                      |
+
+Every configured value is copied in as written. The adapter checks each one's shape,
+such as a valid label key or a nonblank name, and nothing more: it cannot tell a
+credential from any other string. The free-form maps are where one is most likely to be
+pasted: `ARMADA_POD_ANNOTATIONS`, `ARMADA_INGRESS_ANNOTATIONS`, and `ARMADA_POD_LABELS`
+within the label character set. Some ingress annotations invite a credential: an
+ingress-nginx `configuration-snippet` that sets an `Authorization` header, or an `auth-url`
+with a key in its query string. Name a Kubernetes Secret instead
+(`nginx.ingress.kubernetes.io/auth-secret`), the way `ARMADA_IMAGE_PULL_SECRETS` does for
+registries.
 
 No variable sets an environment variable on the pod, by design: a value set that way is
 in the spec. `ARMADA_AGENT_TOKEN_SECRET`, the agent tokens and the `ARMADA_AUTH_*`
