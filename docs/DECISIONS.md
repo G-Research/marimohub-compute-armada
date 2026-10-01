@@ -270,6 +270,37 @@ choice.
 minutes of idle time. A controller that does drop idle connections has
 `ARMADA_INGRESS_ANNOTATIONS` for its timeout.
 
+## Nothing secret in the submission
+
+**The submission is public, for good.** `GetJobDetails` returns the pod spec
+(`pkg/api/job.proto:47`), Lookout shows the submission to everyone who can open the job,
+and nothing withdraws it once submitted. A credential in it has leaked to everyone with
+Lookout access. The usual way that happens is an option that copies a configured value
+into the pod's environment, followed by someone configuring a credential through it. So
+the adapter treats every value it submits as public: the agent token appears only as a
+hash (above), registry credentials only as secret names, and no option sets pod
+environment from configuration. Adding such an option needs a decision here first.
+Credentials marimohub hands a session travel through the agent, at command time, and the
+README lists everything a submission carries so an operator can be briefed on it.
+
+**Configured values are checked for shape, not content.** Every configured value in the
+submission is copied in as written, the free-form `ARMADA_POD_LABELS`,
+`ARMADA_POD_ANNOTATIONS` and `ARMADA_INGRESS_ANNOTATIONS` most of all. Recognising a
+credential by its look would be guesswork that misses the ones that matter and refuses
+legitimate values, so the adapter does not try; it documents that they are public instead.
+
+**Messages name the program, never its arguments.** The pod's environment is fixed at
+submission, so the session environment is exported inline (`sh -lc "export K='v'; …"`), as
+marimohub's own pod-exec adapters do, and the argv of every command carries those
+credentials. The control channel's errors and timeouts name `argv[0]` alone. The sandbox
+adds the caller's own command where it helps (`startProcess`, the exec backstop), which
+holds none of the exports.
+
+**`gitCheckout` clones what it is given.** A credential embedded in the repository URL is
+part of the command, and may be in git's own error output, which is returned as the
+failure. marimohub (0.4.12) never calls `gitCheckout`; if it starts to, a credential helper
+that reads the session environment keeps the token out of both.
+
 ## Sandbox semantics, transcribed from marimohub
 
 marimohub's `packages/compute-kubernetes` and `packages/compute-commons` are the reference

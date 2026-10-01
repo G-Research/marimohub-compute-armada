@@ -380,6 +380,10 @@ data volume, the dev images, `dev/tls`, and the binary and data of `run-native.s
   and a notebook session in a browser are what prove a change against a real Armada.
   If a change rests on something not yet verified, add it to the list at the end of
   `docs/DECISIONS.md`.
+- **Nothing secret goes in the submission.** Lookout shows it to everyone, for good
+  (`docs/DECISIONS.md`). A change that puts a new value into the job submission adds
+  it to the README's "What Armada shows everyone" table; one that would let a configured
+  value reach the pod's environment needs a decision first.
 - **Keep the docs current.** `docs/ARCHITECTURE.md` when the shape changes, this
   file when the dev loop changes, the README's configuration table when a variable
   is added.

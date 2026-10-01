@@ -239,7 +239,7 @@ describe('run', () => {
 		// backstop it did not".
 		expect(caught).toBeInstanceOf(CommandTimeoutError);
 		expect(String(caught)).toContain(
-			'Command timed out after 100ms in default/armada-job-0: sleep 30',
+			'Command timed out after 100ms in default/armada-job-0: "sleep"',
 		);
 	});
 
@@ -310,6 +310,44 @@ describe('stream', () => {
 
 	it('fails the stream when the agent refuses the command', async () => {
 		expect(await rejection(channel('nope').stream(['x']))).toContain('HTTP 401');
+	});
+});
+
+/**
+ * The sandbox exports marimohub's session credentials inline, so the argv of a
+ * command carries them, and a message that quoted it would put them in
+ * marimohub's logs and in front of a user.
+ */
+describe('a secret in a command', () => {
+	const SECRET = 's3cr3t-value';
+	const command: string[] = ['sh', '-lc', `export API_KEY='${SECRET}'; echo hi`];
+
+	it('stays out of a refused run, a timed-out one, and an agent error', async () => {
+		const refused: string = await rejection(channel('nope').run(command));
+		expect(refused).toContain('could not run "sh"');
+		expect(refused).not.toContain(SECRET);
+
+		script = [JSON.stringify({ exit: -1, timedOut: true })];
+		expect(await rejection(channel().run(command, { timeoutMs: 100 }))).not.toContain(SECRET);
+
+		script = [JSON.stringify({ error: 'cannot start sh: not found' })];
+		expect(await rejection(channel().run(command))).not.toContain(SECRET);
+	});
+
+	it('stays out of a refused stream and one the agent fails', async () => {
+		expect(await rejection(channel('nope').stream(command))).not.toContain(SECRET);
+
+		script = [JSON.stringify({ error: 'pipe broke' })];
+		const stream: ReadableStream<Uint8Array> = await channel().stream(command);
+		expect(await rejection(readAll(stream))).not.toContain(SECRET);
+	});
+
+	it('stays out of a refused process start', async () => {
+		answers['/process/start'] = { status: 500, body: { error: 'cannot start sh: not found' } };
+		const message: string = await rejection(channel().startProcess(command));
+
+		expect(message).toContain('could not start "sh"');
+		expect(message).not.toContain(SECRET);
 	});
 });
 

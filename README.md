@@ -114,7 +114,9 @@ record for the controller; and the TLS secret, `<namespace>-` (or
 `ARMADA_INGRESS_CERT_NAME`) plus the executor's `certNameSuffix`, must hold a wildcard
 certificate for `*.<namespace>.<suffix>` that marimohub trusts (`NODE_EXTRA_CA_CERTS` for
 a private CA). `ARMADA_INGRESS_ANNOTATIONS` lands on every job's Ingress: a source
-allowlist for the agent's hostname, or a longer websocket read timeout, go there.
+allowlist for the agent's hostname, or a longer websocket read timeout, go there. It is
+part of the submission, so everyone with Lookout access reads it (see
+[What Armada shows everyone](#what-armada-shows-everyone)).
 
 `ARMADA_POD_LABELS` and `ARMADA_POD_ANNOTATIONS` tag every kernel pod with fixed values,
 for cost allocation, admission policies or `kubectl -l`. Armada copies them from the job
@@ -122,7 +124,8 @@ onto the pod, and Lookout shows the annotations. Armada does not check them at s
 the adapter applies Kubernetes' rules at startup: a key or a label value the cluster would
 refuse stops marimohub rather than failing every session. Keys starting with `armada_` or
 `armadaproject.io/`, and `marimohub/sandbox`, are reserved. The pod's Service and Ingress
-do not get these labels.
+do not get these labels. Both are public to everyone with Lookout access, so neither may
+hold a credential (see [What Armada shows everyone](#what-armada-shows-everyone)).
 
 ```bash
 ARMADA_POD_LABELS='{"team": "quant", "example.com/cost-center": "cc-1234"}'
@@ -177,6 +180,85 @@ restart. Leave it unset and reconciliation is a clean no-op.
 Configure at most one auth mechanism. With none, no `Authorization` header is sent,
 which is what a server running `anonymousAuth: true` expects. Prefer
 `ARMADA_AUTH_TOKEN_FILE` for anything that rotates: it is read per request.
+
+## What Armada shows everyone
+
+Armada keeps every job submission and serves it back whole: its API returns the pod spec,
+and Lookout shows the submission to everyone who can open the job. Once submitted, nothing
+takes it back. Treat every value below as readable by everyone with Lookout access, for
+good, and never put a credential in one. The two tables are the whole submission
+(`src/armada.ts` builds it, `src/podspec.ts` the pod spec in it).
+
+What configuration decides:
+
+| In the submission       | Comes from                                                                       |
+| ----------------------- | -------------------------------------------------------------------------------- |
+| Queue and namespace     | `ARMADA_QUEUE` (or the owner's entry in `ARMADA_QUEUE_BY_*`), `ARMADA_NAMESPACE` |
+| Kernel and agent images | `MARIMOHUB_COMPUTE_IMAGE` (the one marimohub asks for), `ARMADA_AGENT_IMAGE`     |
+| Pod labels              | `ARMADA_POD_LABELS`                                                              |
+| Pod annotations         | `ARMADA_POD_ANNOTATIONS`                                                         |
+| Exposure                | `ARMADA_EXPOSE`: a NodePort service or an Ingress                                |
+| Ingress settings        | `ARMADA_INGRESS_TLS`, `ARMADA_INGRESS_CERT_NAME`, `ARMADA_INGRESS_ANNOTATIONS`   |
+| Ports                   | `ARMADA_KERNEL_PORT`, `ARMADA_AGENT_PORT`, `MARIMOHUB_SURFACE_<ID>_PORT`         |
+| Surfaces                | `MARIMOHUB_SURFACES`, which picks the surfaces whose ports are declared          |
+| Resources               | The compute profile's CPU, memory and GPU count, else 1 CPU and `2Gi`            |
+| Node selector           | `ARMADA_GPU_NODE_SELECTORS`, the entry for the profile's GPU type                |
+| Priority class          | `ARMADA_PRIORITY_CLASS`                                                          |
+| Pull secrets            | `ARMADA_IMAGE_PULL_SECRETS`, the secret names only                               |
+| Pod security context    | `ARMADA_RUN_AS_USER`, `ARMADA_RUN_AS_GROUP`, `ARMADA_FS_GROUP`                   |
+| Deadline                | marimohub's session lifetime, else `ARMADA_KERNEL_MAX_LIFETIME_SECONDS`          |
+
+What the adapter fixes:
+
+| In the submission                       | Value                                                                     |
+| --------------------------------------- | ------------------------------------------------------------------------- |
+| Job set id, client id, external job URI | The sandbox id                                                            |
+| Annotations                             | `armadaproject.io/failFast: "true"`, `marimohub/sandbox` set to the queue |
+| One pod environment variable            | `MH_AGENT_TOKEN_SHA256`, the SHA-256 of the agent token, never the token  |
+| Pod lifecycle                           | Restart policy `Never`, a 30s grace period                                |
+| Agent install                           | The `mh-agent` volume and the init container that copies the agent in     |
+| Init container resources                | `100m` CPU and `64Mi` memory                                              |
+| Container commands                      | `/agent install …` and `/mh-agent/agent --port <ARMADA_AGENT_PORT>`       |
+| Ingress service                         | `useClusterIP: true`                                                      |
+
+Every configured value is copied in as written. The adapter checks each one's shape,
+such as a valid label key or a nonblank name, and nothing more: it cannot tell a
+credential from any other string. The free-form maps are where one is most likely to be
+pasted: `ARMADA_POD_ANNOTATIONS`, `ARMADA_INGRESS_ANNOTATIONS`, and `ARMADA_POD_LABELS`
+within the label character set. Some ingress annotations invite a credential: an
+ingress-nginx `configuration-snippet` that sets an `Authorization` header, or an `auth-url`
+with a key in its query string. Name a Kubernetes Secret instead
+(`nginx.ingress.kubernetes.io/auth-secret`), the way `ARMADA_IMAGE_PULL_SECRETS` does for
+registries.
+
+No variable sets an environment variable on the pod, by design: a value set that way is
+in the spec. `ARMADA_AGENT_TOKEN_SECRET`, the agent tokens and the `ARMADA_AUTH_*`
+credentials never enter a submission; the auth credentials only ever travel as an
+`Authorization` header to Armada and Lookout.
+
+Notebook users cannot put anything in a submission: they pick a compute profile and an
+image from lists the operator wrote. The credentials they give marimohub for an
+integration, such as a database password or a cloud key, become the session's environment,
+which the adapter hands to the pod through the agent, as `export` statements in front of
+each command. So those credentials:
+
+- stay out of the submission and out of Lookout;
+- cross the cluster network as plain HTTP, readable by anyone who can watch it. The agent
+  speaks only HTTP, so under `ARMADA_EXPOSE=nodeport` the whole way is plaintext, and
+  under `ingress` with TLS only the hop from marimohub to the ingress controller is
+  encrypted: the controller forwards to the pod in plaintext;
+- are visible to every process in the kernel container, as on any marimohub backend;
+- never appear in the adapter's own error messages. Those name the command marimohub
+  asked for at most, never the `export` statements put in front of it, so a credential
+  written into the command itself would still show.
+
+What a notebook prints stays out of Lookout as well. The kernel's output goes to a log file
+inside the pod and command output goes back over the agent, so the container log, which is
+what Lookout's log view shows, holds only the agent's own lines.
+
+Before a deployment goes live, walk whoever sets these variables through this section. The
+adapter keeps the credentials it handles out of the submission; it cannot stop a person
+typing one into a variable that is public by design.
 
 ## Deployment
 

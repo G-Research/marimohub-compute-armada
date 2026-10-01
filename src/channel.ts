@@ -348,7 +348,7 @@ export class AgentChannel implements ControlChannel {
 		if (exit.timedOut === true) {
 			// The agent has killed the command's process group by now.
 			throw new CommandTimeoutError(
-				`Command timed out after ${String(options.timeoutMs)}ms in ${this.where}: ${command.join(' ')}`,
+				`Command timed out after ${String(options.timeoutMs)}ms in ${this.where}: ${programOf(command)}`,
 			);
 		}
 		return {
@@ -515,7 +515,7 @@ export class AgentChannel implements ControlChannel {
 	}
 
 	async startProcess(command: readonly string[], cwd?: string): Promise<number> {
-		const what = `start ${JSON.stringify(command.join(' '))}`;
+		const what = `start ${programOf(command)}`;
 		const response: Response = await this.request(what, 'POST', '/process/start', {
 			json: { cmd: [...command], ...(cwd === undefined ? {} : { cwd }) },
 		});
@@ -640,7 +640,17 @@ export class AgentChannel implements ControlChannel {
 }
 
 function runWhat(command: readonly string[]): string {
-	return `run ${JSON.stringify(command.join(' '))}`;
+	return `run ${programOf(command)}`;
+}
+
+/**
+ * A command as messages name it: the program, never its arguments. The sandbox
+ * exports marimohub's env vars inline (`sh -lc "export K='v'; …"`), and those
+ * are session credentials, so the arguments would carry them into marimohub's
+ * logs and whatever it shows a user. The caller knows its own command.
+ */
+function programOf(command: readonly string[]): string {
+	return JSON.stringify(command[0] ?? '');
 }
 
 /** The path travels as a query parameter, so it needs no quoting of any kind. */
