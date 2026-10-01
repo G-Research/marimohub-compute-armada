@@ -340,12 +340,14 @@ function readExposure(env: Record<string, string | undefined>): Exposure {
 }
 
 /**
- * A JSON object of non-empty strings: an annotation or label map, or an owner
- * to queue map. Absent is the empty map.
+ * A JSON object of non-empty strings: an Ingress annotation map, or an owner
+ * to queue map. Absent is the empty map. `allowEmpty` keeps empty and blank
+ * values, which Kubernetes accepts on pod labels and annotations.
  */
 function readStringMap(
 	env: Record<string, string | undefined>,
 	name: string,
+	allowEmpty: boolean = false,
 ): Record<string, string> {
 	const raw: string | undefined = env[name];
 	if (raw === undefined) return {};
@@ -360,8 +362,8 @@ function readStringMap(
 	}
 	const map: Record<string, string> = {};
 	for (const [key, value] of Object.entries(parsed)) {
-		if (typeof value !== 'string' || !value.trim()) {
-			throw new Error(`${name}: ${key} must be a non-empty string`);
+		if (typeof value !== 'string' || (!allowEmpty && !value.trim())) {
+			throw new Error(`${name}: ${key} must be a ${allowEmpty ? '' : 'non-empty '}string`);
 		}
 		map[key] = value;
 	}
@@ -485,7 +487,7 @@ function readPodMetadata(
 	name: string,
 	kind: 'label' | 'annotation',
 ): Record<string, string> {
-	const map: Record<string, string> = readStringMap(env, name);
+	const map: Record<string, string> = readStringMap(env, name, true);
 	for (const [key, value] of Object.entries(map)) {
 		if (!isQualifiedName(key)) {
 			throw new Error(
@@ -495,9 +497,10 @@ function readPodMetadata(
 		if (isReservedKey(key)) {
 			throw new Error(`${name}: ${key} is reserved for Armada or for the adapter itself`);
 		}
-		if (kind === 'label' && !K8S_NAME.test(value)) {
+		// An empty label value is valid, and how a label that only marks something is set.
+		if (kind === 'label' && value !== '' && !K8S_NAME.test(value)) {
 			throw new Error(
-				`${name}: the value of ${key} is not a valid label value, which is up to 63 letters, digits, '-', '_' or '.', starting and ending with a letter or digit`,
+				`${name}: the value of ${key} is not a valid label value, which is empty or up to 63 letters, digits, '-', '_' or '.', starting and ending with a letter or digit`,
 			);
 		}
 	}

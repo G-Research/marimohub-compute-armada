@@ -213,10 +213,26 @@ describe('ARMADA_POD_LABELS and ARMADA_POD_ANNOTATIONS', () => {
 		}
 	});
 
-	it('reject anything but a JSON object of non-empty strings', () => {
-		for (const value of ['nope', '[]', '{"team": 1}', '{"team": ""}']) {
+	it('accept an empty label value and an empty or blank annotation value, as Kubernetes does', () => {
+		const config: ArmadaConfig = readConfig({
+			...baseEnv,
+			ARMADA_POD_LABELS: '{"example.com/gpu-pool": ""}',
+			ARMADA_POD_ANNOTATIONS: '{"example.com/empty": "", "example.com/blank": " "}',
+		});
+		expect(config.podLabels).toEqual({ 'example.com/gpu-pool': '' });
+		expect(config.podAnnotations).toEqual({ 'example.com/empty': '', 'example.com/blank': ' ' });
+		expect(() => readConfig({ ...baseEnv, ARMADA_POD_LABELS: '{"team": " "}' })).toThrow(
+			'not a valid label value',
+		);
+	});
+
+	it('reject anything but a JSON object of strings', () => {
+		for (const value of ['nope', '[]', '{"team": 1}', '{"team": null}']) {
 			expect(() => readConfig({ ...baseEnv, ARMADA_POD_LABELS: value })).toThrow(
 				'ARMADA_POD_LABELS',
+			);
+			expect(() => readConfig({ ...baseEnv, ARMADA_POD_ANNOTATIONS: value })).toThrow(
+				'ARMADA_POD_ANNOTATIONS',
 			);
 		}
 	});
