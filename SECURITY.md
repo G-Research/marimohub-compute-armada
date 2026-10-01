@@ -20,3 +20,9 @@ reach a pod other than its own, recover the token from the pod spec, or derive o
 anything that lets a job set, queue or Lookout answer be confused between two sandboxes or
 two installations. How the agent port is exposed and restricted in a given deployment is
 described in the README's Deployment section and in `docs/DECISIONS.md`.
+
+A job submission is public: Armada keeps it and Lookout shows it to everyone who can open
+the job. Anything that makes the adapter put a credential into a submission, or into a
+message it writes, is in scope. A credential an operator types into a variable the README
+lists as public (its "What Armada shows everyone" section) is not a vulnerability in the
+adapter.
