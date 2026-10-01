@@ -201,7 +201,7 @@ What configuration decides:
 | Ingress settings        | `ARMADA_INGRESS_TLS`, `ARMADA_INGRESS_CERT_NAME`, `ARMADA_INGRESS_ANNOTATIONS`   |
 | Ports                   | `ARMADA_KERNEL_PORT`, `ARMADA_AGENT_PORT`, `MARIMOHUB_SURFACE_<ID>_PORT`         |
 | Surfaces                | `MARIMOHUB_SURFACES`, which picks the surfaces whose ports are declared          |
-| Resources               | The compute profile's CPU, memory and GPU count                                  |
+| Resources               | The compute profile's CPU, memory and GPU count, else 1 CPU and `2Gi`            |
 | Node selector           | `ARMADA_GPU_NODE_SELECTORS`, the entry for the profile's GPU type                |
 | Priority class          | `ARMADA_PRIORITY_CLASS`                                                          |
 | Pull secrets            | `ARMADA_IMAGE_PULL_SECRETS`, the secret names only                               |
@@ -217,6 +217,7 @@ What the adapter fixes:
 | One pod environment variable            | `MH_AGENT_TOKEN_SHA256`, the SHA-256 of the agent token, never the token  |
 | Pod lifecycle                           | Restart policy `Never`, a 30s grace period                                |
 | Agent install                           | The `mh-agent` volume and the init container that copies the agent in     |
+| Init container resources                | `100m` CPU and `64Mi` memory                                              |
 | Container commands                      | `/agent install …` and `/mh-agent/agent --port <ARMADA_AGENT_PORT>`       |
 | Ingress service                         | `useClusterIP: true`                                                      |
 
@@ -242,8 +243,10 @@ which the adapter hands to the pod through the agent, as `export` statements in 
 each command. So those credentials:
 
 - stay out of the submission and out of Lookout;
-- cross the network as plain HTTP under `ARMADA_EXPOSE=nodeport`, readable by anyone who
-  can watch the cluster network; use `ingress` with TLS where that matters;
+- cross the cluster network as plain HTTP, readable by anyone who can watch it. The agent
+  speaks only HTTP, so under `ARMADA_EXPOSE=nodeport` the whole way is plaintext, and
+  under `ingress` with TLS only the hop from marimohub to the ingress controller is
+  encrypted: the controller forwards to the pod in plaintext;
 - are visible to every process in the kernel container, as on any marimohub backend;
 - never appear in the adapter's own error messages. Those name the command marimohub
   asked for at most, never the `export` statements put in front of it, so a credential
