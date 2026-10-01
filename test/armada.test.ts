@@ -103,6 +103,42 @@ describe('submit', () => {
 		});
 	});
 
+	it('carries no labels unless told to', async () => {
+		stubFetch(Response.json({ jobResponseItems: [{ jobId: 'job-1' }] }));
+
+		await new ArmadaClient(config).submit('sandbox-7', buildPodSpec(config, agent), 'marimohub');
+
+		expect(JSON.stringify(calls[0]?.body)).not.toContain('"labels"');
+	});
+
+	it('puts the configured labels and annotations on the job, next to its own mark', async () => {
+		stubFetch(Response.json({ jobResponseItems: [{ jobId: 'job-1' }] }));
+		const taggedConfig: ArmadaConfig = readConfig({
+			...env,
+			ARMADA_POD_LABELS: '{"team": "quant"}',
+			ARMADA_POD_ANNOTATIONS: '{"example.com/owner": "quant@example.com"}',
+		});
+
+		await new ArmadaClient(taggedConfig).submit(
+			'sandbox-7',
+			buildPodSpec(taggedConfig, agent),
+			'marimohub',
+		);
+
+		expect(calls[0]?.body).toMatchObject({
+			jobRequestItems: [
+				{
+					labels: { team: 'quant' },
+					annotations: {
+						'example.com/owner': 'quant@example.com',
+						'armadaproject.io/failFast': 'true',
+						'marimohub/sandbox': 'marimohub',
+					},
+				},
+			],
+		});
+	});
+
 	it('asks for an Ingress instead under ARMADA_EXPOSE=ingress', async () => {
 		stubFetch(Response.json({ jobResponseItems: [{ jobId: 'job-1' }] }));
 		const ingressConfig: ArmadaConfig = readConfig({

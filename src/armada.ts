@@ -146,12 +146,21 @@ export class ArmadaClient {
 					externalJobUri: sandboxId,
 					namespace: this.config.namespace,
 					podSpec,
+					...(Object.keys(this.config.podLabels).length === 0
+						? {}
+						: { labels: this.config.podLabels }),
 					// A retry would hand the user an empty kernel wearing their session's
 					// name, so fail terminally and let marimohub offer the retry. The
 					// sandbox mark is what `listActive` filters on: a queue may hold jobs
 					// that are not marimohub's, and enumeration feeds a reconciler that
 					// destroys what it does not recognise, so only marked jobs may appear.
-					annotations: { 'armadaproject.io/failFast': 'true', [SANDBOX_MARK]: this.config.queue },
+					// The operator's annotations go first: `readConfig` refuses our keys,
+					// and ours win regardless.
+					annotations: {
+						...this.config.podAnnotations,
+						'armadaproject.io/failFast': 'true',
+						[SANDBOX_MARK]: this.config.queue,
+					},
 					...exposure,
 				},
 			],

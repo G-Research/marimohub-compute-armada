@@ -26,6 +26,11 @@ AGENT_IMAGE=${AGENT_IMAGE:-marimohub-kernel-agent:local}
 PORT=${PORT:-3337}
 NODE=${NODE:-armada-worker}
 DATA=${DATA:-$PWD/dev/data}
+# Tags on every kernel pod, to see them in `kubectl get pod --show-labels` and in
+# Lookout. The contact holds an '@', a space and a comma, which only an
+# annotation value may. Set either to '{}' to leave the pods untagged.
+POD_LABELS=${ARMADA_POD_LABELS:-'{"team": "dev", "example.com/cost-center": "cc-1234"}'}
+POD_ANNOTATIONS=${ARMADA_POD_ANNOTATIONS:-'{"example.com/contact": "Dev Team <dev@example.com>, #marimohub"}'}
 
 # One source of truth for the marimohub release: the image the Dockerfile
 # bakes the adapter into, which dependabot keeps current.
@@ -69,6 +74,9 @@ mkdir -p "$DATA"
 # The proxy is not needed for routing here (the browser could reach the
 # NodePort address itself) but it keeps the kernel same-origin with the app.
 #
+# Three compute profiles editors can pick between per notebook, small enough
+# that a few sessions fit on the kind worker at once. The first is the default.
+#
 # Under ARMADA_EXPOSE=ingress marimohub must trust the CA dev/ingress-local.sh
 # made, named in NODE_EXTRA_CA_CERTS when it exists.
 CA=()
@@ -90,10 +98,14 @@ exec env \
 	MARIMOHUB_SESSION_SWEEP_INTERVAL_SECONDS="${MARIMOHUB_SESSION_SWEEP_INTERVAL_SECONDS:-5}" \
 	MARIMOHUB_COMPUTE_BACKEND=library \
 	MARIMOHUB_COMPUTE_LIBRARY="$PWD/dist/index.js" \
+	MARIMOHUB_COMPUTE_PROFILES="${MARIMOHUB_COMPUTE_PROFILES:-small:cpu=1;mem=2Gi,medium:cpu=2;mem=4Gi,large:cpu=4;mem=8Gi}" \
+	MARIMOHUB_COMPUTE_PROFILE_OVERRIDE="${MARIMOHUB_COMPUTE_PROFILE_OVERRIDE:-editors}" \
 	ARMADA_AGENT_IMAGE="$AGENT_IMAGE" \
 	ARMADA_AGENT_TOKEN_SECRET="${ARMADA_AGENT_TOKEN_SECRET:-armada-dev-only-agent-token-secret}" \
 	ARMADA_URL="${ARMADA_URL:-http://localhost:30001}" \
 	ARMADA_QUEUE="$QUEUE" \
 	ARMADA_NAMESPACE="${ARMADA_NAMESPACE:-default}" \
+	ARMADA_POD_LABELS="$POD_LABELS" \
+	ARMADA_POD_ANNOTATIONS="$POD_ANNOTATIONS" \
 	"${CA[@]}" \
 	"$BINARY"
