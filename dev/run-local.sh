@@ -35,7 +35,9 @@ docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 # macOS cannot route to, but this container sits on that network and can. The
 # ack flag is proxy mode's required opt-in (kernels become same-origin with the
 # app), and the session secret signs its routing tokens; both are dev values, as
-# is the secret the adapter derives each sandbox's agent token from.
+# is the secret the adapter derives each sandbox's agent token from. Kernel auth
+# is on, so marimo runs with a per-session token rather than `--no-token`, and a
+# kernel address reached directly is refused.
 #
 # Under ARMADA_EXPOSE=ingress marimohub reaches the kernel and the agent at the
 # hostnames Armada reports, so it must trust the CA dev/ingress-local.sh made:
@@ -52,6 +54,7 @@ docker run -d --name "$CONTAINER" --platform linux/amd64 \
 	-e MARIMOHUB_STORAGE_FS_ROOT=/data \
 	-e MARIMOHUB_AUTH_BACKEND=dev \
 	-e MARIMOHUB_SANDBOX_EXPOSURE=proxy \
+	-e MARIMOHUB_SANDBOX_AUTH="${MARIMOHUB_SANDBOX_AUTH:-on}" \
 	-e MARIMOHUB_SANDBOX_PROXY_ACK_UNTRUSTED=true \
 	-e MARIMOHUB_AUTH_SESSION_SECRET="${MARIMOHUB_AUTH_SESSION_SECRET:-armada-dev-only-proxy-secret}" \
 	-e MARIMOHUB_RUN_MAINTENANCE=true \

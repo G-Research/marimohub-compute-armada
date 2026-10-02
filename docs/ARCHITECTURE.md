@@ -190,6 +190,79 @@ service is plain HTTP on the cluster network, an Ingress is an HTTPS hostname pe
 served by the cluster's ingress controller, with the certificate and the DNS suffix
 coming from the executor's configuration rather than from this adapter.
 
+## Two tokens
+
+A kernel pod exposes two ports that run code, and each has its own token. They are
+easy to confuse, because both arrive as `Authorization: Bearer`, but different code
+sends each one and different code checks it.
+
+| Port         | Token                                                 | Sent by                  | Checked by                             | Default                                 |
+| ------------ | ----------------------------------------------------- | ------------------------ | -------------------------------------- | --------------------------------------- |
+| 8718, agent  | `HMAC-SHA256(ARMADA_AGENT_TOKEN_SECRET, sandboxId)`   | this adapter             | the agent's `authenticated` middleware | always on                               |
+| 2718, kernel | 32 random bytes per session, minted by marimohub core | marimohub's kernel proxy | marimo itself                          | off, unless `MARIMOHUB_SANDBOX_AUTH=on` |
+
+```mermaid
+sequenceDiagram
+  participant B as browser
+  participant H as marimohub
+  participant A as adapter
+  participant G as agent :8718
+  participant K as marimo :2718
+  participant X as anyone else
+  Note over A: agent token = HMAC(secret, sandbox id), the pod spec holds its SHA-256
+  Note over H: kernel token = random, per session, with MARIMOHUB_SANDBOX_AUTH=on
+  H->>A: write /tmp/.marimohub-kernel-token
+  A->>G: PUT /files, Bearer agent token
+  G->>G: sha256(token) matches the spec's hash, write the file
+  H->>A: start marimo --token-password-file /tmp/.marimohub-kernel-token
+  A->>G: POST /process/start, Bearer agent token
+  G->>K: start marimo, which reads the kernel token from the file
+  B->>H: open the notebook, with the hub login
+  H->>H: check the user may attach to this session
+  H->>K: forward, Bearer kernel token
+  K-->>H: editor
+  H-->>B: editor
+  X->>G: POST /exec, no token or a wrong one
+  G-->>X: 401
+  X->>K: GET the kernel, no token or a wrong one
+  K-->>X: 401, or a redirect to its login page
+```
+
+With kernel auth off, marimohub mints no kernel token and marimo starts with `--no-token`,
+so the last request in the diagram gets the editor.
+
+**The agent token is ours.** `src/sandbox.ts` derives it, puts only its SHA-256 in the
+pod spec as `MH_AGENT_TOKEN_SHA256`, and `src/channel.ts` sends it on every request.
+The agent refuses to start without that hash (`agent/main.go`) and wraps every route
+but `GET /healthz` in `authenticated` (`agent/server.go`), which hashes the presented
+token and compares it in constant time; a missing or wrong token is a 401. The hash in
+the spec is not a credential: sent as a token it is hashed again and refused, and the
+token behind it is a 256-bit HMAC output, so it cannot be recovered. Whoever holds
+`ARMADA_AGENT_TOKEN_SECRET` can compute every sandbox's token.
+
+**The kernel token is marimohub's.** With `MARIMOHUB_SANDBOX_AUTH=on`, marimohub
+(0.4.14, `packages/core/src/services/runtime/kernelAuth.ts`) mints a token per session,
+keeps it in the session record in its storage, and writes it to
+`/tmp/.marimohub-kernel-token` in the pod. For this adapter that write is an ordinary
+`PUT /files` to the agent, behind the agent token. marimo starts with
+`--token --token-password-file /tmp/.marimohub-kernel-token` and checks every request
+itself. In `proxy` mode marimohub adds the token to what it forwards after checking the
+user, so the browser never sees it; in `subdomain` mode it goes into the kernel URL as
+`?access_token=`, which marimo exchanges for a cookie. The agent does not check this
+token, and none of this repository's code does.
+
+**With kernel auth off, the kernel port is open.** marimohub's default is `off`, which
+starts marimo with `--no-token` on `0.0.0.0:2718`. Anyone who can reach the address,
+including code in another user's notebook on the same cluster network, gets a live
+editor in that pod, which is the user's files, environment and a shell. Turn it on in
+every deployment. It applies to sessions started after the change, and it does not cover
+the surface ports (`MARIMOHUB_SURFACES`).
+
+**Neither token is encrypted under NodePort.** Both travel as plain HTTP on the cluster
+network, so someone who can watch that network can copy either one and use it for the
+rest of the pod's life. An ingress with TLS encrypts the hop from marimohub to the
+ingress controller, not the hop from the controller to the pod.
+
 ## Abandoned commands
 
 Most of marimohub's calls carry no timeout, and a marimohub restart abandons every
