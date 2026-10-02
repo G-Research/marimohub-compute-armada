@@ -73,6 +73,8 @@ mkdir -p "$DATA"
 # fires the snapshot runs as often, or its 60s default would set the pace.
 # The proxy is not needed for routing here (the browser could reach the
 # NodePort address itself) but it keeps the kernel same-origin with the app.
+# Kernel auth is on, so marimo runs with a per-session token rather than
+# `--no-token`, and a kernel address reached directly is refused.
 #
 # Three compute profiles editors can pick between per notebook, small enough
 # that a few sessions fit on the kind worker at once. The first is the default.
@@ -91,6 +93,7 @@ exec env \
 	MARIMOHUB_STORAGE_FS_ROOT="$DATA" \
 	MARIMOHUB_AUTH_BACKEND=dev \
 	MARIMOHUB_SANDBOX_EXPOSURE=proxy \
+	MARIMOHUB_SANDBOX_AUTH="${MARIMOHUB_SANDBOX_AUTH:-on}" \
 	MARIMOHUB_SANDBOX_PROXY_ACK_UNTRUSTED=true \
 	MARIMOHUB_AUTH_SESSION_SECRET="${MARIMOHUB_AUTH_SESSION_SECRET:-armada-dev-only-proxy-secret}" \
 	MARIMOHUB_RUN_MAINTENANCE=true \

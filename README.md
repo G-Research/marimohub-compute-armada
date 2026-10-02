@@ -286,6 +286,18 @@ plaintext HTTP on the cluster network, over an ingress it is a public HTTPS host
 Restrict the ingress to marimohub's egress address in the latter case, through
 `ARMADA_INGRESS_ANNOTATIONS` or the executor's cluster-wide ingress annotations.
 
+The kernel port is not guarded by the agent token. marimo checks a token of its own,
+which marimohub mints per session, and only when `MARIMOHUB_SANDBOX_AUTH=on`. Its default
+is `off`, which starts marimo with `--no-token`: anyone who can reach a kernel's address
+then has a live editor in that pod. Set `MARIMOHUB_SANDBOX_AUTH=on`, as both scripts in
+`dev/` do. [ARCHITECTURE.md](docs/ARCHITECTURE.md#two-tokens) explains which code sends and
+checks each token.
+
+The surface ports (`MARIMOHUB_SURFACES`) have no token under either setting: marimohub starts
+VS Code and OpenCode without authentication, so each one is open to anyone who can reach its
+address. Enable surfaces only where the cluster network keeps everyone but marimohub away
+from the kernel pods.
+
 ### Without the marimohub image
 
 Each marimohub release also ships `marimohub-linux-x64`, a standalone server binary for
