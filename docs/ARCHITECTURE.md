@@ -196,10 +196,10 @@ A kernel pod exposes two ports that run code, and each has its own token. They a
 easy to confuse, because both arrive as `Authorization: Bearer`, but different code
 sends each one and different code checks it.
 
-| Port         | Token                                                 | Sent by                  | Checked by                             | Default                                 |
-| ------------ | ----------------------------------------------------- | ------------------------ | -------------------------------------- | --------------------------------------- |
-| 8718, agent  | `HMAC-SHA256(ARMADA_AGENT_TOKEN_SECRET, sandboxId)`   | this adapter             | the agent's `authenticated` middleware | always on                               |
-| 2718, kernel | 32 random bytes per session, minted by marimohub core | marimohub's kernel proxy | marimo itself                          | off, unless `MARIMOHUB_SANDBOX_AUTH=on` |
+| Port         | Token                                                 | Sent by                                                | Checked by                             | Default                                 |
+| ------------ | ----------------------------------------------------- | ------------------------------------------------------ | -------------------------------------- | --------------------------------------- |
+| 8718, agent  | `HMAC-SHA256(ARMADA_AGENT_TOKEN_SECRET, sandboxId)`   | this adapter                                           | the agent's `authenticated` middleware | always on                               |
+| 2718, kernel | 32 random bytes per session, minted by marimohub core | marimohub's proxy (`proxy`), the browser (`subdomain`) | marimo itself                          | off, unless `MARIMOHUB_SANDBOX_AUTH=on` |
 
 ```mermaid
 sequenceDiagram
@@ -228,8 +228,9 @@ sequenceDiagram
   K-->>X: 401, or a redirect to its login page
 ```
 
-With kernel auth off, marimohub mints no kernel token and marimo starts with `--no-token`,
-so the last request in the diagram gets the editor.
+The diagram shows `proxy` mode. In `subdomain` mode the browser sends the kernel token to
+marimo itself. With kernel auth off, marimohub mints no kernel token and marimo starts with
+`--no-token`, so the last request in the diagram gets the editor.
 
 **The agent token is ours.** `src/sandbox.ts` derives it, puts only its SHA-256 in the
 pod spec as `MH_AGENT_TOKEN_SHA256`, and `src/channel.ts` sends it on every request.
@@ -260,8 +261,9 @@ the surface ports (`MARIMOHUB_SURFACES`).
 
 **Neither token is encrypted under NodePort.** Both travel as plain HTTP on the cluster
 network, so someone who can watch that network can copy either one and use it for the
-rest of the pod's life. An ingress with TLS encrypts the hop from marimohub to the
-ingress controller, not the hop from the controller to the pod.
+rest of the pod's life. An ingress with TLS encrypts only the hop to the ingress
+controller, not the hop from the controller to the pod. The client on that hop is
+marimohub, except for the kernel in `subdomain` mode, where it is the browser.
 
 ## Abandoned commands
 
