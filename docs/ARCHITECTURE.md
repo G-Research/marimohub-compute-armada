@@ -253,7 +253,9 @@ user, and strips the `Set-Cookie` marimo answers with, so the browser sees neith
 `subdomain` mode the token goes into the kernel URL as `?access_token=`, which marimo
 exchanges for a session cookie; that cookie is a credential too, since on its own it gets
 into the kernel. The agent does not check this token, and none of this repository's code
-does.
+does. Scheduled jobs get no kernel token, and need none: a job runs `marimo export html`,
+which writes a file and serves nothing, so a job's pod declares port 2718 but nothing
+listens on it.
 
 **With kernel auth off, the kernel port is open.** marimohub's default is `off`, which
 starts marimo with `--no-token` on `0.0.0.0:2718`. Anyone who can reach the address,
