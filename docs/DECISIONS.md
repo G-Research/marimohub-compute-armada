@@ -185,6 +185,16 @@ agent's own `FROM scratch` image runs `/agent install` into an `emptyDir` mounte
 operator's kernel image is used unchanged. If a deployment forbids the shared volume, the
 fallback is one `COPY` line in the kernel image.
 
+**The agent ships as binaries in the npm package, not as an image.** The clusters this
+adapter targets pull from private registries, so a public image would be copied into one
+anyway. The package carries the static binary for linux/amd64 and linux/arm64 and a
+`FROM scratch` Dockerfile that copies the one matching `TARGETARCH`, so building and pushing
+the image needs Docker alone, and the bundle and the agent always come as a matched pair.
+Both architectures ship in one package rather than as per-platform optional dependencies,
+because the binary runs on the worker nodes, whose architecture says nothing about the host
+running `npm install`. No install script runs: the binaries are in the tarball, attested by
+the release that built them.
+
 **The pod carries a hash of the token, never the token.** The pod spec is not secret:
 `GetJobDetails` returns it with `expandJobSpec` (`pkg/api/job.proto:47`), Lookout renders
 it, and an env var is inherited by every process the agent starts, `os.environ` in a

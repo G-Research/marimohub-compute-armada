@@ -1,0 +1,179 @@
+name: Release
+
+# CHANGELOG.md drives releases. When main gets a changelog whose newest version heading
+# has no GitHub release yet, this publishes @gresearch/marimohub-compute-armada at that
+# version: the adapter bundle plus the kernel agent for linux/amd64 and linux/arm64 with
+# the Dockerfile that packages them. It then tags the commit and creates the GitHub
+# release, with that version's changelog section as its notes and the same files,
+# attested, as its assets. A `-rc.1` style version publishes under the `next` dist-tag
+# and makes a prerelease.
+#
+# Every step is safe to repeat, so a run that failed part way is retried with "Run
+# workflow" on main: the release is the last step, and its absence is what starts one.
+#
+# One-time setup, outside this file:
+#   1. The package on npmjs.com has a trusted publisher naming org G-Research, repo
+#      marimohub-compute-armada, workflow file `release.yml` and environment `release`.
+#      Publishing needs no token secret.
+#   2. A GitHub environment named `release` exists, limited to main, with required
+#      reviewers if a release should wait for approval before it reaches npm.
+#
+# The changelog is the only place the version is written: package.json stays at 0.0.0
+# and private, so nothing but this workflow can publish it.
+
+on:
+  push:
+    branches: [main]
+    paths: [CHANGELOG.md]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      dist-tag: ${{ steps.detect.outputs.dist-tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - run: bun install --frozen-lockfile
+      - name: Is the newest changelog version released?
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(bun run scripts/changelog.ts version)"
+          if [ -z "$version" ]; then
+            echo "no version in CHANGELOG.md yet, only [Unreleased]"
+            exit 0
+          fi
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "v$version is already released"
+            exit 0
+          fi
+          # A prerelease must not become what a bare `npm install` resolves to.
+          case "$version" in
+            *-*) dist_tag=next ;;
+            *) dist_tag=latest ;;
+          esac
+          echo "releasing $version under the $dist_tag dist-tag"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "dist-tag=$dist_tag" >>"$GITHUB_OUTPUT"
+
+  ci:
+    needs: detect
+    if: needs.detect.outputs.version != ''
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: [detect, ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: agent/go.mod
+          cache-dependency-path: agent/go.mod
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun run agent:dist
+      - name: Pack
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          npm pkg set version="$VERSION"
+          npm pkg delete private
+          mkdir release
+          npm pack --ignore-scripts --pack-destination release
+          for arch in amd64 arm64; do
+            cp "dist/agent/linux-$arch/agent" "release/marimohub-kernel-agent-linux-$arch"
+          done
+          (cd release && sha256sum -- * >SHA256SUMS)
+          cat release/SHA256SUMS
+          bun run scripts/changelog.ts notes "$VERSION" >notes.md
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: release/SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: |
+            release/
+            notes.md
+          if-no-files-found: error
+
+  publish:
+    needs: [detect, build]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+      - name: Publish with trusted publishing
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          DIST_TAG: ${{ needs.detect.outputs.dist-tag }}
+        run: |
+          if [ "$(npm view "@gresearch/marimohub-compute-armada@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+            echo "$VERSION is already on npm"
+            exit 0
+          fi
+          # An older npm falls back to token auth and fails with a misleading 404.
+          if ! printf '%s\n' 11.5.1 "$(npm -v)" | sort -V -C; then
+            echo "::error::npm $(npm -v) cannot use trusted publishing; it needs 11.5.1 or later"
+            exit 1
+          fi
+          npm publish release/*.tgz --ignore-scripts --provenance --access public --tag "$DIST_TAG"
+
+  github-release:
+    needs: [detect, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+      - name: Tag the commit and create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          DIST_TAG: ${{ needs.detect.outputs.dist-tag }}
+        run: |
+          prerelease=()
+          if [ "$DIST_TAG" = next ]; then prerelease=(--prerelease); fi
+          gh release create "v$VERSION" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --notes-file notes.md \
+            "${prerelease[@]}"
