@@ -1,0 +1,14 @@
+# The kernel agent image from the prebuilt binaries in the npm package, the same
+# image agent/Dockerfile builds from source. It ships as dist/agent/Dockerfile next
+# to linux-amd64/ and linux-arm64/, so that directory is the build context:
+#
+#   docker buildx build --platform linux/amd64,linux/arm64 --push \
+#     -t <registry>/marimohub-kernel-agent:<version> \
+#     node_modules/@gresearch/marimohub-compute-armada/dist/agent
+#
+# Nothing runs during the build, so a platform other than the host's needs no
+# emulation.
+FROM scratch
+ARG TARGETARCH
+COPY linux-${TARGETARCH}/agent /agent
+ENTRYPOINT ["/agent"]

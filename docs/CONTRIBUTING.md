@@ -27,15 +27,17 @@ bun run check             # oxfmt, oxlint (type-aware), then golangci-lint fmt a
 bun run typecheck         # both tsconfigs
 bun run test              # adapter tests, then go vet and go test
 bun run build             # bundles src into dist/index.js, self-contained
+bun run agent:dist        # the agent for linux/amd64 and linux/arm64 into dist/agent
 bun run fmt               # formats TypeScript, Markdown, YAML and Go
 bun run check:armada-api  # the wire types against the pinned Armada spec
+bun run scripts/changelog.ts version  # the newest version in CHANGELOG.md, as the release reads it
 bun run smoke             # one job against a running Armada, through the agent
 ```
 
-CI (`.github/workflows/ci.yml`) runs `check`, `typecheck`, `test` and `build`, lints
-and builds the agent in its own job, and verifies the Armada API contract when an
-Armada-related file changed. Every GitHub Action is pinned to a full-length commit
-SHA; keep it that way.
+CI (`.github/workflows/ci.yml`) runs `check`, `typecheck`, `test` and `build`, checks
+that the release can read `CHANGELOG.md`, lints and builds the agent and both agent
+images in its own job, and verifies the Armada API contract when an Armada-related file
+changed. Every GitHub Action is pinned to a full-length commit SHA; keep it that way.
 
 ### Lint rules that cost time
 
@@ -364,6 +366,39 @@ Lookout UI: <http://localhost:30000>. To tear down, `./dev/shutdown.sh` removes 
 marimohub container and deletes the kind cluster; `./dev/shutdown.sh --purge` also drops the
 data volume, the dev images, `dev/tls`, and the binary and data of `run-native.sh`
 (`dev/bin`, `dev/data`).
+
+## Releasing
+
+`CHANGELOG.md` drives releases, in [Keep a Changelog](https://keepachangelog.com/) form.
+Changes go under `## [Unreleased]` as they merge. To release, rename that heading to the
+new version and date, start a fresh `[Unreleased]` above it, and merge:
+
+```markdown
+## [Unreleased]
+
+## [0.2.0] - 2026-10-20
+
+### Added
+
+- ...
+```
+
+On main, `.github/workflows/release.yml` sees a newest version with no GitHub release yet.
+It runs CI, builds the bundle and the agents, stamps the version into `package.json`,
+packs, attests the tarball and both binaries, and publishes to npm with provenance through
+trusted publishing. It then tags the commit `v0.2.0` and creates the GitHub release, with
+that section of the changelog as its notes and the tarball, the binaries and their
+`SHA256SUMS` as assets. A version such as `0.2.0-rc.1` publishes under the `next`
+dist-tag and makes a prerelease.
+
+The changelog is the only place the version is written: `package.json` stays at `0.0.0`
+and `private`, so a stray `npm publish` from a checkout fails. CI runs
+`bun run scripts/changelog.ts version` on every pull request, so a heading the release
+could not read (no date, not semver, a `v` prefix) fails there rather than on main. If a
+release fails part way, fix the cause and start the workflow again with "Run workflow" on
+main; every step skips what is already done. The publish job runs in the `release`
+environment, which is where an approval step goes. The header of `release.yml` lists the
+one-time npm and GitHub setup.
 
 ## Changing things
 

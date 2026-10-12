@@ -1,5 +1,5 @@
 {
-	"name": "marimohub-compute-armada",
+	"name": "@gresearch/marimohub-compute-armada",
 	"version": "0.0.0",
 	"private": true,
 	"description": "marimohub compute adapter running notebook kernels as Armada jobs",
@@ -9,7 +9,15 @@
 		"type": "git",
 		"url": "https://github.com/G-Research/marimohub-compute-armada.git"
 	},
+	"files": [
+		"dist/index.js",
+		"dist/index.js.map",
+		"dist/agent"
+	],
 	"type": "module",
+	"exports": {
+		".": "./dist/index.js"
+	},
 	"scripts": {
 		"build": "bun build src/index.ts --target=node --format=esm --sourcemap=linked --outdir=dist",
 		"dev": "bun build src/index.ts --target=node --format=esm --sourcemap=linked --outdir=dist --watch",
@@ -23,13 +31,15 @@
 		"lint": "oxlint --type-aware",
 		"agent:lint": "cd agent && golangci-lint fmt --diff && golangci-lint run",
 		"agent:test": "go -C agent vet ./... && go -C agent test ./...",
-		"agent:build": "docker build -t marimohub-kernel-agent:local agent"
+		"agent:build": "docker build -t marimohub-kernel-agent:local agent",
+		"agent:dist": "bash scripts/build-agent.sh"
 	},
 	"devDependencies": {
 		"@kubernetes/client-node": "^2.0.0",
 		"@nojaf/oxlint-plugin-annotate-non-primitives": "^0.1.1",
 		"@types/bun": "^1.4.0",
 		"@types/node": "^24",
+		"keep-a-changelog": "^3.2.0",
 		"oxfmt": "^0.66.0",
 		"oxlint": "^1.81.0",
 		"oxlint-tsgolint": "^7.0.2001",

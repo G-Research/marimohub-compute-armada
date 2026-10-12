@@ -8,10 +8,18 @@ needs no changes to marimohub itself.
 
 ## Status
 
-Nothing is published yet: no npm package, no marimohub image with the adapter in it, and no
-agent image. To try it, clone this repository and build both images yourself (see
-[Deployment](#deployment)); [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) walks through a
-full run against a local kind cluster. Publishing the agent image is planned, but not soon.
+Released on npm as
+[`@gresearch/marimohub-compute-armada`](https://www.npmjs.com/package/@gresearch/marimohub-compute-armada):
+the adapter bundle, and the kernel agent as static Linux binaries for amd64 and arm64 with a
+Dockerfile that turns them into the agent image. No image is published; the agent image goes
+into a registry your worker clusters pull from, built from the package without a Go
+toolchain (see [From the npm package](#from-the-npm-package)). Each release is also a GitHub
+release with the same files and build attestations; [CHANGELOG.md](CHANGELOG.md) lists what
+changed.
+
+To build from source instead, see [Deployment](#deployment);
+[docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) walks through a full run against a local kind
+cluster.
 
 ## How it works
 
@@ -71,9 +79,10 @@ booting rather than failing at the first session.
 
 `MARIMOHUB_COMPUTE_IMAGE` defaults to `ghcr.io/marimo-team/marimo-sandbox:latest`, marimo's
 own kernel image, as marimohub's kubernetes adapter defaults its own. It is public and amd64.
-`ARMADA_AGENT_IMAGE` has no default because the image is not published: build it from
-`agent/` for the architecture of the worker nodes (see Deployment). The agent port is
-exposed the same way as the kernel port, so whatever reaches one reaches the other.
+`ARMADA_AGENT_IMAGE` has no default because the image is not published: build it from the
+npm package's `dist/agent` or from `agent/`, and push it where the worker nodes pull from
+(see Deployment). The agent port is exposed the same way as the kernel port, so whatever
+reaches one reaches the other.
 
 `ARMADA_AGENT_TOKEN_SECRET` is the key each sandbox's agent token is derived from, with
 the sandbox id. Generate it once (`openssl rand -hex 32`) and give every marimohub process
@@ -297,6 +306,33 @@ The surface ports (`MARIMOHUB_SURFACES`) have no token under either setting: mar
 VS Code and OpenCode without authentication, so each one is open to anyone who can reach its
 address. Enable surfaces only where the cluster network keeps everyone but marimohub away
 from the kernel pods.
+
+### From the npm package
+
+The package carries everything this adapter adds: `dist/index.js`, the bundle marimohub
+loads, and `dist/agent`, the agent for both worker architectures with its Dockerfile and
+checksums. Install it anywhere; nothing in it runs on install.
+
+```bash
+npm install --prefix /opt/marimohub-armada @gresearch/marimohub-compute-armada@<version>
+PKG=/opt/marimohub-armada/node_modules/@gresearch/marimohub-compute-armada
+
+# The agent image, into a registry the worker clusters pull from. Nothing runs in the
+# build, so either architecture builds on any host without emulation.
+docker buildx build --platform linux/amd64,linux/arm64 --push \
+  -t <registry>/marimohub-kernel-agent:<version> "$PKG/dist/agent"
+export ARMADA_AGENT_IMAGE=<registry>/marimohub-kernel-agent:<version>
+
+# The adapter, from where it was installed, or copied into the marimohub image as the
+# Dockerfile does.
+export MARIMOHUB_COMPUTE_LIBRARY="$PKG/dist/index.js"
+```
+
+Tag the agent image with the package version and upgrade both together: an adapter can
+call an agent route that an older agent does not have. To check where the files came from,
+`npm audit signatures` verifies the package's provenance, and
+`gh attestation verify "$PKG/dist/agent/linux-amd64/agent" --repo G-Research/marimohub-compute-armada`
+verifies a binary against the attestation of the release that built it.
 
 ### Without the marimohub image
 
