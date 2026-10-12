@@ -152,7 +152,8 @@ jobs:
             echo "::error::npm $(npm -v) cannot use trusted publishing; it needs 11.5.1 or later"
             exit 1
           fi
-          npm publish release/*.tgz --ignore-scripts --provenance --access public --tag "$DIST_TAG"
+          # The ./ matters: npm reads `release/x.tgz` as the GitHub repo release/x.tgz.
+          npm publish ./release/*.tgz --ignore-scripts --provenance --access public --tag "$DIST_TAG"
 
   github-release:
     needs: [detect, publish]
