@@ -43,6 +43,12 @@ import (
 // bearer token every request must present.
 const TokenHashEnv = "MH_AGENT_TOKEN_SHA256"
 
+// version is the release this binary was built for, stamped in with
+// `-ldflags -X main.version=...` from CHANGELOG.md (scripts/build-agent.sh).
+// A build that does not stamp it, such as `go build` or agent/Dockerfile
+// without a VERSION build argument, reports "dev".
+var version = "dev"
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "install" {
 		if len(os.Args) != 3 {
@@ -59,7 +65,13 @@ func main() {
 	port := flag.Int("port", 8718, "port to listen on")
 	bind := flag.String("bind", "", "address to bind, all interfaces when empty")
 	grace := flag.Duration("grace", 25*time.Second, "how long to wait for children after SIGTERM")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	hash, err := hex.DecodeString(os.Getenv(TokenHashEnv))
 	if err != nil || len(hash) != 32 {
@@ -79,7 +91,7 @@ func main() {
 			log.Fatalf("listen: %v", err)
 		}
 	}()
-	log.Printf("kernel agent listening on %s as pid %d", server.Addr, os.Getpid())
+	log.Printf("kernel agent %s listening on %s as pid %d", version, server.Addr, os.Getpid())
 
 	// Kubernetes stops the container by sending SIGTERM to PID 1 and waiting
 	// the grace period. Forward it, so the kernel gets its chance to flush, and

@@ -8,6 +8,14 @@ heading merged to main is released: see [docs/CONTRIBUTING.md](docs/CONTRIBUTING
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-12
+
+### Fixed
+
+- The kernel agent had no way to report its version. `agent --version` now prints the
+  release it was built for, and the agent logs it at startup. A build from
+  `agent/Dockerfile` reports `dev` unless it is given `--build-arg VERSION=...`.
+
 ## [0.1.0] - 2026-10-12
 
 First release, built and tested against marimohub 0.4.14 and Armada v0.22.7.
