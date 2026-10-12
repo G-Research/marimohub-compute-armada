@@ -8,7 +8,7 @@ needs no changes to marimohub itself.
 
 ## Status
 
-Not released yet. Releases go to npm as
+Released on npm as
 [`@gresearch/marimohub-compute-armada`](https://www.npmjs.com/package/@gresearch/marimohub-compute-armada):
 the adapter bundle, and the kernel agent as static Linux binaries for amd64 and arm64 with a
 Dockerfile that turns them into the agent image. No image is published; the agent image goes
@@ -17,9 +17,9 @@ toolchain (see [From the npm package](#from-the-npm-package)). Each release is a
 release with the same files and build attestations; [CHANGELOG.md](CHANGELOG.md) lists what
 changed.
 
-Until the first release, clone this repository and build both images yourself (see
-[Deployment](#deployment)); [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) walks through a full
-run against a local kind cluster.
+To build from source instead, see [Deployment](#deployment);
+[docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) walks through a full run against a local kind
+cluster.
 
 ## How it works
 
