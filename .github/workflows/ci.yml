@@ -42,8 +42,17 @@ jobs:
       - run: go -C agent vet ./...
       - run: go -C agent test ./...
       - run: docker build agent
+      # build-agent.sh reads the agent's version from CHANGELOG.md.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - run: bun install --frozen-lockfile
       # The image the npm package's prebuilt binaries and Dockerfile make.
       - run: bash scripts/build-agent.sh
+      - name: The agent reports the changelog's version
+        run: |
+          want="$(bun run scripts/changelog.ts version)"
+          got="$(dist/agent/linux-amd64/agent --version)"
+          echo "agent --version: $got"
+          [ "$got" = "$want" ] || { echo "::error::expected $want"; exit 1; }
       # The README's command, minus the push. The runner's default builder cannot build
       # several platforms at once; nothing runs in this image, so neither needs emulation.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
