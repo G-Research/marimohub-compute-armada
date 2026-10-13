@@ -140,8 +140,9 @@ business, so `ARMADA_GPU_NODE_SELECTORS` maps each type to a `nodeSelector`.
 `gpuProfiles` is on exactly when that map is set. Without it marimohub strips GPUs from
 every profile and warns at startup, which beats scheduling an `A100` profile on whatever
 GPU is free. With it, `readConfig` refuses a profile whose type the map does not name,
-reading marimohub's own `MARIMOHUB_COMPUTE_PROFILES` for the types as it reads the surface
-variables, and the pod spec refuses one again as the backstop. A plain `nodeSelector`, not
+reading marimohub's own `MARIMOHUB_COMPUTE_PROFILES` and `MARIMOHUB_COMPUTE_APP_PROFILES`
+(the separate app list, 0.5.0 onwards) for the types as it reads the surface variables,
+and the pod spec refuses one again as the backstop. A plain `nodeSelector`, not
 node affinity: Armada rejects the preferred kind (`submit_request.go:182`) and the required
 kind says nothing more here.
 

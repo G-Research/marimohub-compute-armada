@@ -508,14 +508,20 @@ function readPodMetadata(
 }
 
 /**
- * The GPU types marimohub's `MARIMOHUB_COMPUTE_PROFILES` names, upper-cased as
- * marimohub stores them. marimohub validates the variable in full
+ * The variables marimohub reads compute profiles from: the editing list, and
+ * (0.5.0 onwards) a separate list for apps. Both use the same syntax.
+ */
+const PROFILE_VARIABLES = ['MARIMOHUB_COMPUTE_PROFILES', 'MARIMOHUB_COMPUTE_APP_PROFILES'] as const;
+
+/**
+ * The GPU types a profile list names, upper-cased as marimohub stores them.
+ * marimohub validates the variable in full
  * (`packages/config/src/computeProfiles.ts`), so this only has to find the
  * `gpu=<type>[:<count>]` entries in `name:key=value;…,…`.
  */
-function profileGpuTypes(env: Record<string, string | undefined>): string[] {
+function profileGpuTypes(profiles: string | undefined): string[] {
 	const types: string[] = [];
-	for (const profile of (env.MARIMOHUB_COMPUTE_PROFILES ?? '').split(',')) {
+	for (const profile of (profiles ?? '').split(',')) {
 		const body: string = profile.slice(profile.indexOf(':') + 1);
 		for (const pair of body.split(';')) {
 			const [key = '', value = ''] = pair.split('=');
@@ -607,13 +613,15 @@ export function readConfig(
 	// does not name would fail every session started on it. Without one, marimohub
 	// strips GPUs from every profile itself and says so at startup.
 	if (Object.keys(config.gpuNodeSelectors).length > 0) {
-		const unmapped: string[] = profileGpuTypes(env).filter(
-			(type: string) => config.gpuNodeSelectors[type] === undefined,
-		);
-		if (unmapped.length > 0) {
-			throw new Error(
-				`MARIMOHUB_COMPUTE_PROFILES names GPU type ${[...new Set(unmapped)].join(', ')}, which ARMADA_GPU_NODE_SELECTORS does not map; it maps ${Object.keys(config.gpuNodeSelectors).join(', ')}`,
+		for (const variable of PROFILE_VARIABLES) {
+			const unmapped: string[] = profileGpuTypes(env[variable]).filter(
+				(type: string) => config.gpuNodeSelectors[type] === undefined,
 			);
+			if (unmapped.length > 0) {
+				throw new Error(
+					`${variable} names GPU type ${[...new Set(unmapped)].join(', ')}, which ARMADA_GPU_NODE_SELECTORS does not map; it maps ${Object.keys(config.gpuNodeSelectors).join(', ')}`,
+				);
+			}
 		}
 	}
 	// marimohub creates sandboxes by id alone on paths that exec and destroy,

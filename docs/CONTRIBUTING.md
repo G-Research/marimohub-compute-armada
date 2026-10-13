@@ -370,8 +370,9 @@ data volume, the dev images, `dev/tls`, and the binary and data of `run-native.s
 ## Releasing
 
 `CHANGELOG.md` drives releases, in [Keep a Changelog](https://keepachangelog.com/) form.
-Changes go under `## [Unreleased]` as they merge. To release, rename that heading to the
-new version and date, start a fresh `[Unreleased]` above it, and merge:
+Changes go under `## [Unreleased]` as they merge. End each entry with a link to its GitHub
+issue, or to its pull request when there is no issue. To release, rename that heading to
+the new version and date, start a fresh `[Unreleased]` above it, and merge:
 
 ```markdown
 ## [Unreleased]
@@ -380,7 +381,7 @@ new version and date, start a fresh `[Unreleased]` above it, and merge:
 
 ### Added
 
-- ...
+- ... ([#42](https://github.com/G-Research/marimohub-compute-armada/issues/42))
 ```
 
 On main, `.github/workflows/release.yml` sees a newest version with no GitHub release yet.

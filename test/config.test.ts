@@ -343,12 +343,26 @@ describe('ARMADA_GPU_NODE_SELECTORS', () => {
 		).toThrow('names GPU type H100, which ARMADA_GPU_NODE_SELECTORS does not map; it maps A100');
 	});
 
+	it('refuses at startup an app profile whose GPU type it does not map', () => {
+		expect(() =>
+			readConfig({
+				...baseEnv,
+				ARMADA_GPU_NODE_SELECTORS: a100,
+				MARIMOHUB_COMPUTE_PROFILES: 'small:cpu=1;mem=2Gi,gpu:cpu=8;mem=32Gi;gpu=A100',
+				MARIMOHUB_COMPUTE_APP_PROFILES: 'app:cpu=1;mem=2Gi,app-gpu:cpu=8;gpu=t4',
+			}),
+		).toThrow(
+			'MARIMOHUB_COMPUTE_APP_PROFILES names GPU type T4, which ARMADA_GPU_NODE_SELECTORS does not map; it maps A100',
+		);
+	});
+
 	it('accepts profiles whose GPU types are all mapped, in any case', () => {
 		expect(() =>
 			readConfig({
 				...baseEnv,
 				ARMADA_GPU_NODE_SELECTORS: a100,
 				MARIMOHUB_COMPUTE_PROFILES: 'small:cpu=1,gpu:gpu=a100;cpu=8, big:gpu=A100:4',
+				MARIMOHUB_COMPUTE_APP_PROFILES: 'app:cpu=1,app-gpu:gpu=a100:2',
 			}),
 		).not.toThrow();
 	});
