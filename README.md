@@ -160,7 +160,9 @@ and memory become the kernel container's requests and limits, which Armada requi
 be equal. So a kernel that outgrows its profile's memory is OOM-killed, and every session
 is charged its full profile against the queue's fair share, idle or not. Offer a short
 list of sizes rather than one large default. Users can only pick when
-`MARIMOHUB_COMPUTE_PROFILE_OVERRIDE=editors`.
+`MARIMOHUB_COMPUTE_PROFILE_OVERRIDE=editors`. From marimohub 0.5.0,
+`MARIMOHUB_COMPUTE_APP_PROFILES` gives apps their own list, in the same syntax; without
+it, apps use the editing list.
 
 ```bash
 MARIMOHUB_COMPUTE_PROFILES='small:cpu=1;mem=4Gi,large:cpu=4;mem=32Gi,a100:cpu=8;mem=64Gi;gpu=A100'

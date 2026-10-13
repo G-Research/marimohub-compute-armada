@@ -8,6 +8,13 @@ heading merged to main is released: see [docs/CONTRIBUTING.md](docs/CONTRIBUTING
 
 ## [Unreleased]
 
+### Fixed
+
+- Startup now also checks the GPU types in `MARIMOHUB_COMPUTE_APP_PROFILES`, the separate
+  app profile list from marimohub 0.5.0. An app profile with a GPU type that
+  `ARMADA_GPU_NODE_SELECTORS` does not map passed startup and then failed every app
+  session that used it.
+
 ## [0.1.1] - 2026-10-12
 
 ### Fixed
