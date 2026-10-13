@@ -171,22 +171,33 @@ export interface JobStatusUsingExternalJobUriRequest {
 }
 
 export interface JobStatusResponse {
-	/** Job id to state. */
-	jobStates?: Record<string, JobState>;
+	/**
+	 * Job id to state, as the number of a {@link JOB_STATE} member. The spec
+	 * says the names, but the gateway marshals with Go's `encoding/json`
+	 * (`runtime.JSONBuiltin`, `internal/common/grpc/gateway.go`), which writes
+	 * a proto enum as its integer.
+	 */
+	jobStates?: Record<string, number>;
 }
 
-export type JobState =
-	| 'QUEUED'
-	| 'PENDING'
-	| 'RUNNING'
-	| 'SUCCEEDED'
-	| 'FAILED'
-	| 'UNKNOWN'
-	| 'SUBMITTED'
-	| 'LEASED'
-	| 'PREEMPTED'
-	| 'CANCELLED'
-	| 'REJECTED';
+/**
+ * `api.JobState` (`pkg/api/submit.proto`), name to number. The contract check
+ * holds the spec's enum to this order, which is the proto's declaration order
+ * and so the numbering.
+ */
+export const JOB_STATE = {
+	QUEUED: 0,
+	PENDING: 1,
+	RUNNING: 2,
+	SUCCEEDED: 3,
+	FAILED: 4,
+	UNKNOWN: 5,
+	SUBMITTED: 6,
+	LEASED: 7,
+	PREEMPTED: 8,
+	CANCELLED: 9,
+	REJECTED: 10,
+} as const;
 
 /*
  * Lookout's job-query API, a separate service from the Armada server with its

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import type { Mock } from 'bun:test';
-import type { ArmadaClient, PodLocation } from '../src/armada.js';
+import type { ArmadaClient, PodLocation, SubmittedJob } from '../src/armada.js';
 import type { V1Container, V1EnvVar, V1PodSpec } from '@kubernetes/client-node';
 import { createHash } from 'node:crypto';
 import { readConfig } from '../src/config.js';
@@ -86,6 +86,8 @@ function scriptOf(call: ExecCall | undefined): string {
 interface Recorded {
 	calls: ExecCall[];
 	submitted: string[];
+	/** The queue of every lookup of an existing job. */
+	found: string[];
 	/** The agent token hash each submitted pod spec carried. */
 	tokenHashes: string[];
 	/** The timeout of every agent readiness check. */
@@ -119,12 +121,17 @@ function stubSandbox(
 		queues?: QueueDirectory;
 		placements?: Placements;
 		owner?: SandboxOwner;
+		/** Build the instance `connectExisting` builds, which never submits. */
+		attachOnly?: boolean;
+		/** What a lookup of the existing job finds; `null` is no job at all. */
+		existing?: SubmittedJob | null;
 	} = {},
 ): Recorded & { sandbox: ArmadaSandbox } {
 	const settings: ArmadaConfig = readConfig({ ...baseEnv, ...options.env });
 	const recorded: Recorded = {
 		calls: [],
 		submitted: [],
+		found: [],
 		tokenHashes: [],
 		readies: [],
 		cancelled: [],
@@ -147,6 +154,11 @@ function stubSandbox(
 					.find((env: V1EnvVar): boolean => env.name === AGENT_TOKEN_HASH_ENV)?.value ?? '',
 			);
 			return { jobId: 'job-1', jobSetId: 'set-1', queue };
+		},
+		findJob: async (_id: string, queue: string): Promise<SubmittedJob | undefined> => {
+			recorded.found.push(queue);
+			if (options.existing === null) return undefined;
+			return options.existing ?? { jobId: 'job-1', jobSetId: 'set-1', queue };
 		},
 		waitForRunning: async () => pod,
 		portUrl: async (_job: unknown, port: number) => `http://172.18.0.3:${String(30000 + port)}`,
@@ -224,6 +236,7 @@ function stubSandbox(
 			options.queues ?? new QueueDirectory(settings, undefined),
 			options.placements ?? new Map(),
 			options.owner === undefined ? undefined : { owner: options.owner },
+			options.attachOnly ?? false,
 		),
 		...recorded,
 	};
@@ -306,6 +319,89 @@ describe('placements', () => {
 		await sandbox.destroy();
 
 		expect(placements.size).toBe(0);
+	});
+});
+
+describe('attaching to an existing sandbox', () => {
+	it('reaches the job the sandbox already has, submitting nothing', async () => {
+		const attached: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			attachOnly: true,
+			existing: { jobId: 'job-9', jobSetId: 'sandbox-1', queue: 'marimohub' },
+		});
+		const result: ExecResult = await attached.sandbox.exec('echo hi');
+
+		expect(result.success).toBe(true);
+		expect(attached.submitted).toEqual([]);
+		expect(attached.found).toEqual(['marimohub']);
+		expect(attached.endpoints).toHaveLength(1);
+		// The job it found is the one destroy cancels.
+		await attached.sandbox.destroy();
+		expect(attached.cancelled).toEqual(['job:job-9']);
+	});
+
+	it('looks in the queue the sandbox was placed in, not the default', async () => {
+		const queues: QueueDirectory = new QueueDirectory(readConfig(baseEnv), undefined);
+		queues.remember('sandbox-1', 'team-b');
+		const attached: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			attachOnly: true,
+			queues,
+		});
+		await attached.sandbox.ready();
+
+		expect(attached.found).toEqual(['team-b']);
+	});
+
+	it('fails every call when the sandbox has no job left, and never submits one', async () => {
+		const gone: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			attachOnly: true,
+			existing: null,
+		});
+
+		expect(await rejection(gone.sandbox.ready())).toContain(
+			'Sandbox sandbox-1 has no unfinished job in queue "marimohub" to attach to',
+		);
+		// What marimohub's capture and kernel probe see: failures, not an empty pod.
+		expect(await gone.sandbox.exec('echo hi')).toMatchObject({
+			success: false,
+			error: { code: 'BACKEND_ERROR' },
+		});
+		expect(await gone.sandbox.readFile('/work/notebook.py')).toEqual({
+			success: false,
+			content: '',
+			error: { code: 'BACKEND_ERROR' },
+		});
+		expect(await gone.sandbox.listFiles('/work')).toEqual({
+			success: false,
+			files: [],
+			error: { code: 'BACKEND_ERROR' },
+		});
+		expect(gone.submitted).toEqual([]);
+		expect(gone.endpoints).toEqual([]);
+	});
+
+	it('still destroys a sandbox that has no job left, by job set', async () => {
+		const gone: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			attachOnly: true,
+			existing: null,
+		});
+		await gone.sandbox.destroy();
+
+		expect(gone.cancelled).toEqual(['set:sandbox-1@marimohub']);
+		expect(gone.found).toEqual([]);
+	});
+
+	it('takes a sandbox this process already reached from its placement, with no lookup', async () => {
+		const placements: Placements = new Map();
+		await stubSandbox(ok, { placements }).sandbox.ready();
+		const attached: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			placements,
+			attachOnly: true,
+			existing: null,
+		});
+		await attached.sandbox.ready();
+
+		expect(attached.found).toEqual([]);
+		expect(attached.submitted).toEqual([]);
 	});
 });
 

@@ -79,6 +79,26 @@ the agent's health; a pod that no longer answers is dropped and resolved from th
 `destroy` forgets it. This is per process by nature: after a restart the first call pays the
 full resolution once, which is why the agent token has to be derived rather than kept.
 
+**Attaching never submits.** From marimohub 0.4.16, reclaiming an expired editor session
+saves its edits first, but only through `connectExisting`, which must reach the sandbox
+without being able to start one. Without it marimohub keeps such a session, its pod and its
+editor claim until the session's authorization runs out or an admin discards it, and the
+edits are lost either way. `create` cannot stand in: its lazy submission would put a fresh
+pod under the capture, an empty workspace saved over the user's work. So `connectExisting`
+is the same sandbox with the submit replaced by a lookup, `GetJobStatusUsingExternalJobUri`
+by the sandbox id in the queue the sandbox resolves to. No job, or only a finished one,
+fails `ready()` and with it every read and command, so the capture fails, `destroy` cancels
+the set, and marimohub releases the session. The states arrive as enum numbers whatever the
+spec says (the gateway marshals with `encoding/json`), which is why the contract check holds
+`apiJobState` to its order. The server answers from the database Lookout's ingester fills, a
+second or so behind a submit, which a sandbox started long before never notices.
+
+marimohub hands a library adapter no `NotFoundError` (its factory context carries only
+`preconditionFailed`), so a vanished sandbox reads as a failure rather than as "gone". The
+capture path does not mind. The idle check before a reclaim does: it reads a failed probe as
+"kernel unreachable" and keeps the session, the same outcome as before this method existed.
+A `notFound` in the factory context upstream would close that.
+
 **`activeDeadlineSeconds` is always set.** Armada assigns a default deadline to any pod
 that does not set one, and the shipped default is 72 hours, 336 for GPU jobs
 (`config/server/config.yaml:65`, `:67`). A kernel that inherits an operator's default is

@@ -71,6 +71,30 @@ export class ArmadaCompute implements SandboxProvider {
 		);
 	}
 
+	/**
+	 * Strict attachment, which marimohub (0.4.16 onwards) needs before it saves
+	 * an expired session's edits and reclaims its sandbox: the same sandbox as
+	 * `create`, except that it reaches only a job that already exists. Without
+	 * this method marimohub keeps such a session, its pod and its editor claim
+	 * until the session's authorization runs out or an admin discards it.
+	 *
+	 * Warm pools stay off: marimohub needs a `warmPool` capability too, which
+	 * this provider does not declare, so `MARIMOHUB_COMPUTE_WARM_POOL_ENABLED`
+	 * is still refused at startup.
+	 */
+	connectExisting(id: SandboxId, options?: CreateSandboxOptions): ArmadaSandbox {
+		return new ArmadaSandbox(
+			id,
+			this.config,
+			this.armada,
+			openAgent,
+			this.queues,
+			this.placements,
+			options,
+			true,
+		);
+	}
+
 	/** Kernels are reached directly at their Armada ingress, so nothing is proxied. */
 	async proxy(_request: Request): Promise<Response | null> {
 		return null;

@@ -169,7 +169,9 @@ export function toFileInfos(
  * One kernel session, backed by one Armada job.
  *
  * Resolution is lazy: `create()` is synchronous and id-addressed, so the job is
- * submitted on first use. Commands run through the agent's `/exec`; detached
+ * submitted on first use. An instance from `connectExisting` never submits: it
+ * finds the job the sandbox already has, and fails every call when there is
+ * none (`attachOnly`). Commands run through the agent's `/exec`; detached
  * processes and files go through its own endpoints, so nothing here builds a
  * shell command beyond the env prefix and the quoted `git clone`.
  */
@@ -202,6 +204,12 @@ export class ArmadaSandbox implements SandboxInstance {
 		private readonly queues: QueueDirectory,
 		private readonly placements: Placements,
 		private readonly options?: CreateSandboxOptions,
+		/**
+		 * Reach the job the sandbox already has, never submit one. marimohub
+		 * attaches this way to save an expired session's edits before reclaiming
+		 * it, and a fresh pod there would be an empty workspace to capture.
+		 */
+		private readonly attachOnly: boolean = false,
 	) {
 		this.token = agentToken(config.agentTokenSecret, id);
 	}
@@ -237,12 +245,7 @@ export class ArmadaSandbox implements SandboxInstance {
 				this.placements.delete(this.id);
 			}
 		}
-		const tokenSha256: string = createHash('sha256').update(this.token).digest('hex');
-		this.job ??= await this.armada.submit(
-			this.id,
-			buildPodSpec(this.config, { tokenSha256 }, this.options),
-			await this.queue(),
-		);
+		this.job ??= this.attachOnly ? await this.existingJob() : await this.submit();
 		this.pod = await this.armada.waitForRunning(this.job);
 		// The agent's address comes from the same event as the kernel's.
 		const url: string = await this.armada.portUrl(this.job, this.config.agentPort);
@@ -250,6 +253,32 @@ export class ArmadaSandbox implements SandboxInstance {
 		await channel.ready(AGENT_READY_TIMEOUT_MS);
 		this.channel = channel;
 		this.placements.set(this.id, { job: this.job, pod: this.pod, channel });
+	}
+
+	private async submit(): Promise<SubmittedJob> {
+		const tokenSha256: string = createHash('sha256').update(this.token).digest('hex');
+		return this.armada.submit(
+			this.id,
+			buildPodSpec(this.config, { tokenSha256 }, this.options),
+			await this.queue(),
+		);
+	}
+
+	/**
+	 * The sandbox's unfinished job, for an `attachOnly` instance. Its absence is
+	 * the answer marimohub needs: the read or command that asked fails, its
+	 * capture with it, and reclaiming goes on to `destroy`, which cancels the
+	 * job set and releases the session.
+	 */
+	private async existingJob(): Promise<SubmittedJob> {
+		const queue: string = await this.queue();
+		const job: SubmittedJob | undefined = await this.armada.findJob(this.id, queue);
+		if (job === undefined) {
+			throw new Error(
+				`Sandbox ${this.id} has no unfinished job in queue "${queue}" to attach to, and attaching never submits one`,
+			);
+		}
+		return job;
 	}
 
 	/** Where the pod landed, once it has. For reporting, not for reaching it. */
