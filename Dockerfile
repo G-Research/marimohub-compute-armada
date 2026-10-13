@@ -1,6 +1,6 @@
 # marimohub with the Armada compute adapter baked in.
 # Build context needs dist/index.js — run `bun run build` first (CI does).
-FROM ghcr.io/marimo-team/marimohub:0.4.14
+FROM ghcr.io/marimo-team/marimohub:0.5.0
 
 COPY dist/index.js /etc/marimohub/compute.mjs
 
