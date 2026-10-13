@@ -80,3 +80,9 @@ describe('compute profile capabilities', () => {
 		expect(provider.capabilities.gpuProfiles).toBe(true);
 	});
 });
+
+describe('connectExisting', () => {
+	it('is present, so marimohub can save an expired session before reclaiming it', () => {
+		expect(typeof new ArmadaCompute(readConfig(baseEnv)).connectExisting).toBe('function');
+	});
+});

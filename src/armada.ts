@@ -18,12 +18,15 @@ import type {
 	JobSetRequest,
 	JobSubmitRequest,
 	JobSubmitRequestItem,
+	JobStatusResponse,
+	JobStatusUsingExternalJobUriRequest,
 	JobSubmitResponse,
 	JobSubmitResponseItem,
 	LookoutGetJobsRequest,
 	LookoutGetJobsResponse,
 	LookoutJob,
 } from './armada-types.js';
+import { JOB_STATE } from './armada-types.js';
 import { authorizationHeader } from './auth.js';
 import type { ArmadaConfig, Exposure } from './config.js';
 import { readNdjson } from './ndjson.js';
@@ -82,6 +85,19 @@ export const SANDBOX_MARK = 'marimohub/sandbox';
 
 /** Lookout job states meaning "this sandbox is alive or on its way". */
 const ACTIVE_JOB_STATES: string[] = ['QUEUED', 'LEASED', 'PENDING', 'RUNNING'];
+
+/**
+ * Job states after which no pod runs and none will. `UNKNOWN` is not among
+ * them: the server knows the job but not its state, and attaching to it finds
+ * out the same way it does for a live one.
+ */
+const FINISHED_JOB_STATES: ReadonlySet<number> = new Set([
+	JOB_STATE.SUCCEEDED,
+	JOB_STATE.FAILED,
+	JOB_STATE.PREEMPTED,
+	JOB_STATE.CANCELLED,
+	JOB_STATE.REJECTED,
+]);
 
 /** Lookout page size; more active kernels than this loops rather than truncates. */
 const LIST_ACTIVE_PAGE = 500;
@@ -323,6 +339,38 @@ export class ArmadaClient {
 	async cancelSet(jobSetId: string, queue: string): Promise<void> {
 		const request: JobCancelRequest = { queue, jobSetId };
 		await this.post('/v1/job/cancel', request);
+	}
+
+	/**
+	 * The sandbox's job, if it has one that has not finished, found without
+	 * submitting anything: by the `externalJobUri` the submit set to the sandbox
+	 * id, the one lookup the server keys by something we choose
+	 * (`GetJobStatusUsingExternalJobUri`). `undefined` when the queue holds no
+	 * such job, or only finished ones, which is how attaching tells a sandbox
+	 * that is gone from one that is there.
+	 *
+	 * The server answers from the database Lookout's ingester fills, so a job
+	 * submitted a moment ago may not be there yet. That suits its one caller,
+	 * attaching to a sandbox marimohub started long before.
+	 */
+	async findJob(sandboxId: SandboxId, queue: string): Promise<SubmittedJob | undefined> {
+		const request: JobStatusUsingExternalJobUriRequest = {
+			queue,
+			jobset: sandboxId,
+			externalJobUri: sandboxId,
+		};
+		const response: JobStatusResponse = await this.postJson(
+			'/v1/job/statusUsingExternalJobUri',
+			request,
+		);
+		// The set holds one job, as `clientId` dedupes the submit. Should it ever
+		// hold more, job ids are ULIDs, so the greatest is the newest.
+		const live: string[] = Object.entries(response.jobStates ?? {})
+			.filter(([, state]: [string, number]) => !FINISHED_JOB_STATES.has(state))
+			.map(([jobId]: [string, number]) => jobId)
+			.toSorted();
+		const jobId: string | undefined = live.at(-1);
+		return jobId === undefined ? undefined : { jobId, jobSetId: sandboxId, queue };
 	}
 
 	/**

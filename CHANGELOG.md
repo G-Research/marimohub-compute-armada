@@ -10,6 +10,19 @@ heading merged to main is released: see [docs/CONTRIBUTING.md](docs/CONTRIBUTING
 
 ## [0.1.2] - 2026-10-13
 
+### Added
+
+- Strict attachment (`connectExisting`), which marimohub uses to save an expired editor
+  session's edits before it reclaims the sandbox. It reaches the sandbox's existing job and
+  never submits one. Without it, such a session kept its pod and editor claim until its
+  authorization ran out or an admin discarded it, and its edits were lost.
+  ([#21](https://github.com/G-Research/marimohub-compute-armada/pull/21))
+
+### Changed
+
+- Built and tested against marimohub 0.5.0, which is also the base of the `Dockerfile`
+  image now. ([#21](https://github.com/G-Research/marimohub-compute-armada/pull/21))
+
 ### Fixed
 
 - Startup now also checks the GPU types in `MARIMOHUB_COMPUTE_APP_PROFILES`, the separate

@@ -12,6 +12,7 @@
  * version. CI runs it too, whenever one of those files changed.
  */
 import { readFileSync } from 'node:fs';
+import { JOB_STATE } from '../src/armada-types.js';
 
 interface SwaggerSchema {
 	type?: string;
@@ -130,19 +131,16 @@ const CONTRACT: Record<string, Record<string, FieldType>> = {
 const ENUMS: Record<string, readonly string[]> = {
 	apiIngressType: ['Ingress'],
 	apiServiceType: ['NodePort', 'Headless'],
-	apiJobState: [
-		'QUEUED',
-		'PENDING',
-		'RUNNING',
-		'SUCCEEDED',
-		'FAILED',
-		'UNKNOWN',
-		'SUBMITTED',
-		'LEASED',
-		'PREEMPTED',
-		'CANCELLED',
-		'REJECTED',
-	],
+};
+
+/**
+ * Enums the gateway sends as integers, so position is meaning: each member
+ * must sit in the spec's list at the index we read it as, since the spec lists
+ * them in proto declaration order, which is the numbering. A member added at
+ * the end changes nothing we read.
+ */
+const NUMBERED_ENUMS: Record<string, Record<string, number>> = {
+	apiJobState: JOB_STATE,
 };
 
 /**
@@ -232,6 +230,17 @@ async function main(): Promise<void> {
 		for (const member of members) {
 			if (!values.includes(member)) {
 				problems.push(`${name} no longer has the member ${member} (has: ${values.join(', ')})`);
+			}
+		}
+	}
+
+	for (const [name, numbering] of Object.entries(NUMBERED_ENUMS)) {
+		const values: string[] = definitions[name]?.enum ?? [];
+		for (const [member, number] of Object.entries(numbering)) {
+			if (values[number] !== member) {
+				problems.push(
+					`${name} has ${values[number] ?? 'nothing'} at ${String(number)}, we read that number as ${member} (has: ${values.join(', ')})`,
+				);
 			}
 		}
 	}

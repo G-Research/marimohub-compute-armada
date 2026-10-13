@@ -570,6 +570,54 @@ describe('findQueue', () => {
 	});
 });
 
+describe('findJob', () => {
+	it('looks the job up by the external uri the submit set, in the queue it was given', async () => {
+		// States arrive as the enum's numbers, as the gateway sends them: 2 is RUNNING.
+		stubFetch(Response.json({ jobStates: { 'job-1': 2 } }));
+
+		const job: SubmittedJob | undefined = await new ArmadaClient(config).findJob(
+			'sb-one',
+			'team-a',
+		);
+		expect(job).toEqual({ jobId: 'job-1', jobSetId: 'sb-one', queue: 'team-a' });
+		expect(calls[0]?.url).toBe('http://armada.example.com/v1/job/statusUsingExternalJobUri');
+		expect(calls[0]?.body).toEqual({
+			queue: 'team-a',
+			jobset: 'sb-one',
+			externalJobUri: 'sb-one',
+		});
+	});
+
+	it('finds nothing for a sandbox with no job, or only finished ones', async () => {
+		const client: ArmadaClient = new ArmadaClient(config);
+		stubFetch(Response.json({}));
+		expect(await client.findJob('sb-none', 'marimohub')).toBeUndefined();
+		// SUCCEEDED, FAILED, PREEMPTED, CANCELLED, REJECTED.
+		stubFetch(Response.json({ jobStates: { a: 3, b: 4, c: 8, d: 9, e: 10 } }));
+		expect(await client.findJob('sb-done', 'marimohub')).toBeUndefined();
+	});
+
+	it('counts every other state as a job to attach to, QUEUED (0) and UNKNOWN included', async () => {
+		const client: ArmadaClient = new ArmadaClient(config);
+		for (const state of [0, 1, 2, 5, 6, 7]) {
+			stubFetch(Response.json({ jobStates: { 'job-1': state } }));
+			// oxlint-disable-next-line no-await-in-loop -- one stubbed answer per state
+			expect((await client.findJob('sb-one', 'marimohub'))?.jobId).toBe('job-1');
+		}
+	});
+
+	it('takes the newest unfinished job should a set ever hold several', async () => {
+		stubFetch(
+			Response.json({
+				jobStates: { '01m4t4aaaa': 9, '01m4t4cccc': 2, '01m4t4bbbb': 2, '01m4t4dddd': 3 },
+			}),
+		);
+		expect((await new ArmadaClient(config).findJob('sb-one', 'marimohub'))?.jobId).toBe(
+			'01m4t4cccc',
+		);
+	});
+});
+
 describe('submit to a mapped queue', () => {
 	it('sends the queue it was given, not the default', async () => {
 		stubFetch(Response.json({ jobResponseItems: [{ jobId: 'job-1' }] }));
