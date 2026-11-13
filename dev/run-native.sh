@@ -32,6 +32,14 @@ DATA=${DATA:-$PWD/dev/data}
 POD_LABELS=${ARMADA_POD_LABELS:-'{"team": "dev", "example.com/cost-center": "cc-1234"}'}
 POD_ANNOTATIONS=${ARMADA_POD_ANNOTATIONS:-'{"example.com/contact": "Dev Team <dev@example.com>, #marimohub"}'}
 
+# "Open in Lookout" in the notebook's Open menu (marimohub 0.6.1 onwards). The
+# adapter submits each sandbox as its own job set named after the sandbox id, so
+# filtering Lookout on that job set shows the session's job. The browser opens
+# the link, hence localhost and the port kind maps for the Lookout UI. Set it to
+# '[]' to leave the menu without it.
+LOOKOUT_LINK='[{"id":"lookout","label":"Lookout","href_template":"http://localhost:30000/?f[0][id]=jobSet&f[0][value]={sandbox_id}&f[0][match]=exact"}]'
+SESSION_LINKS=${MARIMOHUB_THEME_SESSION_LINKS:-$LOOKOUT_LINK}
+
 # One source of truth for the marimohub release: the image the Dockerfile
 # bakes the adapter into, which dependabot keeps current.
 VERSION=$(sed -n 's|^FROM ghcr.io/marimo-team/marimohub:\(.*\)$|\1|p' Dockerfile)
@@ -99,6 +107,8 @@ exec env \
 	MARIMOHUB_RUN_MAINTENANCE=true \
 	MARIMOHUB_SESSION_SNAPSHOT_INTERVAL_SECONDS="${MARIMOHUB_SESSION_SNAPSHOT_INTERVAL_SECONDS:-5}" \
 	MARIMOHUB_SESSION_SWEEP_INTERVAL_SECONDS="${MARIMOHUB_SESSION_SWEEP_INTERVAL_SECONDS:-5}" \
+	MARIMOHUB_THEME_SESSION_LINKS="$SESSION_LINKS" \
+	MARIMOHUB_COMPUTE_IMAGE="${MARIMOHUB_COMPUTE_IMAGE:-$SANDBOX_IMAGE}" \
 	MARIMOHUB_COMPUTE_BACKEND=library \
 	MARIMOHUB_COMPUTE_LIBRARY="$PWD/dist/index.js" \
 	MARIMOHUB_COMPUTE_PROFILES="${MARIMOHUB_COMPUTE_PROFILES:-small:cpu=1;mem=2Gi,medium:cpu=2;mem=4Gi,large:cpu=4;mem=8Gi}" \

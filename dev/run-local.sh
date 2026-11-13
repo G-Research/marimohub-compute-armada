@@ -28,6 +28,14 @@ ensure_queue
 
 echo "==> restarting marimohub"
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+# "Open in Lookout" in the notebook's Open menu (marimohub 0.6.1 onwards). The
+# adapter submits each sandbox as its own job set named after the sandbox id, so
+# filtering Lookout on that job set shows the session's job. The browser opens
+# the link, hence localhost and the port kind maps for the Lookout UI. Set it to
+# '[]' to leave the menu without it.
+LOOKOUT_LINK='[{"id":"lookout","label":"Lookout","href_template":"http://localhost:30000/?f[0][id]=jobSet&f[0][value]={sandbox_id}&f[0][match]=exact"}]'
+SESSION_LINKS=${MARIMOHUB_THEME_SESSION_LINKS:-$LOOKOUT_LINK}
+
 # Sandbox exposure is `proxy`: the browser reaches the kernel through the app at
 # /proxy/<token>/, and marimohub forwards to the exposePort() URL server-side.
 # That is what makes a kernel reachable from a Mac browser at all: the NodePort
@@ -60,7 +68,8 @@ docker run -d --name "$CONTAINER" --platform linux/amd64 \
 	-e MARIMOHUB_RUN_MAINTENANCE=true \
 	-e MARIMOHUB_SESSION_SNAPSHOT_INTERVAL_SECONDS="${MARIMOHUB_SESSION_SNAPSHOT_INTERVAL_SECONDS:-5}" \
 	-e MARIMOHUB_SESSION_SWEEP_INTERVAL_SECONDS="${MARIMOHUB_SESSION_SWEEP_INTERVAL_SECONDS:-5}" \
-	${MARIMOHUB_COMPUTE_IMAGE:+-e MARIMOHUB_COMPUTE_IMAGE="$MARIMOHUB_COMPUTE_IMAGE"} \
+	-e MARIMOHUB_THEME_SESSION_LINKS="$SESSION_LINKS" \
+	-e MARIMOHUB_COMPUTE_IMAGE="${MARIMOHUB_COMPUTE_IMAGE:-$SANDBOX_IMAGE}" \
 	-e ARMADA_AGENT_IMAGE="$AGENT_IMAGE" \
 	-e ARMADA_AGENT_TOKEN_SECRET="${ARMADA_AGENT_TOKEN_SECRET:-armada-dev-only-agent-token-secret}" \
 	-e ARMADA_URL="${ARMADA_URL:-http://armada-control-plane:30001}" \
