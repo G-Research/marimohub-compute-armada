@@ -28,6 +28,14 @@ ensure_queue
 
 echo "==> restarting marimohub"
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+# "Open in Lookout" in the notebook's Open menu (marimohub 0.6.1 onwards). The
+# adapter submits each sandbox as its own job set named after the sandbox id, so
+# filtering Lookout on that job set shows the session's job. The browser opens
+# the link, hence localhost and the port kind maps for the Lookout UI. Set it to
+# '[]' to leave the menu without it.
+LOOKOUT_LINK='[{"id":"lookout","label":"Lookout","href_template":"http://localhost:30000/?f[0][id]=jobSet&f[0][value]={sandbox_id}&f[0][match]=exact"}]'
+SESSION_LINKS=${MARIMOHUB_THEME_SESSION_LINKS:-$LOOKOUT_LINK}
+
 # Sandbox exposure is `proxy`: the browser reaches the kernel through the app at
 # /proxy/<token>/, and marimohub forwards to the exposePort() URL server-side.
 # That is what makes a kernel reachable from a Mac browser at all: the NodePort
@@ -42,14 +50,6 @@ docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 # Under ARMADA_EXPOSE=ingress marimohub reaches the kernel and the agent at the
 # hostnames Armada reports, so it must trust the CA dev/ingress-local.sh made:
 # the file is mounted and named in NODE_EXTRA_CA_CERTS when it exists.
-# "Open in Lookout" in the notebook's Open menu (marimohub 0.6.1 onwards). The
-# adapter submits each sandbox as its own job set named after the sandbox id, so
-# filtering Lookout on that job set shows the session's job. The browser opens
-# the link, hence localhost and the port kind maps for the Lookout UI. Set it to
-# '[]' to leave the menu without it.
-LOOKOUT_LINK='[{"id":"lookout","label":"Lookout","href_template":"http://localhost:30000/?f[0][id]=jobSet&f[0][value]={sandbox_id}&f[0][match]=exact"}]'
-SESSION_LINKS=${MARIMOHUB_THEME_SESSION_LINKS:-$LOOKOUT_LINK}
-
 CA_MOUNT=()
 if [ -f dev/tls/ca.crt ]; then
 	CA_MOUNT=(-v "$PWD/dev/tls/ca.crt:/etc/marimohub/ingress-ca.crt:ro" -e NODE_EXTRA_CA_CERTS=/etc/marimohub/ingress-ca.crt)
