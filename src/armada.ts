@@ -6,6 +6,7 @@
  * only), so this talks to the grpc-gateway REST endpoints. The protos carry
  * `google.api.http` annotations, so every RPC has an HTTP form.
  */
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { V1PodSpec } from '@kubernetes/client-node';
 import type {
 	LookoutFilter,
@@ -118,6 +119,14 @@ function stuckAt(stage: string | undefined, queue: string): string {
 	}
 }
 
+/**
+ * The pause before reopening a dropped event stream. A watch stream on a queued
+ * job drops as a matter of course: the job sends no events while it waits, and
+ * Node's fetch ends a response body that sends nothing for 5 minutes. The pause
+ * keeps a server that refuses connections from being asked in a tight loop.
+ */
+const DEFAULT_STREAM_REOPEN_DELAY_MS = 1000;
+
 /** The ingress event lands around Running, so by expose time it usually replays. */
 const DEFAULT_INGRESS_TIMEOUT_MS = 60 * 1000;
 
@@ -158,7 +167,11 @@ const FINISHED_JOB_STATES: ReadonlySet<number> = new Set([
 const LIST_ACTIVE_PAGE = 500;
 
 export class ArmadaClient {
-	constructor(private readonly config: ArmadaConfig) {}
+	constructor(
+		private readonly config: ArmadaConfig,
+		/** The pause before a dropped event stream is reopened; tests shorten it. */
+		private readonly streamReopenDelayMs: number = DEFAULT_STREAM_REOPEN_DELAY_MS,
+	) {}
 
 	/**
 	 * Headers for every call to the gateway.
@@ -281,54 +294,85 @@ export class ArmadaClient {
 		}
 	}
 
+	/**
+	 * The wait can outlast a single response: when the stream ends or drops
+	 * before the job runs, it is opened again after the last message read, so
+	 * no event is lost or seen twice.
+	 */
 	private async followUntilRunning(
 		job: SubmittedJob,
 		signal: AbortSignal,
 		onEvent: (kind: string) => void,
 	): Promise<PodLocation> {
-		const request: JobSetRequest = {
-			queue: job.queue,
-			id: job.jobSetId,
-			watch: true,
-			errorIfMissing: false,
-		};
 		const path: string = `/v1/job-set/${encodeURIComponent(job.queue)}/${encodeURIComponent(job.jobSetId)}`;
-		const response: Response = await this.post(path, request, signal);
-		if (response.body === null) throw new Error(`Armada returned no event stream for ${path}`);
+		let cursor: string | undefined;
+		// The connection failure since Armada last answered, so a wait that runs
+		// out while Armada is unreachable says so rather than naming a stage.
+		let lastDrop: TypeError | undefined;
 
-		for await (const value of readNdjson(response.body)) {
-			const line: EventStreamLine = asObject(value, 'an event stream line');
-			if (line.error !== undefined) {
-				throw new Error(`Armada event stream failed: ${line.error.message ?? 'unknown error'}`);
+		// oxlint-disable no-await-in-loop -- each reopened stream resumes where the last one stopped
+		for (;;) {
+			const request: JobSetRequest = {
+				queue: job.queue,
+				id: job.jobSetId,
+				watch: true,
+				errorIfMissing: false,
+				...(cursor === undefined ? {} : { fromMessageId: cursor }),
+			};
+			try {
+				const response: Response = await this.post(path, request, signal);
+				lastDrop = undefined;
+				if (response.body === null) throw new Error(`Armada returned no event stream for ${path}`);
+
+				for await (const value of readNdjson(response.body)) {
+					const line: EventStreamLine = asObject(value, 'an event stream line');
+					if (line.error !== undefined) {
+						throw new Error(`Armada event stream failed: ${line.error.message ?? 'unknown error'}`);
+					}
+					if (line.result?.id !== undefined) cursor = line.result.id;
+
+					const message: EventMessage | undefined = line.result?.message;
+					if (message === undefined) continue;
+
+					const kind: string | undefined = eventKind(message, job.jobId);
+					if (kind !== undefined) onEvent(kind);
+
+					const running: JobRunningEvent | undefined = message.running;
+					if (running !== undefined && running.jobId === job.jobId) {
+						return {
+							clusterId: running.clusterId ?? '',
+							podName: running.podName ?? '',
+							podNamespace: running.podNamespace ?? this.config.namespace,
+							...(running.nodeName === undefined ? {} : { nodeName: running.nodeName }),
+						};
+					}
+
+					const failed: JobFailedEvent | undefined = message.failed;
+					if (failed !== undefined && failed.jobId === job.jobId && failed.retryable !== true) {
+						throw new Error(
+							`Armada job ${job.jobId} failed: ${failed.reason ?? 'no reason given'}`,
+						);
+					}
+
+					if (message.cancelled !== undefined && message.cancelled.jobId === job.jobId) {
+						throw new Error(`Armada job ${job.jobId} was cancelled before it started`);
+					}
+				}
+			} catch (error) {
+				if (signal.aborted) throw lastDrop ?? error;
+				// fetch reports a lost connection as a TypeError, its own timeouts
+				// included. Anything else is an answer, and it ends the wait.
+				if (!(error instanceof TypeError)) throw error;
+				lastDrop = error;
 			}
-
-			const message: EventMessage | undefined = line.result?.message;
-			if (message === undefined) continue;
-
-			const kind: string | undefined = eventKind(message, job.jobId);
-			if (kind !== undefined) onEvent(kind);
-
-			const running: JobRunningEvent | undefined = message.running;
-			if (running !== undefined && running.jobId === job.jobId) {
-				return {
-					clusterId: running.clusterId ?? '',
-					podName: running.podName ?? '',
-					podNamespace: running.podNamespace ?? this.config.namespace,
-					...(running.nodeName === undefined ? {} : { nodeName: running.nodeName }),
-				};
-			}
-
-			const failed: JobFailedEvent | undefined = message.failed;
-			if (failed !== undefined && failed.jobId === job.jobId && failed.retryable !== true) {
-				throw new Error(`Armada job ${job.jobId} failed: ${failed.reason ?? 'no reason given'}`);
-			}
-
-			if (message.cancelled !== undefined && message.cancelled.jobId === job.jobId) {
-				throw new Error(`Armada job ${job.jobId} was cancelled before it started`);
+			try {
+				await sleep(this.streamReopenDelayMs, undefined, { signal });
+			} catch {
+				// sleep rejects with its own AbortError; the reason is the timeout.
+				throw lastDrop ?? signal.reason;
 			}
 		}
-
-		throw new Error(`Armada event stream ended before job ${job.jobId} started`);
+		// oxlint-enable no-await-in-loop
 	}
 
 	/**

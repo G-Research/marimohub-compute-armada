@@ -41,7 +41,9 @@ const calls: Call[] = [];
 const realFetch: typeof fetch = globalThis.fetch;
 
 /** Records the request and answers with `response`. */
-function stubFetch(response: Response | (() => Response)): void {
+function stubFetch(
+	response: Response | ((init?: RequestInit) => Response | Promise<Response>),
+): void {
 	const stub: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> = async (
 		input: RequestInfo | URL,
 		init?: RequestInit,
@@ -55,7 +57,7 @@ function stubFetch(response: Response | (() => Response)): void {
 			headers: Object.fromEntries(new Headers(init?.headers).entries()),
 			body: typeof body === 'string' ? JSON.parse(body) : undefined,
 		});
-		return typeof response === 'function' ? response() : response;
+		return typeof response === 'function' ? response(init) : response;
 	};
 
 	// fetch carries statics a plain function does not, so keep the real ones.
@@ -102,6 +104,23 @@ function stubOpenStream(...messages: readonly object[]): void {
 		return new Response(body);
 	};
 	globalThis.fetch = Object.assign(stub, { preconnect: realFetch.preconnect });
+}
+
+/**
+ * A watch stream that sends `messages` and then drops, the way Node's fetch
+ * ends a response body that has been silent for 5 minutes.
+ */
+function droppedStream(...messages: readonly object[]): Response {
+	const lines: string[] = messages.map((message: object) => `${JSON.stringify(message)}\n`);
+	// Pulled one line at a time, since an error discards whatever is still queued.
+	const body: ReadableStream<Uint8Array> = new ReadableStream<Uint8Array>({
+		pull(controller: ReadableStreamDefaultController<Uint8Array>): void {
+			const line: string | undefined = lines.shift();
+			if (line === undefined) controller.error(new TypeError('terminated'));
+			else controller.enqueue(new TextEncoder().encode(line));
+		},
+	});
+	return new Response(body);
 }
 
 /** An ndjson event stream, the shape the gateway sends for a streaming RPC. */
@@ -340,15 +359,150 @@ describe('waitForRunning', () => {
 	});
 
 	it('ignores events belonging to another job', async () => {
-		stubFetch(
-			eventStream({
-				result: { id: '1', message: { running: { jobId: 'other', clusterId: 'cluster-x' } } },
-			}),
+		stubOpenStream({
+			result: { id: '1', message: { running: { jobId: 'other', clusterId: 'cluster-x' } } },
+		});
+
+		expect(await rejection(new ArmadaClient(config).waitForRunning(job, 50))).toContain(
+			'Armada reported no event for it',
+		);
+	});
+
+	it('reopens a dropped stream after the last message it read', async () => {
+		const responses: (() => Response)[] = [
+			(): Response =>
+				droppedStream({ result: { id: '2', message: { queued: { jobId: 'job-1' } } } }),
+			(): Response =>
+				eventStream({
+					result: { id: '3', message: { running: { jobId: 'job-1', clusterId: 'cluster-c' } } },
+				}),
+		];
+		stubFetch(() => responses[calls.length - 1]?.() ?? eventStream());
+
+		const pod: PodLocation = await new ArmadaClient(config, 10).waitForRunning(job, 1000);
+
+		expect(pod.clusterId).toBe('cluster-c');
+		expect(calls).toHaveLength(2);
+		expect(calls[1]?.body).toEqual({
+			queue: 'marimohub',
+			id: 'sandbox-7',
+			watch: true,
+			errorIfMissing: false,
+			fromMessageId: '2',
+		});
+	});
+
+	it('reopens a stream that ended, after the last message it read', async () => {
+		const responses: (() => Response)[] = [
+			(): Response => eventStream({ result: { id: '4', message: { queued: { jobId: 'job-1' } } } }),
+			(): Response =>
+				eventStream({
+					result: { id: '5', message: { running: { jobId: 'job-1', clusterId: 'cluster-d' } } },
+				}),
+		];
+		stubFetch(() => responses[calls.length - 1]?.() ?? eventStream());
+
+		const pod: PodLocation = await new ArmadaClient(config, 10).waitForRunning(job, 1000);
+
+		expect(pod.clusterId).toBe('cluster-d');
+		expect(calls).toHaveLength(2);
+		expect(calls[1]?.body).toMatchObject({ fromMessageId: '4' });
+	});
+
+	it('reopens a stream that dropped before its first message from the start', async () => {
+		const responses: (() => Response)[] = [
+			(): Response => droppedStream(),
+			(): Response =>
+				eventStream({
+					result: { id: '1', message: { running: { jobId: 'job-1', clusterId: 'cluster-e' } } },
+				}),
+		];
+		stubFetch(() => responses[calls.length - 1]?.() ?? eventStream());
+
+		const pod: PodLocation = await new ArmadaClient(config, 10).waitForRunning(job, 1000);
+
+		expect(pod.clusterId).toBe('cluster-e');
+		expect(calls).toHaveLength(2);
+		expect(calls[1]?.body).not.toHaveProperty('fromMessageId');
+	});
+
+	it('gives the timeout as the cause when it runs out during the pause', async () => {
+		stubFetch(() => eventStream({ result: { id: '1', message: { queued: { jobId: 'job-1' } } } }));
+
+		const error: unknown = await new ArmadaClient(config, 1000).waitForRunning(job, 50).then(
+			(): undefined => undefined,
+			(reason: unknown): unknown => reason,
 		);
 
-		expect(await rejection(new ArmadaClient(config).waitForRunning(job))).toContain(
-			'ended before job job-1 started',
+		expect(String(error)).toContain('still waiting in queue marimohub');
+		expect(error instanceof Error ? String(error.cause) : '').toContain('TimeoutError');
+	});
+
+	it('keeps the stage of a dropped stream for the timeout message', async () => {
+		const responses: (() => Response)[] = [
+			(): Response =>
+				droppedStream({ result: { id: '1', message: { pending: { jobId: 'job-1' } } } }),
+		];
+		stubFetch(
+			async (init?: RequestInit): Promise<Response> =>
+				responses[calls.length - 1]?.() ?? stalledFetch('', init),
 		);
+
+		expect(await rejection(new ArmadaClient(config, 10).waitForRunning(job, 200))).toContain(
+			'its pod exists but is not running',
+		);
+	});
+
+	it('gives the last failed connection as the cause when Armada stops answering', async () => {
+		stubFetch((): Response => {
+			if (calls.length === 1) {
+				return droppedStream({ result: { id: '1', message: { queued: { jobId: 'job-1' } } } });
+			}
+			throw new TypeError('fetch failed');
+		});
+
+		const error: unknown = await new ArmadaClient(config, 10).waitForRunning(job, 200).then(
+			(): undefined => undefined,
+			(reason: unknown): unknown => reason,
+		);
+
+		expect(String(error)).toContain('still waiting in queue marimohub');
+		expect(error instanceof Error ? String(error.cause) : '').toBe('TypeError: fetch failed');
+	});
+
+	it('gives the timeout as the cause once Armada answers again', async () => {
+		stubFetch(async (init?: RequestInit): Promise<Response> => {
+			if (calls.length === 1) {
+				return droppedStream({ result: { id: '1', message: { queued: { jobId: 'job-1' } } } });
+			}
+			// Answered, and then open with nothing to say until the wait ends.
+			const signal: AbortSignal | null | undefined = init?.signal;
+			const body: ReadableStream<Uint8Array> = new ReadableStream<Uint8Array>({
+				start(controller: ReadableStreamDefaultController<Uint8Array>): void {
+					signal?.addEventListener('abort', () => {
+						controller.error(signal.reason);
+					});
+				},
+			});
+			return new Response(body);
+		});
+
+		const error: unknown = await new ArmadaClient(config, 10).waitForRunning(job, 200).then(
+			(): undefined => undefined,
+			(reason: unknown): unknown => reason,
+		);
+
+		expect(String(error)).toContain('still waiting in queue marimohub');
+		expect(error instanceof Error ? String(error.cause) : '').toContain('TimeoutError');
+	});
+
+	it('does not reopen a stream the server refused', async () => {
+		stubFetch(() => new Response('permission denied', { status: 403 }));
+
+		expect(await rejection(new ArmadaClient(config).waitForRunning(job))).toContain(
+			'failed (403): permission denied',
+		);
+		expect(calls).toHaveLength(1);
 	});
 
 	it('reports a stream-level error', async () => {
