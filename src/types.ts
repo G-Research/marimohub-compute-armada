@@ -239,7 +239,17 @@ export interface SandboxProvider {
 
 export interface AdapterFactoryContext {
 	env: Record<string, string | undefined>;
-	errors: { preconditionFailed(message?: string): Error };
+	errors: {
+		preconditionFailed(message?: string): Error;
+		/**
+		 * marimohub's own `NotFoundError`, the one error its session lifecycle
+		 * reads as "this sandbox is gone": a probe or capture that throws it
+		 * releases the editor claim instead of keeping it. Not offered by
+		 * marimohub up to 0.6.4, where a library adapter cannot make that error
+		 * at all; proposed upstream so a lost pod stops locking its notebook.
+		 */
+		notFound?: (message?: string) => Error;
+	};
 	compute?: {
 		sessionMaxLifetimeSeconds?: number;
 		sessionIdleTimeoutMs?: number;

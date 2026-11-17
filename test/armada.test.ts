@@ -618,6 +618,46 @@ describe('findJob', () => {
 	});
 });
 
+describe('isFinished', () => {
+	const job: SubmittedJob = { jobId: 'job-1', jobSetId: 'sb-one', queue: 'team-a' };
+
+	it("asks for the job set's states by the external uri, in the job's queue", async () => {
+		stubFetch(Response.json({ jobStates: { 'job-1': 9 } }));
+
+		expect(await new ArmadaClient(config).isFinished(job)).toBe(true);
+		expect(calls[0]?.url).toBe('http://armada.example.com/v1/job/statusUsingExternalJobUri');
+		expect(calls[0]?.body).toEqual({
+			queue: 'team-a',
+			jobset: 'sb-one',
+			externalJobUri: 'sb-one',
+		});
+	});
+
+	it('is true for every finished state: SUCCEEDED, FAILED, PREEMPTED, CANCELLED, REJECTED', async () => {
+		const client: ArmadaClient = new ArmadaClient(config);
+		for (const state of [3, 4, 8, 9, 10]) {
+			stubFetch(Response.json({ jobStates: { 'job-1': state } }));
+			// oxlint-disable-next-line no-await-in-loop -- one stubbed answer per state
+			expect(await client.isFinished(job)).toBe(true);
+		}
+	});
+
+	it('is false for every other state, and for a job the server does not list yet', async () => {
+		const client: ArmadaClient = new ArmadaClient(config);
+		for (const state of [0, 1, 2, 5, 6, 7]) {
+			stubFetch(Response.json({ jobStates: { 'job-1': state } }));
+			// oxlint-disable-next-line no-await-in-loop -- one stubbed answer per state
+			expect(await client.isFinished(job)).toBe(false);
+		}
+		// A fresh submit can be missing from the database the server reads.
+		stubFetch(Response.json({}));
+		expect(await client.isFinished(job)).toBe(false);
+		// Another job of the set finishing says nothing about this one.
+		stubFetch(Response.json({ jobStates: { 'job-0': 9 } }));
+		expect(await client.isFinished(job)).toBe(false);
+	});
+});
+
 describe('submit to a mapped queue', () => {
 	it('sends the queue it was given, not the default', async () => {
 		stubFetch(Response.json({ jobResponseItems: [{ jobId: 'job-1' }] }));

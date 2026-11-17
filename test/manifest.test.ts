@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import manifest from '../src/index.js';
+import { ArmadaCompute } from '../src/provider.js';
 import type { AdapterFactoryContext, SandboxProvider } from '../src/types.js';
 
 const env: Record<string, string | undefined> = {
@@ -26,6 +27,29 @@ describe('adapter manifest', () => {
 		const provider: SandboxProvider = await manifest.create(context);
 		expect(typeof provider.create).toBe('function');
 		expect(typeof provider.proxy).toBe('function');
+	});
+
+	it("reports a gone sandbox with marimohub's not-found error when the context offers one", async () => {
+		class NotFoundError extends Error {}
+		// The attach lookup answers that the sandbox has no job at all.
+		const realFetch: typeof fetch = globalThis.fetch;
+		globalThis.fetch = Object.assign(async (): Promise<Response> => Response.json({}), {
+			preconnect: realFetch.preconnect,
+		});
+		try {
+			const provider: SandboxProvider = await manifest.create({
+				...context,
+				errors: { ...context.errors, notFound: (message?: string) => new NotFoundError(message) },
+			});
+			if (!(provider instanceof ArmadaCompute)) throw new Error('expected the Armada provider');
+			const error: unknown = await provider
+				.connectExisting('sb-gone')
+				.exec('true')
+				.catch((caught: unknown) => caught);
+			expect(error).toBeInstanceOf(NotFoundError);
+		} finally {
+			globalThis.fetch = realFetch;
+		}
 	});
 
 	it('rejects a missing required variable with an actionable message', () => {

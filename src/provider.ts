@@ -33,7 +33,15 @@ export class ArmadaCompute implements SandboxProvider {
 	 */
 	readonly capabilities: { multiPort: boolean; computeProfiles: boolean; gpuProfiles: boolean };
 
-	constructor(private readonly config: ArmadaConfig) {
+	/**
+	 * `notFound` is marimohub's factory for its own not-found error, when the
+	 * marimohub in use offers one: a sandbox found gone is reported with it, so
+	 * the session lifecycle recognises the loss (see `SandboxGoneError`).
+	 */
+	constructor(
+		private readonly config: ArmadaConfig,
+		private readonly notFound?: (message: string) => Error,
+	) {
 		this.armada = new ArmadaClient(config);
 		this.capabilities = {
 			multiPort: config.surfacePorts.length > 0,
@@ -68,6 +76,8 @@ export class ArmadaCompute implements SandboxProvider {
 			this.queues,
 			this.placements,
 			options,
+			false, // attachOnly
+			this.notFound,
 		);
 	}
 
@@ -92,6 +102,7 @@ export class ArmadaCompute implements SandboxProvider {
 			this.placements,
 			options,
 			true,
+			this.notFound,
 		);
 	}
 

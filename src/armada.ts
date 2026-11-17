@@ -354,6 +354,33 @@ export class ArmadaClient {
 	 * attaching to a sandbox marimohub started long before.
 	 */
 	async findJob(sandboxId: SandboxId, queue: string): Promise<SubmittedJob | undefined> {
+		// The set holds one job, as `clientId` dedupes the submit. Should it ever
+		// hold more, job ids are ULIDs, so the greatest is the newest.
+		const live: string[] = Object.entries(await this.jobStates(sandboxId, queue))
+			.filter(([, state]: [string, number]) => !FINISHED_JOB_STATES.has(state))
+			.map(([jobId]: [string, number]) => jobId)
+			.toSorted();
+		const jobId: string | undefined = live.at(-1);
+		return jobId === undefined ? undefined : { jobId, jobSetId: sandboxId, queue };
+	}
+
+	/**
+	 * Whether the server says this job has finished, so that no pod runs for it
+	 * and none ever will. A submit for a sandbox whose job has finished is
+	 * deduped on `clientId` to that same job, and its event stream replays the
+	 * old `Running` before the end, so this is what keeps a waiter from going on
+	 * to an agent that is long gone.
+	 *
+	 * A job the server does not list yet is not finished: like {@link findJob},
+	 * this reads what Lookout's ingester has written, which lags a fresh submit.
+	 */
+	async isFinished(job: SubmittedJob): Promise<boolean> {
+		const state: number | undefined = (await this.jobStates(job.jobSetId, job.queue))[job.jobId];
+		return state !== undefined && FINISHED_JOB_STATES.has(state);
+	}
+
+	/** Every job of a sandbox's job set with its state, by the `externalJobUri` the submit set. */
+	private async jobStates(sandboxId: SandboxId, queue: string): Promise<Record<string, number>> {
 		const request: JobStatusUsingExternalJobUriRequest = {
 			queue,
 			jobset: sandboxId,
@@ -363,14 +390,7 @@ export class ArmadaClient {
 			'/v1/job/statusUsingExternalJobUri',
 			request,
 		);
-		// The set holds one job, as `clientId` dedupes the submit. Should it ever
-		// hold more, job ids are ULIDs, so the greatest is the newest.
-		const live: string[] = Object.entries(response.jobStates ?? {})
-			.filter(([, state]: [string, number]) => !FINISHED_JOB_STATES.has(state))
-			.map(([jobId]: [string, number]) => jobId)
-			.toSorted();
-		const jobId: string | undefined = live.at(-1);
-		return jobId === undefined ? undefined : { jobId, jobSetId: sandboxId, queue };
+		return response.jobStates ?? {};
 	}
 
 	/**

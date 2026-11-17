@@ -18,7 +18,7 @@ import type {
 } from '../src/channel.js';
 import { QueueDirectory } from '../src/queues.js';
 import { AGENT_TOKEN_HASH_ENV } from '../src/podspec.js';
-import { ArmadaSandbox, agentToken } from '../src/sandbox.js';
+import { ArmadaSandbox, agentToken, isSandboxGone } from '../src/sandbox.js';
 import type { Placements } from '../src/sandbox.js';
 import type {
 	ExecResult,
@@ -88,6 +88,10 @@ interface Recorded {
 	submitted: string[];
 	/** The queue of every lookup of an existing job. */
 	found: string[];
+	/** The job id of every check whether a job has finished. */
+	stateChecks: string[];
+	/** How many times the job's event stream was watched for its pod to run. */
+	runningWaits: number;
 	/** The agent token hash each submitted pod spec carried. */
 	tokenHashes: string[];
 	/** The timeout of every agent readiness check. */
@@ -125,6 +129,10 @@ function stubSandbox(
 		attachOnly?: boolean;
 		/** What a lookup of the existing job finds; `null` is no job at all. */
 		existing?: SubmittedJob | null;
+		/** Whether the server reports the submitted (or deduped) job as finished. */
+		finished?: boolean | 'unanswerable';
+		/** marimohub's factory for its not-found error, when it offers one. */
+		notFound?: (message: string) => Error;
 	} = {},
 ): Recorded & { sandbox: ArmadaSandbox } {
 	const settings: ArmadaConfig = readConfig({ ...baseEnv, ...options.env });
@@ -132,6 +140,8 @@ function stubSandbox(
 		calls: [],
 		submitted: [],
 		found: [],
+		stateChecks: [],
+		runningWaits: 0,
 		tokenHashes: [],
 		readies: [],
 		cancelled: [],
@@ -160,7 +170,15 @@ function stubSandbox(
 			if (options.existing === null) return undefined;
 			return options.existing ?? { jobId: 'job-1', jobSetId: 'set-1', queue };
 		},
-		waitForRunning: async () => pod,
+		isFinished: async (job: SubmittedJob): Promise<boolean> => {
+			recorded.stateChecks.push(job.jobId);
+			if (options.finished === 'unanswerable') throw new Error('Armada returned 503');
+			return options.finished ?? false;
+		},
+		waitForRunning: async () => {
+			recorded.runningWaits++;
+			return pod;
+		},
 		portUrl: async (_job: unknown, port: number) => `http://172.18.0.3:${String(30000 + port)}`,
 		cancel: async (job: { jobId: string }) => {
 			recorded.cancelled.push(`job:${job.jobId}`);
@@ -237,8 +255,13 @@ function stubSandbox(
 			options.placements ?? new Map(),
 			options.owner === undefined ? undefined : { owner: options.owner },
 			options.attachOnly ?? false,
+			...(options.notFound === undefined ? [] : [options.notFound]),
 		),
+		// A getter, so a count taken after the calls sees them; the spread copies values.
 		...recorded,
+		get runningWaits(): number {
+			return recorded.runningWaits;
+		},
 	};
 }
 
@@ -351,32 +374,29 @@ describe('attaching to an existing sandbox', () => {
 		expect(attached.found).toEqual(['team-b']);
 	});
 
-	it('fails every call when the sandbox has no job left, and never submits one', async () => {
+	it('throws the sandbox gone from every call when it has no job left, and never submits one', async () => {
 		const gone: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
 			attachOnly: true,
 			existing: null,
 		});
 
 		expect(await rejection(gone.sandbox.ready())).toContain(
-			'Sandbox sandbox-1 has no unfinished job in queue "marimohub" to attach to',
+			'SandboxGoneError: Sandbox sandbox-1 has no unfinished job in queue "marimohub" to attach to',
 		);
-		// What marimohub's capture and kernel probe see: failures, not an empty pod.
-		expect(await gone.sandbox.exec('echo hi')).toMatchObject({
-			success: false,
-			error: { code: 'BACKEND_ERROR' },
-		});
-		expect(await gone.sandbox.readFile('/work/notebook.py')).toEqual({
-			success: false,
-			content: '',
-			error: { code: 'BACKEND_ERROR' },
-		});
-		expect(await gone.sandbox.listFiles('/work')).toEqual({
-			success: false,
-			files: [],
-			error: { code: 'BACKEND_ERROR' },
-		});
+		// What marimohub's capture and kernel probe see: the sandbox gone, not a
+		// failed call they would read as "unknown" and keep the session for.
+		const reasons: string[] = await Promise.all(
+			[
+				gone.sandbox.exec('echo hi'),
+				gone.sandbox.readFile('/work/notebook.py'),
+				gone.sandbox.readFileBounded('/work/notebook.py', { maxBytes: 10, timeoutMs: 1000 }),
+				gone.sandbox.listFiles('/work'),
+			].map(rejection),
+		);
+		for (const why of reasons) expect(why).toStartWith('SandboxGoneError: ');
 		expect(gone.submitted).toEqual([]);
 		expect(gone.endpoints).toEqual([]);
+		expect(logged()).toEqual([]);
 	});
 
 	it('still destroys a sandbox that has no job left, by job set', async () => {
@@ -402,6 +422,100 @@ describe('attaching to an existing sandbox', () => {
 
 		expect(attached.found).toEqual([]);
 		expect(attached.submitted).toEqual([]);
+	});
+});
+
+describe('a sandbox whose job has finished', () => {
+	it('is gone at once, without waiting for a pod or an agent that will never answer', async () => {
+		// The submit dedupes to the finished job, whose event stream would replay
+		// its old Running and send us to a dead agent for the full timeout.
+		const finished: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, { finished: true });
+
+		expect(await rejection(finished.sandbox.ready())).toBe(
+			'SandboxGoneError: Sandbox sandbox-1 is gone: its Armada job job-1 has finished, and a finished job is never started again',
+		);
+		expect(finished.stateChecks).toEqual(['job-1']);
+		expect(finished.runningWaits).toBe(0);
+		expect(finished.endpoints).toEqual([]);
+	});
+
+	it('throws from the calls that otherwise answer a failed result', async () => {
+		const { sandbox } = stubSandbox(ok, { finished: true });
+
+		expect(await rejection(sandbox.exec('echo hi'))).toStartWith('SandboxGoneError: ');
+		expect(await rejection(sandbox.readFile('/work/notebook.py'))).toStartWith(
+			'SandboxGoneError: ',
+		);
+		expect(
+			await rejection(
+				sandbox.readFileBounded('/work/notebook.py', { maxBytes: 10, timeoutMs: 1000 }),
+			),
+		).toStartWith('SandboxGoneError: ');
+		expect(await rejection(sandbox.listFiles('/work'))).toStartWith('SandboxGoneError: ');
+		expect(logged()).toEqual([]);
+	});
+
+	it('is found when a pod another instance reached stops answering', async () => {
+		const placements: Placements = new Map();
+		await stubSandbox(ok, {
+			placements,
+			channel: {
+				ready: async (timeoutMs: number): Promise<void> => {
+					if (timeoutMs === 0) throw new Error('ECONNREFUSED');
+				},
+			},
+		}).sandbox.ready();
+		const later: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			placements,
+			finished: true,
+		});
+
+		expect(await rejection(later.sandbox.exec('echo hi'))).toStartWith('SandboxGoneError: ');
+		expect(later.runningWaits).toBe(0);
+		expect(placements.size).toBe(0);
+	});
+
+	it("is reported with marimohub's own not-found error when marimohub offers one", async () => {
+		class NotFoundError extends Error {}
+		const { sandbox } = stubSandbox(ok, {
+			finished: true,
+			notFound: (message: string): Error => new NotFoundError(message),
+		});
+
+		const error: unknown = await sandbox.exec('echo hi').catch((caught: unknown) => caught);
+		expect(error).toBeInstanceOf(NotFoundError);
+		expect(isSandboxGone(error)).toBe(true);
+	});
+
+	it('still runs when the job has not finished', async () => {
+		const running: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok);
+		const result: ExecResult = await running.sandbox.exec('echo hi');
+
+		expect(result.success).toBe(true);
+		expect(running.stateChecks).toEqual(['job-1']);
+		expect(running.runningWaits).toBe(1);
+	});
+
+	it('does not stop a sandbox from starting when its state cannot be asked', async () => {
+		const unanswered: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			finished: 'unanswerable',
+		});
+		const result: ExecResult = await unanswered.sandbox.exec('echo hi');
+
+		expect(result.success).toBe(true);
+		expect(unanswered.stateChecks).toEqual(['job-1']);
+		expect(unanswered.runningWaits).toBe(1);
+	});
+
+	it('is not mistaken for a channel failure, which stays a failed result', async () => {
+		const { sandbox } = stubSandbox(async (): Promise<CommandResult> => {
+			throw new Error('connection reset');
+		});
+
+		expect(await sandbox.exec('echo hi')).toMatchObject({
+			success: false,
+			error: { code: 'BACKEND_ERROR' },
+		});
 	});
 });
 
