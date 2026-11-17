@@ -79,6 +79,31 @@ function stubStalledFetch(): void {
 	globalThis.fetch = Object.assign(stalledFetch, { preconnect: realFetch.preconnect });
 }
 
+/**
+ * A watch stream that sends `messages` and then stays open, as the gateway does
+ * while a job waits: the response ends only when the request's signal aborts.
+ */
+function stubOpenStream(...messages: readonly object[]): void {
+	const stub: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> = async (
+		_input: RequestInfo | URL,
+		init?: RequestInit,
+	): Promise<Response> => {
+		const signal: AbortSignal | null | undefined = init?.signal;
+		const body: ReadableStream<Uint8Array> = new ReadableStream<Uint8Array>({
+			start(controller: ReadableStreamDefaultController<Uint8Array>): void {
+				for (const message of messages) {
+					controller.enqueue(new TextEncoder().encode(`${JSON.stringify(message)}\n`));
+				}
+				signal?.addEventListener('abort', () => {
+					controller.error(signal.reason);
+				});
+			},
+		});
+		return new Response(body);
+	};
+	globalThis.fetch = Object.assign(stub, { preconnect: realFetch.preconnect });
+}
+
 /** An ndjson event stream, the shape the gateway sends for a streaming RPC. */
 function eventStream(...messages: readonly object[]): Response {
 	return new Response(messages.map((message: object) => JSON.stringify(message)).join('\n'));
@@ -332,6 +357,73 @@ describe('waitForRunning', () => {
 		expect(await rejection(new ArmadaClient(config).waitForRunning(job))).toContain(
 			'jobset not found',
 		);
+	});
+
+	it('names where a job that never starts got stuck', async () => {
+		stubOpenStream(
+			{ result: { id: '1', message: { submitted: { jobId: 'job-1' } } } },
+			{ result: { id: '2', message: { queued: { jobId: 'job-1' } } } },
+		);
+
+		const message: string = await rejection(new ArmadaClient(config).waitForRunning(job, 50));
+
+		expect(message).toContain('job-1 did not start running within 0.05s');
+		expect(message).toContain('ARMADA_START_TIMEOUT_SECONDS');
+		expect(message).toContain('still waiting in queue marimohub');
+	});
+
+	it('takes the stage from the latest event of its own job only', async () => {
+		stubOpenStream(
+			{ result: { id: '1', message: { pending: { jobId: 'job-1' } } } },
+			{ result: { id: '2', message: { queued: { jobId: 'other' } } } },
+		);
+
+		expect(await rejection(new ArmadaClient(config).waitForRunning(job, 50))).toContain(
+			'its pod exists but is not running',
+		);
+	});
+
+	it('keeps the stage through a reprioritization, which can come at any stage', async () => {
+		stubOpenStream(
+			{ result: { id: '1', message: { pending: { jobId: 'job-1' } } } },
+			{ result: { id: '2', message: { reprioritized: { jobId: 'job-1' } } } },
+		);
+
+		expect(await rejection(new ArmadaClient(config).waitForRunning(job, 50))).toContain(
+			'its pod exists but is not running',
+		);
+	});
+
+	it('names a retried failure as such', async () => {
+		stubOpenStream({
+			result: {
+				id: '1',
+				message: { failed: { jobId: 'job-1', reason: 'node died', retryable: true } },
+			},
+		});
+
+		expect(await rejection(new ArmadaClient(config).waitForRunning(job, 50))).toContain(
+			'its last run failed, and Armada retries it from queue marimohub',
+		);
+	});
+
+	it('says so when no event came', async () => {
+		stubStalledFetch();
+
+		expect(await rejection(new ArmadaClient(config).waitForRunning(job, 50))).toContain(
+			'Armada reported no event for it, or did not answer',
+		);
+	});
+
+	it('waits ARMADA_START_TIMEOUT_SECONDS by default', async () => {
+		stubStalledFetch();
+		const short: ArmadaConfig = readConfig({ ...env, ARMADA_START_TIMEOUT_SECONDS: '1' });
+
+		const started: number = Date.now();
+		const message: string = await rejection(new ArmadaClient(short).waitForRunning(job));
+
+		expect(message).toContain('within 1s');
+		expect(Date.now() - started).toBeLessThan(5000);
 	});
 });
 

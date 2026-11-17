@@ -59,6 +59,7 @@ in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `ARMADA_RUN_AS_GROUP`                | no       | Pod `securityContext.runAsGroup`, a gid               |
 | `ARMADA_FS_GROUP`                    | no       | Pod `securityContext.fsGroup`; owns the agent volume  |
 | `ARMADA_COMMAND_MAX_SECONDS`         | no       | Backstop for one exec (default `21600`, `0` off)      |
+| `ARMADA_START_TIMEOUT_SECONDS`       | no       | Wait for a job to start running (default `300`)       |
 | `ARMADA_EXPOSE`                      | no       | `nodeport` (default) or `ingress`, for both ports     |
 | `ARMADA_INGRESS_TLS`                 | no       | `true` (default) or `false`; ingress only             |
 | `ARMADA_INGRESS_CERT_NAME`           | no       | TLS secret name prefix (default `<namespace>-`)       |
@@ -153,11 +154,22 @@ Lookout by job set for a sandbox it has never seen, since marimohub addresses sa
 id alone on several paths. A queue map therefore requires `ARMADA_LOOKOUT_URL`, and a
 call Lookout cannot answer fails rather than guesses; marimohub retries it.
 
-The browser gives a starting session `MARIMOHUB_SANDBOX_STARTUP_TIMEOUT_SECONDS`
-(default 120) plus 30 seconds, and that clock includes the time the job waits in its
-Armada queue. On a busy cluster, raise it so users see their kernel arrive, not a
-timeout. The adapter waits at most 5 minutes for the job to start running, so a
-value above 270 gains nothing.
+Two clocks bound a session start. `ARMADA_START_TIMEOUT_SECONDS` (default 300) is the
+adapter's: how long it waits for the job to start running, which covers the time in the
+Armada queue, scheduling, the image pull and the agent's init container. marimohub's
+`MARIMOHUB_SANDBOX_STARTUP_TIMEOUT_SECONDS` (default 120) starts only once the pod
+answers, and covers installing the notebook's dependencies and starting marimo. On a busy
+cluster, raise the first so users see their kernel arrive, not a timeout. A start that runs
+out of it fails with the last event the job reported, which tells a job still in its queue
+from one whose pod will not start.
+
+marimohub adds two limits of its own. A browser tab that picks up a session that is
+already starting (a reload, a second tab) gives up after
+`MARIMOHUB_SANDBOX_STARTUP_TIMEOUT_SECONDS` plus 30 seconds from when it began watching,
+so keep that at least as long as a typical queue wait. And marimohub marks a session that
+is still starting after 15 minutes as failed, so keep `ARMADA_START_TIMEOUT_SECONDS` plus
+`MARIMOHUB_SANDBOX_STARTUP_TIMEOUT_SECONDS` and about 90 seconds of adapter waits (the
+ingress address and the agent's first answer) below that.
 
 Compute profiles (`MARIMOHUB_COMPUTE_PROFILES`, marimohub 0.4.13 onwards) let editors
 pick hardware per notebook: when creating it, later through "Change compute profile", or

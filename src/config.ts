@@ -138,6 +138,17 @@ export interface ArmadaConfig {
 	 * one. Streams are exempt: how long one stays open is the consumer's choice.
 	 */
 	commandMaxSeconds: number;
+	/**
+	 * How long a sandbox start waits for its job to run, in seconds: the time it
+	 * spends in the queue, being scheduled, pulling images and running the agent's
+	 * init container, together.
+	 *
+	 * marimohub's `MARIMOHUB_SANDBOX_STARTUP_TIMEOUT_SECONDS` does not cover any of
+	 * this. Its clock starts once the sandbox is reachable, so this is the only
+	 * bound on the queue wait. marimohub marks a session that is still starting
+	 * after 15 minutes as failed, which caps what a larger value can buy.
+	 */
+	startTimeoutSeconds: number;
 	/** How to authenticate to Armada. */
 	auth: ArmadaAuth;
 	/**
@@ -543,6 +554,9 @@ const DEFAULT_MAX_LIFETIME_SECONDS = 24 * 60 * 60;
  */
 const DEFAULT_COMMAND_MAX_SECONDS = 6 * 60 * 60;
 
+/** Long enough for an image pull on a cold node, short enough to fail a wedged queue. */
+const DEFAULT_START_TIMEOUT_SECONDS = 5 * 60;
+
 /**
  * The kernel image when `MARIMOHUB_COMPUTE_IMAGE` is unset: the one marimohub's
  * own docs point the variable at, public, and built to its sandbox contract
@@ -594,6 +608,11 @@ export function readConfig(
 			'ARMADA_COMMAND_MAX_SECONDS',
 			DEFAULT_COMMAND_MAX_SECONDS,
 			0,
+		),
+		startTimeoutSeconds: optionalSeconds(
+			env,
+			'ARMADA_START_TIMEOUT_SECONDS',
+			DEFAULT_START_TIMEOUT_SECONDS,
 		),
 		auth: readAuth(env),
 	};

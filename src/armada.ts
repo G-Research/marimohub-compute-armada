@@ -66,8 +66,57 @@ function asObject(value: unknown, what: string): object {
 	return value;
 }
 
-/** Long enough for an image pull on a cold node, short enough to fail a wedged queue. */
-const DEFAULT_RUNNING_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * The kind of a job-set event about `jobId`: `queued`, `leased`, `pending` and
+ * so on, the key the event sits under. Read for every kind, including those
+ * `EventMessage` does not model, since only the name is used.
+ */
+function eventKind(message: EventMessage, jobId: string): string | undefined {
+	for (const [kind, event] of Object.entries(message) as [string, unknown][]) {
+		if (typeof event === 'object' && event !== null && 'jobId' in event && event.jobId === jobId) {
+			return kind;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Event kinds that can arrive at any stage and so say nothing about where a job
+ * is. A reprioritized job keeps whatever stage it was in.
+ */
+const STAGE_NEUTRAL_EVENTS: ReadonlySet<string> = new Set(['reprioritizing', 'reprioritized']);
+
+/**
+ * Where a job that never started got stuck, from the last event it reported.
+ * The kinds are those Armada's event API sends before Running (v0.22.7,
+ * `internal/server/event/conversion`).
+ *
+ * No event at all has two causes this cannot tell apart: the gateway answers a
+ * watch request only with the job set's first event, so a set that has none yet
+ * looks the same as a server that does not answer.
+ */
+function stuckAt(stage: string | undefined, queue: string): string {
+	switch (stage) {
+		case undefined:
+			return 'Armada reported no event for it, or did not answer';
+		case 'submitted':
+		case 'queued':
+			return `it is still waiting in queue ${queue}`;
+		case 'leased':
+			return 'it was scheduled, but the executor has not created its pod';
+		case 'pending':
+			return 'its pod exists but is not running; look for a slow or failing image pull or init container';
+		// A failure that is not retryable ends the wait at once, so one seen here is.
+		case 'failed':
+			return `its last run failed, and Armada retries it from queue ${queue}`;
+		case 'leaseReturned':
+		case 'leaseExpired':
+		case 'preempted':
+			return `its last run ended (${stage}) and it is back in queue ${queue}`;
+		default:
+			return `its last event was ${stage}`;
+	}
+}
 
 /** The ingress event lands around Running, so by expose time it usually replays. */
 const DEFAULT_INGRESS_TIMEOUT_MS = 60 * 1000;
@@ -205,10 +254,37 @@ export class ArmadaClient {
 	 * Terminal failures arrive on the same stream, so we react to them rather than
 	 * waiting out the timeout with no explanation. A failure marked `retryable` is
 	 * the scheduler saying another run follows, so it is not the end.
+	 *
+	 * The wait is `ARMADA_START_TIMEOUT_SECONDS` unless the caller passes one.
+	 * Running out of it names the last event the job reported, which tells a job
+	 * still in its queue from one whose pod will not start.
 	 */
 	async waitForRunning(
 		job: SubmittedJob,
-		timeoutMs: number = DEFAULT_RUNNING_TIMEOUT_MS,
+		timeoutMs: number = this.config.startTimeoutSeconds * 1000,
+	): Promise<PodLocation> {
+		const signal: AbortSignal = AbortSignal.timeout(timeoutMs);
+		// The kind of the last event about the job that says where it is.
+		let stage: string | undefined;
+		try {
+			return await this.followUntilRunning(job, signal, (kind: string) => {
+				if (!STAGE_NEUTRAL_EVENTS.has(kind)) stage = kind;
+			});
+		} catch (error) {
+			if (signal.aborted) {
+				throw new Error(
+					`Armada job ${job.jobId} did not start running within ${String(timeoutMs / 1000)}s (ARMADA_START_TIMEOUT_SECONDS): ${stuckAt(stage, job.queue)}`,
+					{ cause: error },
+				);
+			}
+			throw error;
+		}
+	}
+
+	private async followUntilRunning(
+		job: SubmittedJob,
+		signal: AbortSignal,
+		onEvent: (kind: string) => void,
 	): Promise<PodLocation> {
 		const request: JobSetRequest = {
 			queue: job.queue,
@@ -217,7 +293,7 @@ export class ArmadaClient {
 			errorIfMissing: false,
 		};
 		const path: string = `/v1/job-set/${encodeURIComponent(job.queue)}/${encodeURIComponent(job.jobSetId)}`;
-		const response: Response = await this.post(path, request, AbortSignal.timeout(timeoutMs));
+		const response: Response = await this.post(path, request, signal);
 		if (response.body === null) throw new Error(`Armada returned no event stream for ${path}`);
 
 		for await (const value of readNdjson(response.body)) {
@@ -228,6 +304,9 @@ export class ArmadaClient {
 
 			const message: EventMessage | undefined = line.result?.message;
 			if (message === undefined) continue;
+
+			const kind: string | undefined = eventKind(message, job.jobId);
+			if (kind !== undefined) onEvent(kind);
 
 			const running: JobRunningEvent | undefined = message.running;
 			if (running !== undefined && running.jobId === job.jobId) {

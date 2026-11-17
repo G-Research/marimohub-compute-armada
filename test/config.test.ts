@@ -280,6 +280,27 @@ describe('security context ids', () => {
 	});
 });
 
+describe('ARMADA_START_TIMEOUT_SECONDS', () => {
+	it('defaults to five minutes', () => {
+		expect(readConfig(baseEnv).startTimeoutSeconds).toBe(300);
+	});
+
+	it('reads a whole number of seconds', () => {
+		expect(
+			readConfig({ ...baseEnv, ARMADA_START_TIMEOUT_SECONDS: '600' }).startTimeoutSeconds,
+		).toBe(600);
+	});
+
+	it('rejects zero and anything that is not a whole number', () => {
+		expect(() => readConfig({ ...baseEnv, ARMADA_START_TIMEOUT_SECONDS: '0' })).toThrow(
+			'ARMADA_START_TIMEOUT_SECONDS must be a whole number of seconds, got: 0',
+		);
+		expect(() => readConfig({ ...baseEnv, ARMADA_START_TIMEOUT_SECONDS: '5m' })).toThrow(
+			'ARMADA_START_TIMEOUT_SECONDS must be a whole number of seconds, got: 5m',
+		);
+	});
+});
+
 describe('ARMADA_AGENT_TOKEN_SECRET', () => {
 	it('is required, since every sandbox token derives from it', () => {
 		const env: Record<string, string> = { ...baseEnv };
