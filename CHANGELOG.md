@@ -8,6 +8,17 @@ heading merged to main is released: see [docs/CONTRIBUTING.md](docs/CONTRIBUTING
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-17
+
+### Fixed
+
+- A sandbox whose Armada job had finished without marimohub asking (preempted, cancelled,
+  failed, node lost) still looked alive. Every call to it waited the 30s agent timeout
+  against a pod that no longer existed, and each lifecycle sweep took about 90s, which
+  delayed snapshots for every session on the hub. The sandbox is now reported gone at once,
+  and its calls throw instead of returning `BACKEND_ERROR`.
+  ([#28](https://github.com/G-Research/marimohub-compute-armada/pull/28))
+
 ## [0.2.0] - 2026-10-13
 
 ### Added
