@@ -8,6 +8,18 @@ heading merged to main is released: see [docs/CONTRIBUTING.md](docs/CONTRIBUTING
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-17
+
+### Added
+
+- `ARMADA_START_TIMEOUT_SECONDS` sets how long a session start waits for its Armada job to
+  run (default 300, as before). The wait was a fixed 5 minutes, and raising marimohub's
+  `MARIMOHUB_SANDBOX_STARTUP_TIMEOUT_SECONDS` did not extend it: marimohub's clock starts
+  only once the sandbox is reachable, after the queue wait. A start that runs out now says
+  where the job got stuck (still queued, or a pod that will not start) instead of failing
+  with a bare `TimeoutError`.
+  ([#29](https://github.com/G-Research/marimohub-compute-armada/pull/29))
+
 ## [0.2.1] - 2026-11-17
 
 ### Fixed
