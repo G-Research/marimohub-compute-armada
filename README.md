@@ -153,6 +153,12 @@ Lookout by job set for a sandbox it has never seen, since marimohub addresses sa
 id alone on several paths. A queue map therefore requires `ARMADA_LOOKOUT_URL`, and a
 call Lookout cannot answer fails rather than guesses; marimohub retries it.
 
+The browser gives a starting session `MARIMOHUB_SANDBOX_STARTUP_TIMEOUT_SECONDS`
+(default 120) plus 30 seconds, and that clock includes the time the job waits in its
+Armada queue. On a busy cluster, raise it so users see their kernel arrive, not a
+timeout. The adapter waits at most 5 minutes for the job to start running, so a
+value above 270 gains nothing.
+
 Compute profiles (`MARIMOHUB_COMPUTE_PROFILES`, marimohub 0.4.13 onwards) let editors
 pick hardware per notebook: when creating it, later through "Change compute profile", or
 for one edit session. The adapter tells marimohub it applies them, and a profile's CPU

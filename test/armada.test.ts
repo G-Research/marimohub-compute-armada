@@ -62,6 +62,23 @@ function stubFetch(response: Response | (() => Response)): void {
 	globalThis.fetch = Object.assign(stub, { preconnect: realFetch.preconnect });
 }
 
+/** A server that never answers: each request ends only when its signal aborts. */
+async function stalledFetch(_input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+	return new Promise<Response>(
+		(_resolve: (response: Response) => void, reject: (reason: unknown) => void) => {
+			const signal: AbortSignal | null | undefined = init?.signal;
+			if (signal === undefined || signal === null) return;
+			signal.addEventListener('abort', () => {
+				reject(signal.reason);
+			});
+		},
+	);
+}
+
+function stubStalledFetch(): void {
+	globalThis.fetch = Object.assign(stalledFetch, { preconnect: realFetch.preconnect });
+}
+
 /** An ndjson event stream, the shape the gateway sends for a streaming RPC. */
 function eventStream(...messages: readonly object[]): Response {
 	return new Response(messages.map((message: object) => JSON.stringify(message)).join('\n'));
@@ -615,6 +632,63 @@ describe('findJob', () => {
 		expect((await new ArmadaClient(config).findJob('sb-one', 'marimohub'))?.jobId).toBe(
 			'01m4t4cccc',
 		);
+	});
+});
+
+describe('isFinished', () => {
+	const job: SubmittedJob = { jobId: 'job-1', jobSetId: 'sb-one', queue: 'team-a' };
+
+	it("asks for the job set's states by the external uri, in the job's queue", async () => {
+		stubFetch(Response.json({ jobStates: { 'job-1': 9 } }));
+
+		expect(await new ArmadaClient(config).isFinished(job)).toBe(true);
+		expect(calls[0]?.url).toBe('http://armada.example.com/v1/job/statusUsingExternalJobUri');
+		expect(calls[0]?.body).toEqual({
+			queue: 'team-a',
+			jobset: 'sb-one',
+			externalJobUri: 'sb-one',
+		});
+	});
+
+	it('is true for every finished state: SUCCEEDED, FAILED, PREEMPTED, CANCELLED, REJECTED', async () => {
+		const client: ArmadaClient = new ArmadaClient(config);
+		for (const state of [3, 4, 8, 9, 10]) {
+			stubFetch(Response.json({ jobStates: { 'job-1': state } }));
+			// oxlint-disable-next-line no-await-in-loop -- one stubbed answer per state
+			expect(await client.isFinished(job)).toBe(true);
+		}
+	});
+
+	it('is false for every other state, and for a job the server does not list yet', async () => {
+		const client: ArmadaClient = new ArmadaClient(config);
+		for (const state of [0, 1, 2, 5, 6, 7]) {
+			stubFetch(Response.json({ jobStates: { 'job-1': state } }));
+			// oxlint-disable-next-line no-await-in-loop -- one stubbed answer per state
+			expect(await client.isFinished(job)).toBe(false);
+		}
+		// A fresh submit can be missing from the database the server reads.
+		stubFetch(Response.json({}));
+		expect(await client.isFinished(job)).toBe(false);
+		// Another job of the set finishing says nothing about this one.
+		stubFetch(Response.json({ jobStates: { 'job-0': 9 } }));
+		expect(await client.isFinished(job)).toBe(false);
+	});
+
+	it('gives up on a server that does not answer, instead of holding up startup', async () => {
+		stubStalledFetch();
+
+		const outcome: Promise<string> = rejection(new ArmadaClient(config).isFinished(job, 50));
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timedOut: string | undefined = await Promise.race([
+			outcome,
+			new Promise<undefined>((resolve: (value: undefined) => void) => {
+				timer = setTimeout(() => {
+					resolve(undefined);
+				}, 2000);
+			}),
+		]);
+		clearTimeout(timer);
+		expect(timedOut).toContain('TimeoutError');
 	});
 });
 

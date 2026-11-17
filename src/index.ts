@@ -6,7 +6,7 @@ const manifest: ComputeAdapterModule = {
 	apiVersion: 1,
 	kind: 'compute',
 	create(context: AdapterFactoryContext) {
-		return new ArmadaCompute(readConfig(context.env, context.compute));
+		return new ArmadaCompute(readConfig(context.env, context.compute), context.errors.notFound);
 	},
 };
 

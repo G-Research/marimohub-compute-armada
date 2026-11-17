@@ -122,6 +122,31 @@ const AGENT_READY_TIMEOUT_MS = 30_000;
  */
 const PORT_READY_TIMEOUT_MS = 0;
 
+/**
+ * The sandbox is gone for good: its job has finished (preempted, cancelled,
+ * failed, or its node lost), so no pod runs for it and none will. A finished
+ * job cannot come back either, as a resubmit dedupes to it on `clientId`.
+ *
+ * Calls that otherwise answer a typed failure throw this instead, as
+ * marimohub's own Kubernetes adapter does, because the answer marimohub needs
+ * is "gone", not "this one call failed": a session whose sandbox is gone has
+ * nothing left to save, and its editor claim has to be released. marimohub
+ * recognises only its own `NotFoundError` as that answer, so when it hands us
+ * a factory for one (`errors.notFound`) that is what is thrown, and this class
+ * is the stand-in for a marimohub that does not.
+ */
+export class SandboxGoneError extends Error {
+	override readonly name: string = 'SandboxGoneError';
+}
+
+/** Every error made to say a sandbox is gone, whichever class it has. */
+const goneErrors: WeakSet<Error> = new WeakSet();
+
+/** Whether `error` says the sandbox is gone, rather than that one call failed. */
+export function isSandboxGone(error: unknown): boolean {
+	return error instanceof Error && goneErrors.has(error);
+}
+
 /** A non-zero exit is the command's business; marimohub wants it as a result. */
 export function toExecResult(result: CommandResult): ExecResult {
 	if (result.exitCode === 0) {
@@ -210,8 +235,18 @@ export class ArmadaSandbox implements SandboxInstance {
 		 * it, and a fresh pod there would be an empty workspace to capture.
 		 */
 		private readonly attachOnly: boolean = false,
+		/** Makes the error a gone sandbox is reported with ({@link SandboxGoneError}). */
+		private readonly notFound: (message: string) => Error = (message: string): Error =>
+			new SandboxGoneError(message),
 	) {
 		this.token = agentToken(config.agentTokenSecret, id);
+	}
+
+	/** The error for this sandbox being gone, recognisable by {@link isSandboxGone}. */
+	private gone(message: string): Error {
+		const error: Error = this.notFound(message);
+		goneErrors.add(error);
+		return error;
 	}
 
 	/**
@@ -230,6 +265,12 @@ export class ArmadaSandbox implements SandboxInstance {
 	 * {@link Placements} after one look at the agent's health, which is what
 	 * tells a live pod from one that has since gone; a gone one is resolved
 	 * again from the start.
+	 *
+	 * Resolving again is where a sandbox whose job has finished is caught. The
+	 * submit dedupes to that finished job, and its event stream replays the old
+	 * `Running`, so without asking for the job's state first this would go on
+	 * to wait out the agent timeout against a pod that no longer exists, once
+	 * per call marimohub makes.
 	 */
 	async ready(): Promise<void> {
 		if (this.channel !== undefined) return;
@@ -246,6 +287,19 @@ export class ArmadaSandbox implements SandboxInstance {
 			}
 		}
 		this.job ??= this.attachOnly ? await this.existingJob() : await this.submit();
+		// An attached job was found unfinished a moment ago; a submitted one may be
+		// a finished job handed back by the dedupe. The check is an early exit, not
+		// a gate: it reads the database Lookout's ingester fills, which can be
+		// down or slow while submit and the event stream work, so a check that fails
+		// or runs past its short deadline counts as "not finished" and the wait below
+		// behaves as it did before the check.
+		const finished: boolean =
+			!this.attachOnly && (await this.armada.isFinished(this.job).catch(() => false));
+		if (finished) {
+			throw this.gone(
+				`Sandbox ${this.id} is gone: its Armada job ${this.job.jobId} has finished, and a finished job is never started again`,
+			);
+		}
 		this.pod = await this.armada.waitForRunning(this.job);
 		// The agent's address comes from the same event as the kernel's.
 		const url: string = await this.armada.portUrl(this.job, this.config.agentPort);
@@ -266,15 +320,15 @@ export class ArmadaSandbox implements SandboxInstance {
 
 	/**
 	 * The sandbox's unfinished job, for an `attachOnly` instance. Its absence is
-	 * the answer marimohub needs: the read or command that asked fails, its
-	 * capture with it, and reclaiming goes on to `destroy`, which cancels the
-	 * job set and releases the session.
+	 * the answer marimohub needs, so it is thrown as the sandbox being gone
+	 * ({@link SandboxGoneError}) by every call that asked, never folded into a
+	 * failed result.
 	 */
 	private async existingJob(): Promise<SubmittedJob> {
 		const queue: string = await this.queue();
 		const job: SubmittedJob | undefined = await this.armada.findJob(this.id, queue);
 		if (job === undefined) {
-			throw new Error(
+			throw this.gone(
 				`Sandbox ${this.id} has no unfinished job in queue "${queue}" to attach to, and attaching never submits one`,
 			);
 		}
@@ -327,7 +381,10 @@ export class ArmadaSandbox implements SandboxInstance {
 	/**
 	 * Everything above this method is built on the channel, so this is the one
 	 * that has to be right. A command that fails is a normal result, not an
-	 * exception; only the channel itself failing is a `BACKEND_ERROR`.
+	 * exception; only the channel itself failing is a `BACKEND_ERROR`. A
+	 * sandbox that is gone throws ({@link SandboxGoneError}): that is not this
+	 * command failing, and marimohub's kernel probe reads any failed result as
+	 * "unknown", which keeps a lost session's editor claim for good.
 	 *
 	 * A login shell, matching marimohub's kubernetes adapter: what arrives here is
 	 * user and provisioner code, and an image that puts `uv` or `python3` on the
@@ -356,6 +413,7 @@ export class ArmadaSandbox implements SandboxInstance {
 			);
 			return toExecResult(result);
 		} catch (error) {
+			if (isSandboxGone(error)) throw error;
 			const stderr: string =
 				error instanceof CommandTimeoutError && backstopMs !== undefined
 					? `Command ran past ARMADA_COMMAND_MAX_SECONDS (${String(this.config.commandMaxSeconds)}s) and was killed: ${cmd}`
@@ -468,6 +526,7 @@ export class ArmadaSandbox implements SandboxInstance {
 	 * One read through the agent, as marimohub's result: the bytes as `encode`
 	 * words them, `NOT_FOUND` quietly, and any other failure through
 	 * {@link readFailed}, with a channel that cannot be reached a `BACKEND_ERROR`.
+	 * A sandbox that is gone throws, as for `exec`.
 	 */
 	private async readThrough(
 		path: string,
@@ -478,6 +537,7 @@ export class ArmadaSandbox implements SandboxInstance {
 		try {
 			outcome = await read(await this.open());
 		} catch (error) {
+			if (isSandboxGone(error)) throw error;
 			return this.readFailed(path, 'BACKEND_ERROR', reason(error));
 		}
 		if (outcome.outcome === 'not-found') {
@@ -513,13 +573,15 @@ export class ArmadaSandbox implements SandboxInstance {
 	 * List a directory, which session capture uses to size the files it is about
 	 * to read and to enumerate a workspace. The agent walks the tree itself and
 	 * answers structured records; only the hidden-file filter and the relative
-	 * paths are decided here ({@link toFileInfos}).
+	 * paths are decided here ({@link toFileInfos}). A sandbox that is gone
+	 * throws, as for `exec`.
 	 */
 	async listFiles(path: string, options?: ListFilesOptions): Promise<ListFilesResult> {
 		let listed: ListFilesOutcome;
 		try {
 			listed = await (await this.open()).listFiles(path, options?.recursive === true);
-		} catch {
+		} catch (error) {
+			if (isSandboxGone(error)) throw error;
 			return { success: false, files: [], error: { code: 'BACKEND_ERROR' } };
 		}
 		if (listed.outcome === 'not-a-directory') {
