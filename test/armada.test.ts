@@ -62,6 +62,23 @@ function stubFetch(response: Response | (() => Response)): void {
 	globalThis.fetch = Object.assign(stub, { preconnect: realFetch.preconnect });
 }
 
+/** A server that never answers: each request ends only when its signal aborts. */
+async function stalledFetch(_input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+	return new Promise<Response>(
+		(_resolve: (response: Response) => void, reject: (reason: unknown) => void) => {
+			const signal: AbortSignal | null | undefined = init?.signal;
+			if (signal === undefined || signal === null) return;
+			signal.addEventListener('abort', () => {
+				reject(signal.reason);
+			});
+		},
+	);
+}
+
+function stubStalledFetch(): void {
+	globalThis.fetch = Object.assign(stalledFetch, { preconnect: realFetch.preconnect });
+}
+
 /** An ndjson event stream, the shape the gateway sends for a streaming RPC. */
 function eventStream(...messages: readonly object[]): Response {
 	return new Response(messages.map((message: object) => JSON.stringify(message)).join('\n'));
@@ -655,6 +672,23 @@ describe('isFinished', () => {
 		// Another job of the set finishing says nothing about this one.
 		stubFetch(Response.json({ jobStates: { 'job-0': 9 } }));
 		expect(await client.isFinished(job)).toBe(false);
+	});
+
+	it('gives up on a server that does not answer, instead of holding up startup', async () => {
+		stubStalledFetch();
+
+		const outcome: Promise<string> = rejection(new ArmadaClient(config).isFinished(job, 50));
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timedOut: string | undefined = await Promise.race([
+			outcome,
+			new Promise<undefined>((resolve: (value: undefined) => void) => {
+				timer = setTimeout(() => {
+					resolve(undefined);
+				}, 2000);
+			}),
+		]);
+		clearTimeout(timer);
+		expect(timedOut).toContain('TimeoutError');
 	});
 });
 

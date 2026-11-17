@@ -73,6 +73,12 @@ const DEFAULT_RUNNING_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_INGRESS_TIMEOUT_MS = 60 * 1000;
 
 /**
+ * The finished-job check is a shortcut ahead of the wait for Running, so a
+ * status read that stalls must give up soon and let that wait go on.
+ */
+const DEFAULT_STATUS_TIMEOUT_MS = 5 * 1000;
+
+/**
  * Annotation marking a job as this installation's, set at submit and filtered
  * on by `listActive` and `findQueue`. Its value is the default queue name
  * (`ARMADA_QUEUE`), which names one marimohub installation however many queues
@@ -373,14 +379,27 @@ export class ArmadaClient {
 	 *
 	 * A job the server does not list yet is not finished: like {@link findJob},
 	 * this reads what Lookout's ingester has written, which lags a fresh submit.
+	 * Rejects when the server has not answered within `timeoutMs`.
 	 */
-	async isFinished(job: SubmittedJob): Promise<boolean> {
-		const state: number | undefined = (await this.jobStates(job.jobSetId, job.queue))[job.jobId];
+	async isFinished(
+		job: SubmittedJob,
+		timeoutMs: number = DEFAULT_STATUS_TIMEOUT_MS,
+	): Promise<boolean> {
+		const states: Record<string, number> = await this.jobStates(
+			job.jobSetId,
+			job.queue,
+			AbortSignal.timeout(timeoutMs),
+		);
+		const state: number | undefined = states[job.jobId];
 		return state !== undefined && FINISHED_JOB_STATES.has(state);
 	}
 
 	/** Every job of a sandbox's job set with its state, by the `externalJobUri` the submit set. */
-	private async jobStates(sandboxId: SandboxId, queue: string): Promise<Record<string, number>> {
+	private async jobStates(
+		sandboxId: SandboxId,
+		queue: string,
+		signal?: AbortSignal,
+	): Promise<Record<string, number>> {
 		const request: JobStatusUsingExternalJobUriRequest = {
 			queue,
 			jobset: sandboxId,
@@ -389,6 +408,7 @@ export class ArmadaClient {
 		const response: JobStatusResponse = await this.postJson(
 			'/v1/job/statusUsingExternalJobUri',
 			request,
+			signal,
 		);
 		return response.jobStates ?? {};
 	}
@@ -511,8 +531,8 @@ export class ArmadaClient {
 		return response;
 	}
 
-	private async postJson(path: string, body: unknown): Promise<object> {
-		const response: Response = await this.post(path, body);
+	private async postJson(path: string, body: unknown, signal?: AbortSignal): Promise<object> {
+		const response: Response = await this.post(path, body, signal);
 		return asObject(await response.json(), `a response to ${path}`);
 	}
 

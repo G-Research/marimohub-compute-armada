@@ -290,8 +290,9 @@ export class ArmadaSandbox implements SandboxInstance {
 		// An attached job was found unfinished a moment ago; a submitted one may be
 		// a finished job handed back by the dedupe. The check is an early exit, not
 		// a gate: it reads the database Lookout's ingester fills, which can be
-		// down while submit and the event stream work, so a failed check counts as
-		// "not finished" and the wait below behaves as it did before the check.
+		// down or slow while submit and the event stream work, so a check that fails
+		// or runs past its short deadline counts as "not finished" and the wait below
+		// behaves as it did before the check.
 		const finished: boolean =
 			!this.attachOnly && (await this.armada.isFinished(this.job).catch(() => false));
 		if (finished) {
