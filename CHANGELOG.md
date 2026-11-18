@@ -8,7 +8,7 @@ heading merged to main is released: see [docs/CONTRIBUTING.md](docs/CONTRIBUTING
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-11-17
+## [0.3.0] - 2026-11-18
 
 ### Added
 
@@ -18,6 +18,15 @@ heading merged to main is released: see [docs/CONTRIBUTING.md](docs/CONTRIBUTING
   only once the sandbox is reachable, after the queue wait. A start that runs out now says
   where the job got stuck (still queued, or a pod that will not start) instead of failing
   with a bare `TimeoutError`.
+  ([#29](https://github.com/G-Research/marimohub-compute-armada/pull/29))
+
+### Changed
+
+- Needs marimohub 0.7.1 or later, and refuses to load on an older one. Built and tested
+  against 0.7.1, which is also the base of the `Dockerfile` image now. From 0.7.1, marimohub
+  gives library adapters its own not-found error, and the adapter reports a sandbox whose
+  Armada job has finished with it. Before, a notebook whose pod was preempted, cancelled or
+  lost stayed locked until an admin reclaimed its session.
   ([#29](https://github.com/G-Research/marimohub-compute-armada/pull/29))
 
 ## [0.2.1] - 2026-11-17

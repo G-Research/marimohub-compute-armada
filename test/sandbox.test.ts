@@ -29,6 +29,11 @@ import type {
 	SandboxProcess,
 } from '../src/types.js';
 
+/** Stands in for marimohub's `NotFoundError`, which `errors.notFound` makes. */
+class NotFoundError extends Error {
+	override readonly name: string = 'NotFoundError';
+}
+
 const baseEnv: Record<string, string> = {
 	ARMADA_URL: 'http://armada.example.com/',
 	ARMADA_QUEUE: 'marimohub',
@@ -131,8 +136,6 @@ function stubSandbox(
 		existing?: SubmittedJob | null;
 		/** Whether the server reports the submitted (or deduped) job as finished. */
 		finished?: boolean | 'unanswerable';
-		/** marimohub's factory for its not-found error, when it offers one. */
-		notFound?: (message: string) => Error;
 	} = {},
 ): Recorded & { sandbox: ArmadaSandbox } {
 	const settings: ArmadaConfig = readConfig({ ...baseEnv, ...options.env });
@@ -253,9 +256,9 @@ function stubSandbox(
 			},
 			options.queues ?? new QueueDirectory(settings, undefined),
 			options.placements ?? new Map(),
+			(message: string): Error => new NotFoundError(message),
 			options.owner === undefined ? undefined : { owner: options.owner },
 			options.attachOnly ?? false,
-			...(options.notFound === undefined ? [] : [options.notFound]),
 		),
 		// A getter, so a count taken after the calls sees them; the spread copies values.
 		...recorded,
@@ -381,7 +384,7 @@ describe('attaching to an existing sandbox', () => {
 		});
 
 		expect(await rejection(gone.sandbox.ready())).toContain(
-			'SandboxGoneError: Sandbox sandbox-1 has no unfinished job in queue "marimohub" to attach to',
+			'NotFoundError: Sandbox sandbox-1 has no unfinished job in queue "marimohub" to attach to',
 		);
 		// What marimohub's capture and kernel probe see: the sandbox gone, not a
 		// failed call they would read as "unknown" and keep the session for.
@@ -393,7 +396,7 @@ describe('attaching to an existing sandbox', () => {
 				gone.sandbox.listFiles('/work'),
 			].map(rejection),
 		);
-		for (const why of reasons) expect(why).toStartWith('SandboxGoneError: ');
+		for (const why of reasons) expect(why).toStartWith('NotFoundError: ');
 		expect(gone.submitted).toEqual([]);
 		expect(gone.endpoints).toEqual([]);
 		expect(logged()).toEqual([]);
@@ -432,7 +435,7 @@ describe('a sandbox whose job has finished', () => {
 		const finished: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, { finished: true });
 
 		expect(await rejection(finished.sandbox.ready())).toBe(
-			'SandboxGoneError: Sandbox sandbox-1 is gone: its Armada job job-1 has finished, and a finished job is never started again',
+			'NotFoundError: Sandbox sandbox-1 is gone: its Armada job job-1 has finished, and a finished job is never started again',
 		);
 		expect(finished.stateChecks).toEqual(['job-1']);
 		expect(finished.runningWaits).toBe(0);
@@ -442,16 +445,14 @@ describe('a sandbox whose job has finished', () => {
 	it('throws from the calls that otherwise answer a failed result', async () => {
 		const { sandbox } = stubSandbox(ok, { finished: true });
 
-		expect(await rejection(sandbox.exec('echo hi'))).toStartWith('SandboxGoneError: ');
-		expect(await rejection(sandbox.readFile('/work/notebook.py'))).toStartWith(
-			'SandboxGoneError: ',
-		);
+		expect(await rejection(sandbox.exec('echo hi'))).toStartWith('NotFoundError: ');
+		expect(await rejection(sandbox.readFile('/work/notebook.py'))).toStartWith('NotFoundError: ');
 		expect(
 			await rejection(
 				sandbox.readFileBounded('/work/notebook.py', { maxBytes: 10, timeoutMs: 1000 }),
 			),
-		).toStartWith('SandboxGoneError: ');
-		expect(await rejection(sandbox.listFiles('/work'))).toStartWith('SandboxGoneError: ');
+		).toStartWith('NotFoundError: ');
+		expect(await rejection(sandbox.listFiles('/work'))).toStartWith('NotFoundError: ');
 		expect(logged()).toEqual([]);
 	});
 
@@ -470,17 +471,13 @@ describe('a sandbox whose job has finished', () => {
 			finished: true,
 		});
 
-		expect(await rejection(later.sandbox.exec('echo hi'))).toStartWith('SandboxGoneError: ');
+		expect(await rejection(later.sandbox.exec('echo hi'))).toStartWith('NotFoundError: ');
 		expect(later.runningWaits).toBe(0);
 		expect(placements.size).toBe(0);
 	});
 
-	it("is reported with marimohub's own not-found error when marimohub offers one", async () => {
-		class NotFoundError extends Error {}
-		const { sandbox } = stubSandbox(ok, {
-			finished: true,
-			notFound: (message: string): Error => new NotFoundError(message),
-		});
+	it("is reported with marimohub's own not-found error", async () => {
+		const { sandbox } = stubSandbox(ok, { finished: true });
 
 		const error: unknown = await sandbox.exec('echo hi').catch((caught: unknown) => caught);
 		expect(error).toBeInstanceOf(NotFoundError);

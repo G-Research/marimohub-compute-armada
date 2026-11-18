@@ -93,11 +93,12 @@ spec says (the gateway marshals with `encoding/json`), which is why the contract
 `apiJobState` to its order. The server answers from the database Lookout's ingester fills, a
 second or so behind a submit, which a sandbox started long before never notices.
 
-marimohub hands a library adapter no `NotFoundError` (its factory context carries only
-`preconditionFailed`), so a vanished sandbox reads as a failure rather than as "gone". The
-capture path does not mind. The idle check before a reclaim does: it reads a failed probe as
-"kernel unreachable" and keeps the session, the same outcome as before this method existed.
-A `notFound` in the factory context upstream would close that.
+A vanished sandbox fails with marimohub's own `NotFoundError`, which marimohub hands a
+library adapter as `errors.notFound` from 0.7.1 (marimo-team/marimohub#696), so its lifecycle
+reads it as "gone" and releases the session. Any other error reads as a failure: the idle
+check before a reclaim takes a failed probe for "kernel unreachable" and keeps the session,
+which locks the notebook until an admin reclaims it. So the adapter refuses to load on a
+marimohub without `errors.notFound`, rather than keep a stand-in error for older releases.
 
 **`activeDeadlineSeconds` is always set.** Armada assigns a default deadline to any pod
 that does not set one, and the shipped default is 72 hours, 336 for GPU jobs

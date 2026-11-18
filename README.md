@@ -171,14 +171,14 @@ is still starting after 15 minutes as failed, so keep `ARMADA_START_TIMEOUT_SECO
 `MARIMOHUB_SANDBOX_STARTUP_TIMEOUT_SECONDS` and about 90 seconds of adapter waits (the
 ingress address and the agent's first answer) below that.
 
-Compute profiles (`MARIMOHUB_COMPUTE_PROFILES`, marimohub 0.4.13 onwards) let editors
+Compute profiles (`MARIMOHUB_COMPUTE_PROFILES`) let editors
 pick hardware per notebook: when creating it, later through "Change compute profile", or
 for one edit session. The adapter tells marimohub it applies them, and a profile's CPU
 and memory become the kernel container's requests and limits, which Armada requires to
 be equal. So a kernel that outgrows its profile's memory is OOM-killed, and every session
 is charged its full profile against the queue's fair share, idle or not. Offer a short
 list of sizes rather than one large default. Users can only pick when
-`MARIMOHUB_COMPUTE_PROFILE_OVERRIDE=editors`. From marimohub 0.5.0,
+`MARIMOHUB_COMPUTE_PROFILE_OVERRIDE=editors`.
 `MARIMOHUB_COMPUTE_APP_PROFILES` gives apps their own list, in the same syntax; without
 it, apps use the editing list.
 
@@ -417,8 +417,9 @@ export ARMADA_AGENT_IMAGE=marimohub-kernel-agent:local
 [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md), which also covers the case where
 `kind load` trips over a multi-platform image.
 
-Verified against `ghcr.io/marimo-team/marimohub:0.4.2`, the release the adapter interface
-is transcribed from; everything added since 0.3.12 is optional, so that release loads it too.
+Needs marimohub 0.7.1 or later, and is built and tested against the release in the
+`Dockerfile`. An older marimohub gives library adapters no `errors.notFound`, which the
+adapter reports a lost pod with, so the adapter refuses to load there.
 
 ## Documentation
 

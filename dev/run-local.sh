@@ -28,7 +28,7 @@ ensure_queue
 
 echo "==> restarting marimohub"
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-# "Open in Lookout" in the notebook's Open menu (marimohub 0.6.1 onwards). The
+# "Open in Lookout" in the notebook's Open menu. The
 # adapter submits each sandbox as its own job set named after the sandbox id, so
 # filtering Lookout on that job set shows the session's job. The browser opens
 # the link, hence localhost and the port kind maps for the Lookout UI. Set it to

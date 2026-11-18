@@ -11,9 +11,15 @@ const env: Record<string, string | undefined> = {
 	ARMADA_AGENT_TOKEN_SECRET: 'test-secret-of-at-least-32-characters',
 };
 
+/** Stands in for marimohub's `NotFoundError`, which `errors.notFound` makes. */
+class NotFoundError extends Error {}
+
 const context: AdapterFactoryContext = {
 	env,
-	errors: { preconditionFailed: (message?: string) => new Error(message) },
+	errors: {
+		preconditionFailed: (message?: string) => new Error(message),
+		notFound: (message?: string) => new NotFoundError(message),
+	},
 };
 
 describe('adapter manifest', () => {
@@ -29,18 +35,14 @@ describe('adapter manifest', () => {
 		expect(typeof provider.proxy).toBe('function');
 	});
 
-	it("reports a gone sandbox with marimohub's not-found error when the context offers one", async () => {
-		class NotFoundError extends Error {}
+	it("reports a gone sandbox with marimohub's not-found error", async () => {
 		// The attach lookup answers that the sandbox has no job at all.
 		const realFetch: typeof fetch = globalThis.fetch;
 		globalThis.fetch = Object.assign(async (): Promise<Response> => Response.json({}), {
 			preconnect: realFetch.preconnect,
 		});
 		try {
-			const provider: SandboxProvider = await manifest.create({
-				...context,
-				errors: { ...context.errors, notFound: (message?: string) => new NotFoundError(message) },
-			});
+			const provider: SandboxProvider = await manifest.create(context);
 			if (!(provider instanceof ArmadaCompute)) throw new Error('expected the Armada provider');
 			const error: unknown = await provider
 				.connectExisting('sb-gone')
@@ -50,6 +52,14 @@ describe('adapter manifest', () => {
 		} finally {
 			globalThis.fetch = realFetch;
 		}
+	});
+
+	it('refuses a marimohub older than 0.7.1, which offers no errors.notFound', () => {
+		// What an older marimohub hands over: the same errors, less notFound.
+		const errors: AdapterFactoryContext['errors'] = { ...context.errors };
+		Reflect.deleteProperty(errors, 'notFound');
+
+		expect(() => manifest.create({ ...context, errors })).toThrow('needs marimohub 0.7.1 or later');
 	});
 
 	it('rejects a missing required variable with an actionable message', () => {

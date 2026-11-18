@@ -123,23 +123,19 @@ const AGENT_READY_TIMEOUT_MS = 30_000;
 const PORT_READY_TIMEOUT_MS = 0;
 
 /**
- * The sandbox is gone for good: its job has finished (preempted, cancelled,
- * failed, or its node lost), so no pod runs for it and none will. A finished
- * job cannot come back either, as a resubmit dedupes to it on `clientId`.
+ * Every error made to say a sandbox is gone for good: its job has finished
+ * (preempted, cancelled, failed, or its node lost), so no pod runs for it and
+ * none will. A finished job cannot come back either, as a resubmit dedupes to
+ * it on `clientId`.
  *
- * Calls that otherwise answer a typed failure throw this instead, as
+ * Calls that otherwise answer a typed failure throw such an error instead, as
  * marimohub's own Kubernetes adapter does, because the answer marimohub needs
  * is "gone", not "this one call failed": a session whose sandbox is gone has
  * nothing left to save, and its editor claim has to be released. marimohub
- * recognises only its own `NotFoundError` as that answer, so when it hands us
- * a factory for one (`errors.notFound`) that is what is thrown, and this class
- * is the stand-in for a marimohub that does not.
+ * recognises only its own `NotFoundError` as that answer, so the error is made
+ * by marimohub's factory for it (`errors.notFound`). That class cannot be
+ * imported here, which is why these errors are told apart by identity.
  */
-export class SandboxGoneError extends Error {
-	override readonly name: string = 'SandboxGoneError';
-}
-
-/** Every error made to say a sandbox is gone, whichever class it has. */
 const goneErrors: WeakSet<Error> = new WeakSet();
 
 /** Whether `error` says the sandbox is gone, rather than that one call failed. */
@@ -228,6 +224,8 @@ export class ArmadaSandbox implements SandboxInstance {
 		private readonly openChannel: (endpoint: AgentEndpoint) => ControlChannel,
 		private readonly queues: QueueDirectory,
 		private readonly placements: Placements,
+		/** marimohub's `errors.notFound`, which a gone sandbox is reported with. */
+		private readonly notFound: (message: string) => Error,
 		private readonly options?: CreateSandboxOptions,
 		/**
 		 * Reach the job the sandbox already has, never submit one. marimohub
@@ -235,9 +233,6 @@ export class ArmadaSandbox implements SandboxInstance {
 		 * it, and a fresh pod there would be an empty workspace to capture.
 		 */
 		private readonly attachOnly: boolean = false,
-		/** Makes the error a gone sandbox is reported with ({@link SandboxGoneError}). */
-		private readonly notFound: (message: string) => Error = (message: string): Error =>
-			new SandboxGoneError(message),
 	) {
 		this.token = agentToken(config.agentTokenSecret, id);
 	}
@@ -321,8 +316,8 @@ export class ArmadaSandbox implements SandboxInstance {
 	/**
 	 * The sandbox's unfinished job, for an `attachOnly` instance. Its absence is
 	 * the answer marimohub needs, so it is thrown as the sandbox being gone
-	 * ({@link SandboxGoneError}) by every call that asked, never folded into a
-	 * failed result.
+	 * (`NotFoundError`) by every call that asked, never folded into a failed
+	 * result.
 	 */
 	private async existingJob(): Promise<SubmittedJob> {
 		const queue: string = await this.queue();
@@ -382,7 +377,7 @@ export class ArmadaSandbox implements SandboxInstance {
 	 * Everything above this method is built on the channel, so this is the one
 	 * that has to be right. A command that fails is a normal result, not an
 	 * exception; only the channel itself failing is a `BACKEND_ERROR`. A
-	 * sandbox that is gone throws ({@link SandboxGoneError}): that is not this
+	 * sandbox that is gone throws marimohub's `NotFoundError`: that is not this
 	 * command failing, and marimohub's kernel probe reads any failed result as
 	 * "unknown", which keeps a lost session's editor claim for good.
 	 *
