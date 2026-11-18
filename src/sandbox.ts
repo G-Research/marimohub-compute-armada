@@ -1,5 +1,5 @@
 import { createHash, createHmac } from 'node:crypto';
-import type { ArmadaClient, PodLocation, SubmittedJob } from './armada.js';
+import type { ArmadaClient, JobLookup, PodLocation, SubmittedJob } from './armada.js';
 import type { ArmadaConfig } from './config.js';
 import type {
 	AgentEndpoint,
@@ -306,28 +306,42 @@ export class ArmadaSandbox implements SandboxInstance {
 
 	private async submit(): Promise<SubmittedJob> {
 		const tokenSha256: string = createHash('sha256').update(this.token).digest('hex');
-		return this.armada.submit(
+		const job: SubmittedJob = await this.armada.submit(
 			this.id,
 			buildPodSpec(this.config, { tokenSha256 }, this.options),
 			await this.queue(),
 		);
+		// The queue is where a job now is, no longer the owner map's guess.
+		this.queues.remember(this.id, job.queue);
+		return job;
 	}
 
 	/**
-	 * The sandbox's unfinished job, for an `attachOnly` instance. Its absence is
-	 * the answer marimohub needs, so it is thrown as the sandbox being gone
-	 * (`NotFoundError`) by every call that asked, never folded into a failed
-	 * result.
+	 * The sandbox's unfinished job, for an `attachOnly` instance. A finished job
+	 * or none at all is the answer marimohub needs, so it is thrown as the
+	 * sandbox being gone (`NotFoundError`) by every call that asked, never folded
+	 * into a failed result. A search Armada could not answer is not that answer:
+	 * marimohub reads "gone" as nothing left to capture and drops the session's
+	 * unsaved edits, so that failure stays an ordinary one, which marimohub keeps
+	 * the session for and tries again.
 	 */
 	private async existingJob(): Promise<SubmittedJob> {
 		const queue: string = await this.queue();
-		const job: SubmittedJob | undefined = await this.armada.findJob(this.id, queue);
-		if (job === undefined) {
-			throw this.gone(
-				`Sandbox ${this.id} has no unfinished job in queue "${queue}" to attach to, and attaching never submits one`,
+		const lookup: JobLookup = await this.armada.findJob(this.id, queue);
+		if (lookup.found === 'live') return lookup.job;
+		if (lookup.found === 'nothing' && this.queues.guessed(this.id)) {
+			// Accepted as unlikely, but it costs the session's unsaved edits, so it
+			// is said out loud: see "Attaching never submits" in docs/DECISIONS.md.
+			const others: string = this.queues.all.filter((q: string): boolean => q !== queue).join(', ');
+			console.warn(
+				`marimohub-compute-armada: sandbox ${this.id} is reported gone, but its queue "${queue}" is only the owner map's answer of today: neither this process nor Lookout has seen its job. If the job sits in another queue (${others}), for a map changed since its submit or an attach that named no owner, the sandbox is live and marimohub drops its unsaved edits.`,
 			);
 		}
-		return job;
+		throw this.gone(
+			lookup.found === 'finished'
+				? `Sandbox ${this.id} is gone: its Armada job ${lookup.jobId} has finished, and attaching never submits a new one`
+				: `Sandbox ${this.id} has no job in queue "${queue}" to attach to, and attaching never submits one`,
+		);
 	}
 
 	/** Where the pod landed, once it has. For reporting, not for reaching it. */

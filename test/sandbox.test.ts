@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import type { Mock } from 'bun:test';
-import type { ArmadaClient, PodLocation, SubmittedJob } from '../src/armada.js';
+import type { ArmadaClient, JobLookup, PodLocation, SubmittedJob } from '../src/armada.js';
 import type { V1Container, V1EnvVar, V1PodSpec } from '@kubernetes/client-node';
 import { createHash } from 'node:crypto';
 import { readConfig } from '../src/config.js';
@@ -132,8 +132,8 @@ function stubSandbox(
 		owner?: SandboxOwner;
 		/** Build the instance `connectExisting` builds, which never submits. */
 		attachOnly?: boolean;
-		/** What a lookup of the existing job finds; `null` is no job at all. */
-		existing?: SubmittedJob | null;
+		/** What a search for the existing job finds; by default the sandbox's live job. */
+		lookup?: JobLookup | 'unanswerable';
 		/** Whether the server reports the submitted (or deduped) job as finished. */
 		finished?: boolean | 'unanswerable';
 	} = {},
@@ -168,10 +168,10 @@ function stubSandbox(
 			);
 			return { jobId: 'job-1', jobSetId: 'set-1', queue };
 		},
-		findJob: async (_id: string, queue: string): Promise<SubmittedJob | undefined> => {
+		findJob: async (_id: string, queue: string): Promise<JobLookup> => {
 			recorded.found.push(queue);
-			if (options.existing === null) return undefined;
-			return options.existing ?? { jobId: 'job-1', jobSetId: 'set-1', queue };
+			if (options.lookup === 'unanswerable') throw new Error('Armada returned 503');
+			return options.lookup ?? { found: 'live', job: { jobId: 'job-1', jobSetId: 'set-1', queue } };
 		},
 		isFinished: async (job: SubmittedJob): Promise<boolean> => {
 			recorded.stateChecks.push(job.jobId);
@@ -352,7 +352,7 @@ describe('attaching to an existing sandbox', () => {
 	it('reaches the job the sandbox already has, submitting nothing', async () => {
 		const attached: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
 			attachOnly: true,
-			existing: { jobId: 'job-9', jobSetId: 'sandbox-1', queue: 'marimohub' },
+			lookup: { found: 'live', job: { jobId: 'job-9', jobSetId: 'sandbox-1', queue: 'marimohub' } },
 		});
 		const result: ExecResult = await attached.sandbox.exec('echo hi');
 
@@ -380,11 +380,11 @@ describe('attaching to an existing sandbox', () => {
 	it('throws the sandbox gone from every call when it has no job left, and never submits one', async () => {
 		const gone: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
 			attachOnly: true,
-			existing: null,
+			lookup: { found: 'nothing' },
 		});
 
 		expect(await rejection(gone.sandbox.ready())).toContain(
-			'NotFoundError: Sandbox sandbox-1 has no unfinished job in queue "marimohub" to attach to',
+			'NotFoundError: Sandbox sandbox-1 has no job in queue "marimohub" to attach to',
 		);
 		// What marimohub's capture and kernel probe see: the sandbox gone, not a
 		// failed call they would read as "unknown" and keep the session for.
@@ -402,10 +402,85 @@ describe('attaching to an existing sandbox', () => {
 		expect(logged()).toEqual([]);
 	});
 
+	it('throws the sandbox gone when its job has finished', async () => {
+		const gone: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			attachOnly: true,
+			lookup: { found: 'finished', jobId: 'job-9' },
+		});
+
+		expect(await rejection(gone.sandbox.exec('echo hi'))).toContain(
+			'NotFoundError: Sandbox sandbox-1 is gone: its Armada job job-9 has finished',
+		);
+		expect(gone.submitted).toEqual([]);
+		expect(gone.runningWaits).toBe(0);
+	});
+
+	it('says out loud when it reports gone a sandbox whose queue the owner map guessed', async () => {
+		const env: Record<string, string> = {
+			ARMADA_LOOKOUT_URL: 'http://lookout.example.com',
+			ARMADA_QUEUE_BY_PROJECT: '{"proj-a": "team-a", "proj-b": "team-b"}',
+		};
+		const gone: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			env,
+			queues: new QueueDirectory(readConfig({ ...baseEnv, ...env }), async () => undefined),
+			owner: { projectId: 'proj-a' },
+			attachOnly: true,
+			lookup: { found: 'nothing' },
+		});
+
+		expect(await rejection(gone.sandbox.ready())).toStartWith('NotFoundError: ');
+		expect(gone.found).toEqual(['team-a']);
+		expect(logged()).toEqual([
+			expect.stringContaining(
+				'sandbox sandbox-1 is reported gone, but its queue "team-a" is only the owner map\'s answer of today',
+			),
+		]);
+		expect(logged()[0]).toContain('(marimohub, team-b)');
+	});
+
+	it('stays quiet about a gone sandbox whose queue Lookout named', async () => {
+		const env: Record<string, string> = {
+			ARMADA_LOOKOUT_URL: 'http://lookout.example.com',
+			ARMADA_QUEUE_BY_PROJECT: '{"proj-a": "team-a"}',
+		};
+		const gone: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			env,
+			queues: new QueueDirectory(readConfig({ ...baseEnv, ...env }), async () => 'team-a'),
+			owner: { projectId: 'proj-a' },
+			attachOnly: true,
+			lookup: { found: 'nothing' },
+		});
+
+		expect(await rejection(gone.sandbox.ready())).toStartWith('NotFoundError: ');
+		expect(logged()).toEqual([]);
+	});
+
+	it('does not call a sandbox gone when Armada could not say, and attaches once it can', async () => {
+		let lookup: JobLookup | 'unanswerable' = 'unanswerable';
+		const attached: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
+			attachOnly: true,
+			get lookup(): JobLookup | 'unanswerable' {
+				return lookup;
+			},
+		});
+
+		// An ordinary failure, which marimohub keeps the session for: not gone.
+		const why: string = await rejection(attached.sandbox.ready());
+		expect(why).toContain('Armada returned 503');
+		expect(why).not.toContain('NotFoundError');
+
+		lookup = { found: 'live', job: { jobId: 'job-9', jobSetId: 'sandbox-1', queue: 'marimohub' } };
+		await attached.sandbox.ready();
+
+		expect(attached.found).toEqual(['marimohub', 'marimohub']);
+		expect(attached.submitted).toEqual([]);
+		expect(attached.endpoints).toHaveLength(1);
+	});
+
 	it('still destroys a sandbox that has no job left, by job set', async () => {
 		const gone: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
 			attachOnly: true,
-			existing: null,
+			lookup: { found: 'nothing' },
 		});
 		await gone.sandbox.destroy();
 
@@ -419,7 +494,7 @@ describe('attaching to an existing sandbox', () => {
 		const attached: Recorded & { sandbox: ArmadaSandbox } = stubSandbox(ok, {
 			placements,
 			attachOnly: true,
-			existing: null,
+			lookup: { found: 'nothing' },
 		});
 		await attached.sandbox.ready();
 

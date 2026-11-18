@@ -56,6 +56,8 @@ export class QueueDirectory {
 	/** Whether any owner maps anywhere but the default queue. */
 	readonly mapped: boolean;
 	private readonly remembered: Map<SandboxId, string> = new Map();
+	/** Sandboxes whose remembered queue is the owner map's answer, not where a job was seen. */
+	private readonly guesses: Set<SandboxId> = new Set();
 
 	constructor(
 		private readonly config: ArmadaConfig,
@@ -80,11 +82,25 @@ export class QueueDirectory {
 
 	remember(id: SandboxId, queue: string): void {
 		this.remembered.set(id, queue);
+		this.guesses.delete(id);
 	}
 
 	/** Drops what was remembered for a sandbox whose job set is cancelled. */
 	forget(id: SandboxId): void {
 		this.remembered.delete(id);
+		this.guesses.delete(id);
+	}
+
+	/**
+	 * Whether the queue {@link resolve} gave for a sandbox came from today's
+	 * owner map alone, with a map configured: neither this process nor Lookout
+	 * had seen its job. Right for a submit that has not happened yet; for a job
+	 * submitted before a restart and not yet in Lookout, it is the queue the
+	 * owner maps to now, which is not where the job is if the map has moved
+	 * since or the caller named no owner.
+	 */
+	guessed(id: SandboxId): boolean {
+		return this.guesses.has(id);
 	}
 
 	/**
@@ -109,6 +125,7 @@ export class QueueDirectory {
 		}
 		const queue: string = owner === undefined ? this.config.queue : this.forOwner(owner);
 		this.remembered.set(id, queue);
+		this.guesses.add(id);
 		return queue;
 	}
 }

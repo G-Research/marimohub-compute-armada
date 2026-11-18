@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { ArmadaClient } from '../src/armada.js';
-import type { ActiveJob, PodLocation, SubmittedJob } from '../src/armada.js';
+import type { ActiveJob, JobLookup, PodLocation, SubmittedJob } from '../src/armada.js';
 import { readConfig } from '../src/config.js';
 import type { ArmadaConfig } from '../src/config.js';
 import { buildPodSpec } from '../src/podspec.js';
@@ -496,6 +496,48 @@ describe('waitForRunning', () => {
 		expect(error instanceof Error ? String(error.cause) : '').toContain('TimeoutError');
 	});
 
+	it('reopens after a proxy times out the reopen, with the same cursor', async () => {
+		// Behind a proxy with a read timeout: the watch drops while the job is
+		// queued, and the reopen, which sends nothing until there is a new event,
+		// gets a 504 from the proxy before Running arrives on the next one.
+		const responses: (() => Response)[] = [
+			(): Response =>
+				droppedStream({ result: { id: '2', message: { queued: { jobId: 'job-1' } } } }),
+			(): Response => new Response('upstream request timeout', { status: 504 }),
+			(): Response =>
+				eventStream({
+					result: { id: '3', message: { running: { jobId: 'job-1', clusterId: 'cluster-f' } } },
+				}),
+		];
+		stubFetch(() => responses[calls.length - 1]?.() ?? eventStream());
+
+		const pod: PodLocation = await new ArmadaClient(config, 10).waitForRunning(job, 1000);
+
+		expect(pod.clusterId).toBe('cluster-f');
+		expect(calls).toHaveLength(3);
+		expect(calls[1]?.body).toMatchObject({ fromMessageId: '2' });
+		expect(calls[2]?.body).toMatchObject({ fromMessageId: '2' });
+	});
+
+	it('retries 502 and 503 like a 504, and gives the last one as the cause when time runs out', async () => {
+		stubFetch((): Response => {
+			if (calls.length === 1) {
+				return droppedStream({ result: { id: '1', message: { queued: { jobId: 'job-1' } } } });
+			}
+			const status: number = calls.length % 2 === 0 ? 502 : 503;
+			return new Response('unavailable', { status });
+		});
+
+		const error: unknown = await new ArmadaClient(config, 10).waitForRunning(job, 200).then(
+			(): undefined => undefined,
+			(reason: unknown): unknown => reason,
+		);
+
+		expect(String(error)).toContain('still waiting in queue marimohub');
+		expect(error instanceof Error ? String(error.cause) : '').toMatch(/failed \(50[23]\)/);
+		expect(calls.length).toBeGreaterThan(3);
+	});
+
 	it('does not reopen a stream the server refused', async () => {
 		stubFetch(() => new Response('permission denied', { status: 403 }));
 
@@ -834,16 +876,28 @@ describe('findQueue', () => {
 });
 
 describe('findJob', () => {
+	const statusUrl: string = 'http://armada.example.com/v1/job/statusUsingExternalJobUri';
+
+	/** Answers the status lookup and the event read, each from its own queue of answers. */
+	function stubSearch(statuses: (() => Response)[], events: (() => Response)[]): void {
+		stubFetch(
+			(): Response =>
+				(calls.at(-1)?.url === statusUrl ? statuses.shift() : events.shift())?.() ??
+				Response.json({}),
+		);
+	}
+
 	it('looks the job up by the external uri the submit set, in the queue it was given', async () => {
 		// States arrive as the enum's numbers, as the gateway sends them: 2 is RUNNING.
 		stubFetch(Response.json({ jobStates: { 'job-1': 2 } }));
 
-		const job: SubmittedJob | undefined = await new ArmadaClient(config).findJob(
-			'sb-one',
-			'team-a',
-		);
-		expect(job).toEqual({ jobId: 'job-1', jobSetId: 'sb-one', queue: 'team-a' });
-		expect(calls[0]?.url).toBe('http://armada.example.com/v1/job/statusUsingExternalJobUri');
+		const lookup: JobLookup = await new ArmadaClient(config).findJob('sb-one', 'team-a');
+		expect(lookup).toEqual({
+			found: 'live',
+			job: { jobId: 'job-1', jobSetId: 'sb-one', queue: 'team-a' },
+		});
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.url).toBe(statusUrl);
 		expect(calls[0]?.body).toEqual({
 			queue: 'team-a',
 			jobset: 'sb-one',
@@ -851,13 +905,15 @@ describe('findJob', () => {
 		});
 	});
 
-	it('finds nothing for a sandbox with no job, or only finished ones', async () => {
-		const client: ArmadaClient = new ArmadaClient(config);
-		stubFetch(Response.json({}));
-		expect(await client.findJob('sb-none', 'marimohub')).toBeUndefined();
+	it('reports a set of only finished jobs as finished, without reading events', async () => {
 		// SUCCEEDED, FAILED, PREEMPTED, CANCELLED, REJECTED.
 		stubFetch(Response.json({ jobStates: { a: 3, b: 4, c: 8, d: 9, e: 10 } }));
-		expect(await client.findJob('sb-done', 'marimohub')).toBeUndefined();
+
+		expect(await new ArmadaClient(config).findJob('sb-done', 'marimohub')).toEqual({
+			found: 'finished',
+			jobId: 'e',
+		});
+		expect(calls).toHaveLength(1);
 	});
 
 	it('counts every other state as a job to attach to, QUEUED (0) and UNKNOWN included', async () => {
@@ -865,7 +921,7 @@ describe('findJob', () => {
 		for (const state of [0, 1, 2, 5, 6, 7]) {
 			stubFetch(Response.json({ jobStates: { 'job-1': state } }));
 			// oxlint-disable-next-line no-await-in-loop -- one stubbed answer per state
-			expect((await client.findJob('sb-one', 'marimohub'))?.jobId).toBe('job-1');
+			expect(await client.findJob('sb-one', 'marimohub')).toMatchObject({ found: 'live' });
 		}
 	});
 
@@ -875,8 +931,105 @@ describe('findJob', () => {
 				jobStates: { '01m4t4aaaa': 9, '01m4t4cccc': 2, '01m4t4bbbb': 2, '01m4t4dddd': 3 },
 			}),
 		);
-		expect((await new ArmadaClient(config).findJob('sb-one', 'marimohub'))?.jobId).toBe(
-			'01m4t4cccc',
+		expect(await new ArmadaClient(config).findJob('sb-one', 'marimohub')).toMatchObject({
+			job: { jobId: '01m4t4cccc' },
+		});
+	});
+
+	it('finds a job the status lookup does not list yet in the event stream', async () => {
+		stubSearch(
+			[(): Response => Response.json({})],
+			[
+				(): Response =>
+					eventStream(
+						{ result: { id: '1', message: { submitted: { jobId: 'job-1' } } } },
+						{ result: { id: '2', message: { queued: { jobId: 'job-1' } } } },
+					),
+			],
+		);
+
+		expect(await new ArmadaClient(config, 1).findJob('sb-one', 'team-a')).toEqual({
+			found: 'live',
+			job: { jobId: 'job-1', jobSetId: 'sb-one', queue: 'team-a' },
+		});
+		expect(calls).toHaveLength(2);
+		expect(calls[1]?.url).toBe('http://armada.example.com/v1/job-set/team-a/sb-one');
+		expect(calls[1]?.body).toEqual({
+			queue: 'team-a',
+			id: 'sb-one',
+			watch: false,
+			errorIfMissing: false,
+		});
+	});
+
+	it('reads a job the events show ended as finished, and one Armada will run again as live', async () => {
+		const client: ArmadaClient = new ArmadaClient(config, 1);
+		const endings: [object, JobLookup['found']][] = [
+			[{ succeeded: { jobId: 'job-1' } }, 'finished'],
+			[{ cancelled: { jobId: 'job-1' } }, 'finished'],
+			[{ failed: { jobId: 'job-1', reason: 'OOMKilled' } }, 'finished'],
+			[{ failed: { jobId: 'job-1', retryable: true } }, 'live'],
+		];
+		for (const [message, found] of endings) {
+			stubSearch(
+				[(): Response => Response.json({})],
+				[
+					(): Response =>
+						eventStream(
+							{ result: { id: '1', message: { running: { jobId: 'job-1' } } } },
+							{ result: { id: '2', message } },
+							// Whatever trails an end does not bring the job back.
+							{ result: { id: '3', message: { reprioritized: { jobId: 'job-1' } } } },
+						),
+				],
+			);
+			// oxlint-disable-next-line no-await-in-loop -- one stubbed answer per ending
+			expect(await client.findJob('sb-one', 'marimohub')).toMatchObject({ found });
+		}
+	});
+
+	it('looks again when neither place has the job yet, and finds it once it is listed', async () => {
+		stubSearch(
+			[
+				(): Response => Response.json({}),
+				(): Response => Response.json({ jobStates: { 'job-1': 0 } }),
+			],
+			[(): Response => eventStream()],
+		);
+
+		expect(await new ArmadaClient(config, 1).findJob('sb-one', 'marimohub')).toMatchObject({
+			found: 'live',
+			job: { jobId: 'job-1' },
+		});
+		expect(calls.map((call: Call): boolean => call.url === statusUrl)).toEqual([true, false, true]);
+	});
+
+	it('settles on no job when neither place has one after a few looks', async () => {
+		stubSearch([], []);
+
+		expect(await new ArmadaClient(config, 1).findJob('sb-none', 'marimohub')).toEqual({
+			found: 'nothing',
+		});
+		expect(calls).toHaveLength(6);
+	});
+
+	it('rejects rather than answer when Armada cannot be asked', async () => {
+		stubFetch(() => new Response('upstream connect error', { status: 503 }));
+
+		expect(await rejection(new ArmadaClient(config, 1).findJob('sb-one', 'marimohub'))).toContain(
+			'failed (503)',
+		);
+		expect(calls).toHaveLength(1);
+	});
+
+	it('rejects when the event stream reports an error', async () => {
+		stubSearch(
+			[(): Response => Response.json({})],
+			[(): Response => eventStream({ error: { message: 'redis unavailable' } })],
+		);
+
+		expect(await rejection(new ArmadaClient(config, 1).findJob('sb-one', 'marimohub'))).toContain(
+			'redis unavailable',
 		);
 	});
 });

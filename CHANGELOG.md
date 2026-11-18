@@ -26,7 +26,19 @@ heading merged to main is released: see [docs/CONTRIBUTING.md](docs/CONTRIBUTING
   against 0.7.1, which is also the base of the `Dockerfile` image now. From 0.7.1, marimohub
   gives library adapters its own not-found error, and the adapter reports a sandbox whose
   Armada job has finished with it. Before, a notebook whose pod was preempted, cancelled or
-  lost stayed locked until an admin reclaimed its session.
+  lost stayed locked until an admin reclaimed its session. Because marimohub drops the
+  unsaved edits of a sandbox reported gone, the adapter reports it only when Armada confirms
+  it: a job Lookout does not list yet is looked for in the job set's events, and a lookup
+  Armada cannot answer fails as an ordinary error, which marimohub retries.
+  ([#29](https://github.com/G-Research/marimohub-compute-armada/pull/29))
+
+### Fixed
+
+- A session start behind a proxy with a read timeout (nginx's default is 60s) failed once
+  its job had waited that long in the queue: the proxy cut the watch for the job to start,
+  and a cut watch ended the wait. The wait now opens the stream again after the last event
+  it read, through dropped connections and through the 502, 503 or 504 a proxy answers
+  meanwhile, until its deadline.
   ([#29](https://github.com/G-Research/marimohub-compute-armada/pull/29))
 
 ## [0.2.1] - 2026-11-17
