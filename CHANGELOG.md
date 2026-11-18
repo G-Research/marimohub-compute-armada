@@ -8,6 +8,39 @@ heading merged to main is released: see [docs/CONTRIBUTING.md](docs/CONTRIBUTING
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-18
+
+### Added
+
+- `ARMADA_START_TIMEOUT_SECONDS` sets how long a session start waits for its Armada job to
+  run (default 300, as before). The wait was a fixed 5 minutes, and raising marimohub's
+  `MARIMOHUB_SANDBOX_STARTUP_TIMEOUT_SECONDS` did not extend it: marimohub's clock starts
+  only once the sandbox is reachable, after the queue wait. A start that runs out now says
+  where the job got stuck (still queued, or a pod that will not start) instead of failing
+  with a bare `TimeoutError`.
+  ([#29](https://github.com/G-Research/marimohub-compute-armada/pull/29))
+
+### Changed
+
+- Needs marimohub 0.7.1 or later, and refuses to load on an older one. Built and tested
+  against 0.7.1, which is also the base of the `Dockerfile` image now. From 0.7.1, marimohub
+  gives library adapters its own not-found error, and the adapter reports a sandbox whose
+  Armada job has finished with it. Before, a notebook whose pod was preempted, cancelled or
+  lost stayed locked until an admin reclaimed its session. Because marimohub drops the
+  unsaved edits of a sandbox reported gone, the adapter reports it only when Armada confirms
+  it: a job Lookout does not list yet is looked for in the job set's events, and a lookup
+  Armada cannot answer fails as an ordinary error, which marimohub retries.
+  ([#29](https://github.com/G-Research/marimohub-compute-armada/pull/29))
+
+### Fixed
+
+- A session start behind a proxy with a read timeout (nginx's default is 60s) failed once
+  its job had waited that long in the queue: the proxy cut the watch for the job to start,
+  and a cut watch ended the wait. The wait now opens the stream again after the last event
+  it read, through dropped connections and through the 502, 503 or 504 a proxy answers
+  meanwhile, until its deadline.
+  ([#29](https://github.com/G-Research/marimohub-compute-armada/pull/29))
+
 ## [0.2.1] - 2026-11-17
 
 ### Fixed

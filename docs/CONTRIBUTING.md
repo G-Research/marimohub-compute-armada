@@ -333,9 +333,9 @@ Lookout, then `listActive` no longer showing it. A submit in the first seconds a
 `create queue` fails with a 403 `could not find queue`, because the server's queue cache
 has not refreshed yet; run it again.
 
-The same through the hub, which names the owner from 0.4.0 onwards (the Dockerfile's base
-image is 0.4.13). Map the dev project's id, the `id` in `curl localhost:3337/api/v1/projects`,
-restart, and start a session through the API (dev auth accepts a bare request):
+The same through the hub, which names the owner. Map the dev project's id, the `id` in
+`curl localhost:3337/api/v1/projects`, restart, and start a session through the API (dev
+auth accepts a bare request):
 
 ```bash
 ARMADA_LOOKOUT_URL=http://armada-control-plane:30000 \

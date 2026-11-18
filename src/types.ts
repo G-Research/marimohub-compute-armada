@@ -4,12 +4,12 @@
  * `@marimo-hub/core` is not published to npm yet, so these are transcribed from
  * `packages/core/src/ports/sandbox.ts` and `ports/externalAdapter.ts` at
  * marimohub v0.4.2 (d58bb8a, 2026-09-12; both files are unchanged since `main`
- * 2495463, the earlier transcription point). Every member added since 0.3.12
- * is optional, so the file serves 0.3.12 as well. Branded ids
+ * 2495463, the earlier transcription point), plus members added since, up to
+ * marimohub 0.7.1, which the adapter needs (`errors.notFound`). Branded ids
  * (`ProjectId`, `UserId`, `Millis`) are plain `string` and `number` here.
- * `BoundedReadOptions` and `readFileBounded` come later, from `main` f4e5ef8
- * (2026-09-23), which is in no release as of v0.4.10: from that commit on,
- * marimohub captures nothing from a sandbox whose adapter lacks the method.
+ * `BoundedReadOptions` and `readFileBounded` come from `main` f4e5ef8
+ * (2026-09-23): from that commit on, marimohub captures nothing from a
+ * sandbox whose adapter lacks the method.
  * Replace this file with `import type { … } from '@marimo-hub/core'` once the
  * packages ship (or pin a git sha): the shapes are frozen under `apiVersion: 1`.
  */
@@ -244,11 +244,10 @@ export interface AdapterFactoryContext {
 		/**
 		 * marimohub's own `NotFoundError`, the one error its session lifecycle
 		 * reads as "this sandbox is gone": a probe or capture that throws it
-		 * releases the editor claim instead of keeping it. Not offered by
-		 * marimohub up to 0.6.4, where a library adapter cannot make that error
-		 * at all; proposed upstream so a lost pod stops locking its notebook.
+		 * releases the editor claim instead of keeping it. From marimohub 0.7.1
+		 * (marimo-team/marimohub#696); the adapter refuses to load without it.
 		 */
-		notFound?: (message?: string) => Error;
+		notFound(message?: string): Error;
 	};
 	compute?: {
 		sessionMaxLifetimeSeconds?: number;

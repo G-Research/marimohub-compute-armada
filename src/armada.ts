@@ -6,6 +6,7 @@
  * only), so this talks to the grpc-gateway REST endpoints. The protos carry
  * `google.api.http` annotations, so every RPC has an HTTP form.
  */
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { V1PodSpec } from '@kubernetes/client-node';
 import type {
 	LookoutFilter,
@@ -54,6 +55,46 @@ export interface ActiveJob extends ActiveSandbox {
 }
 
 /**
+ * What a search for a sandbox's job found: a job to attach to, a job that has
+ * finished, or no job at all. Armada could not be asked is none of these: that
+ * rejects, since the answer is still unknown.
+ */
+export type JobLookup =
+	| { found: 'live'; job: SubmittedJob }
+	| { found: 'finished'; jobId: string }
+	| { found: 'nothing' };
+
+/** A gateway answer that is not a success, with its HTTP status. */
+export class ArmadaHttpError extends Error {
+	constructor(
+		message: string,
+		readonly status: number,
+	) {
+		super(message);
+		this.name = 'ArmadaHttpError';
+	}
+}
+
+/**
+ * Statuses that say Armada could not be reached, not that it refused: a proxy
+ * in front of the gateway answers 502 or 504 when the server is restarting or
+ * silent for longer than its read timeout, and the gateway answers 503 for
+ * gRPC's `Unavailable`.
+ */
+const UNREACHABLE_STATUSES: ReadonlySet<number> = new Set([502, 503, 504]);
+
+/**
+ * Whether a failed request lost its way to Armada rather than got an answer.
+ * fetch reports a lost connection as a TypeError, its own timeouts included.
+ */
+function isUnreachable(error: unknown): error is Error {
+	return (
+		error instanceof TypeError ||
+		(error instanceof ArmadaHttpError && UNREACHABLE_STATUSES.has(error.status))
+	);
+}
+
+/**
  * Every Armada response type we read has only optional fields, so a JSON object
  * is structurally one of them. Checking that much and no more keeps the parse
  * honest without a schema validator: a field we read but the server stopped
@@ -66,8 +107,90 @@ function asObject(value: unknown, what: string): object {
 	return value;
 }
 
-/** Long enough for an image pull on a cold node, short enough to fail a wedged queue. */
-const DEFAULT_RUNNING_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * The kind of a job-set event about `jobId`: `queued`, `leased`, `pending` and
+ * so on, the key the event sits under. Read for every kind, including those
+ * `EventMessage` does not model, since only the name is used.
+ */
+function eventKind(message: EventMessage, jobId: string): string | undefined {
+	for (const [kind, event] of Object.entries(message) as [string, unknown][]) {
+		if (typeof event === 'object' && event !== null && 'jobId' in event && event.jobId === jobId) {
+			return kind;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Event kinds that can arrive at any stage and so say nothing about where a job
+ * is. A reprioritized job keeps whatever stage it was in.
+ */
+const STAGE_NEUTRAL_EVENTS: ReadonlySet<string> = new Set(['reprioritizing', 'reprioritized']);
+
+/**
+ * Where a job that never started got stuck, from the last event it reported.
+ * The kinds are those Armada's event API sends before Running (v0.22.7,
+ * `internal/server/event/conversion`).
+ *
+ * No event at all has two causes this cannot tell apart: the gateway answers a
+ * watch request only with the job set's first event, so a set that has none yet
+ * looks the same as a server that does not answer.
+ */
+function stuckAt(stage: string | undefined, queue: string): string {
+	switch (stage) {
+		case undefined:
+			return 'Armada reported no event for it, or did not answer';
+		case 'submitted':
+		case 'queued':
+			return `it is still waiting in queue ${queue}`;
+		case 'leased':
+			return 'it was scheduled, but the executor has not created its pod';
+		case 'pending':
+			return 'its pod exists but is not running; look for a slow or failing image pull or init container';
+		// A failure that is not retryable ends the wait at once, so one seen here is.
+		case 'failed':
+			return `its last run failed, and Armada retries it from queue ${queue}`;
+		case 'leaseReturned':
+		case 'leaseExpired':
+		case 'preempted':
+			return `its last run ended (${stage}) and it is back in queue ${queue}`;
+		default:
+			return `its last event was ${stage}`;
+	}
+}
+
+/**
+ * The pause before asking Armada again. A watch stream on a queued job drops as
+ * a matter of course: the job sends no events while it waits, and Node's fetch
+ * ends a response body that sends nothing for 5 minutes, a proxy sooner. The
+ * pause keeps a server that refuses connections from being asked in a tight
+ * loop. A job search that finds nothing waits the same pause before it looks
+ * again.
+ */
+const DEFAULT_RETRY_DELAY_MS = 1000;
+
+/**
+ * How many times a job search looks before it settles on "no job". The status
+ * lookup lags a fresh submit by as long as Lookout's ingester does; the event
+ * stream lags it by a moment, and the later looks are for that moment.
+ */
+const JOB_SEARCH_ATTEMPTS = 3;
+
+/**
+ * How long each read of a job search may take. A status answer is small and an
+ * event replay short even for an old session (a utilisation event every few
+ * minutes), but a server that stalls must not hold a search forever.
+ */
+const SEARCH_READ_TIMEOUT_MS = 30 * 1000;
+
+/**
+ * Event kinds after which a job never runs again. A failure the scheduler
+ * marks `retryable` is followed by another run, so it is not among them.
+ */
+function endsJob(kind: string, event: object): boolean {
+	if (kind === 'succeeded' || kind === 'cancelled') return true;
+	return kind === 'failed' && !('retryable' in event && event.retryable === true);
+}
 
 /** The ingress event lands around Running, so by expose time it usually replays. */
 const DEFAULT_INGRESS_TIMEOUT_MS = 60 * 1000;
@@ -105,11 +228,40 @@ const FINISHED_JOB_STATES: ReadonlySet<number> = new Set([
 	JOB_STATE.REJECTED,
 ]);
 
+/**
+ * What a sandbox's jobs say about it, from each job's id and whatever tells
+ * whether it has finished; `undefined` when there is no job. The set holds one
+ * job, as `clientId` dedupes the submit. Should it ever hold more, a live one
+ * wins, and job ids are ULIDs, so of several the greatest is the newest.
+ */
+function newestJob<T>(
+	jobs: Record<string, T>,
+	finished: (value: T) => boolean,
+	sandboxId: SandboxId,
+	queue: string,
+): JobLookup | undefined {
+	const entries: [string, T][] = Object.entries(jobs).toSorted(
+		([a]: [string, T], [b]: [string, T]): number => (a < b ? -1 : a > b ? 1 : 0),
+	);
+	const live: string | undefined = entries.findLast(
+		([, value]: [string, T]): boolean => !finished(value),
+	)?.[0];
+	if (live !== undefined) {
+		return { found: 'live', job: { jobId: live, jobSetId: sandboxId, queue } };
+	}
+	const last: string | undefined = entries.at(-1)?.[0];
+	return last === undefined ? undefined : { found: 'finished', jobId: last };
+}
+
 /** Lookout page size; more active kernels than this loops rather than truncates. */
 const LIST_ACTIVE_PAGE = 500;
 
 export class ArmadaClient {
-	constructor(private readonly config: ArmadaConfig) {}
+	constructor(
+		private readonly config: ArmadaConfig,
+		/** The pause before Armada is asked again; tests shorten it. */
+		private readonly retryDelayMs: number = DEFAULT_RETRY_DELAY_MS,
+	) {}
 
 	/**
 	 * Headers for every call to the gateway.
@@ -205,51 +357,111 @@ export class ArmadaClient {
 	 * Terminal failures arrive on the same stream, so we react to them rather than
 	 * waiting out the timeout with no explanation. A failure marked `retryable` is
 	 * the scheduler saying another run follows, so it is not the end.
+	 *
+	 * The wait is `ARMADA_START_TIMEOUT_SECONDS` unless the caller passes one.
+	 * Running out of it names the last event the job reported, which tells a job
+	 * still in its queue from one whose pod will not start.
 	 */
 	async waitForRunning(
 		job: SubmittedJob,
-		timeoutMs: number = DEFAULT_RUNNING_TIMEOUT_MS,
+		timeoutMs: number = this.config.startTimeoutSeconds * 1000,
 	): Promise<PodLocation> {
-		const request: JobSetRequest = {
-			queue: job.queue,
-			id: job.jobSetId,
-			watch: true,
-			errorIfMissing: false,
-		};
+		const signal: AbortSignal = AbortSignal.timeout(timeoutMs);
+		// The kind of the last event about the job that says where it is.
+		let stage: string | undefined;
+		try {
+			return await this.followUntilRunning(job, signal, (kind: string) => {
+				if (!STAGE_NEUTRAL_EVENTS.has(kind)) stage = kind;
+			});
+		} catch (error) {
+			if (signal.aborted) {
+				throw new Error(
+					`Armada job ${job.jobId} did not start running within ${String(timeoutMs / 1000)}s (ARMADA_START_TIMEOUT_SECONDS): ${stuckAt(stage, job.queue)}`,
+					{ cause: error },
+				);
+			}
+			throw error;
+		}
+	}
+
+	/**
+	 * The wait can outlast a single response: when the stream ends or drops
+	 * before the job runs, or Armada cannot be reached to reopen it, it is opened
+	 * again after the last message read, so no event is lost or seen twice.
+	 */
+	private async followUntilRunning(
+		job: SubmittedJob,
+		signal: AbortSignal,
+		onEvent: (kind: string) => void,
+	): Promise<PodLocation> {
 		const path: string = `/v1/job-set/${encodeURIComponent(job.queue)}/${encodeURIComponent(job.jobSetId)}`;
-		const response: Response = await this.post(path, request, AbortSignal.timeout(timeoutMs));
-		if (response.body === null) throw new Error(`Armada returned no event stream for ${path}`);
+		let cursor: string | undefined;
+		// The failure to reach Armada since it last answered, so a wait that runs
+		// out while Armada is unreachable says so rather than naming a stage.
+		let lastDrop: Error | undefined;
 
-		for await (const value of readNdjson(response.body)) {
-			const line: EventStreamLine = asObject(value, 'an event stream line');
-			if (line.error !== undefined) {
-				throw new Error(`Armada event stream failed: ${line.error.message ?? 'unknown error'}`);
+		// oxlint-disable no-await-in-loop -- each reopened stream resumes where the last one stopped
+		for (;;) {
+			const request: JobSetRequest = {
+				queue: job.queue,
+				id: job.jobSetId,
+				watch: true,
+				errorIfMissing: false,
+				...(cursor === undefined ? {} : { fromMessageId: cursor }),
+			};
+			try {
+				const response: Response = await this.post(path, request, signal);
+				lastDrop = undefined;
+				if (response.body === null) throw new Error(`Armada returned no event stream for ${path}`);
+
+				for await (const value of readNdjson(response.body)) {
+					const line: EventStreamLine = asObject(value, 'an event stream line');
+					if (line.error !== undefined) {
+						throw new Error(`Armada event stream failed: ${line.error.message ?? 'unknown error'}`);
+					}
+					if (line.result?.id !== undefined) cursor = line.result.id;
+
+					const message: EventMessage | undefined = line.result?.message;
+					if (message === undefined) continue;
+
+					const kind: string | undefined = eventKind(message, job.jobId);
+					if (kind !== undefined) onEvent(kind);
+
+					const running: JobRunningEvent | undefined = message.running;
+					if (running !== undefined && running.jobId === job.jobId) {
+						return {
+							clusterId: running.clusterId ?? '',
+							podName: running.podName ?? '',
+							podNamespace: running.podNamespace ?? this.config.namespace,
+							...(running.nodeName === undefined ? {} : { nodeName: running.nodeName }),
+						};
+					}
+
+					const failed: JobFailedEvent | undefined = message.failed;
+					if (failed !== undefined && failed.jobId === job.jobId && failed.retryable !== true) {
+						throw new Error(
+							`Armada job ${job.jobId} failed: ${failed.reason ?? 'no reason given'}`,
+						);
+					}
+
+					if (message.cancelled !== undefined && message.cancelled.jobId === job.jobId) {
+						throw new Error(`Armada job ${job.jobId} was cancelled before it started`);
+					}
+				}
+			} catch (error) {
+				if (signal.aborted) throw lastDrop ?? error;
+				// Anything but a failure to reach Armada is an answer, and it ends the wait.
+				if (!isUnreachable(error)) throw error;
+				lastDrop = error;
 			}
-
-			const message: EventMessage | undefined = line.result?.message;
-			if (message === undefined) continue;
-
-			const running: JobRunningEvent | undefined = message.running;
-			if (running !== undefined && running.jobId === job.jobId) {
-				return {
-					clusterId: running.clusterId ?? '',
-					podName: running.podName ?? '',
-					podNamespace: running.podNamespace ?? this.config.namespace,
-					...(running.nodeName === undefined ? {} : { nodeName: running.nodeName }),
-				};
-			}
-
-			const failed: JobFailedEvent | undefined = message.failed;
-			if (failed !== undefined && failed.jobId === job.jobId && failed.retryable !== true) {
-				throw new Error(`Armada job ${job.jobId} failed: ${failed.reason ?? 'no reason given'}`);
-			}
-
-			if (message.cancelled !== undefined && message.cancelled.jobId === job.jobId) {
-				throw new Error(`Armada job ${job.jobId} was cancelled before it started`);
+			try {
+				await sleep(this.retryDelayMs, undefined, { signal });
+			} catch {
+				// sleep rejects with its own AbortError; the reason is the timeout.
+				throw lastDrop ?? signal.reason;
 			}
 		}
-
-		throw new Error(`Armada event stream ended before job ${job.jobId} started`);
+		// oxlint-enable no-await-in-loop
 	}
 
 	/**
@@ -348,26 +560,82 @@ export class ArmadaClient {
 	}
 
 	/**
-	 * The sandbox's job, if it has one that has not finished, found without
-	 * submitting anything: by the `externalJobUri` the submit set to the sandbox
-	 * id, the one lookup the server keys by something we choose
-	 * (`GetJobStatusUsingExternalJobUri`). `undefined` when the queue holds no
-	 * such job, or only finished ones, which is how attaching tells a sandbox
-	 * that is gone from one that is there.
+	 * The sandbox's job, found without submitting anything, which is how
+	 * attaching tells a sandbox that is gone from one that is there.
 	 *
-	 * The server answers from the database Lookout's ingester fills, so a job
-	 * submitted a moment ago may not be there yet. That suits its one caller,
-	 * attaching to a sandbox marimohub started long before.
+	 * The first place to look is the status lookup by the `externalJobUri` the
+	 * submit set to the sandbox id, the one the server keys by something we
+	 * choose (`GetJobStatusUsingExternalJobUri`). It answers from the database
+	 * Lookout's ingester fills, so a job is missing from it until the ingester
+	 * catches up, for as long as the ingester is behind. Missing is therefore not
+	 * gone: a sandbox reported gone has its unsaved edits dropped by marimohub,
+	 * which captures them only from a sandbox that is there. So an empty answer
+	 * is checked against the job set's event stream, which a separate ingester
+	 * fills within a moment of the submit. Only when both have nothing, a few
+	 * times over, is there no job.
+	 *
+	 * Neither can hold nothing for a live job for long: Lookout prunes only
+	 * finished jobs. Both hold nothing for a sandbox whose submit never got
+	 * through, and for one whose finished job has since been pruned, so a search
+	 * for those ends rather than waits for a job that will never come.
+	 *
+	 * Rejects when Armada cannot be asked, since then the answer is not known.
 	 */
-	async findJob(sandboxId: SandboxId, queue: string): Promise<SubmittedJob | undefined> {
-		// The set holds one job, as `clientId` dedupes the submit. Should it ever
-		// hold more, job ids are ULIDs, so the greatest is the newest.
-		const live: string[] = Object.entries(await this.jobStates(sandboxId, queue))
-			.filter(([, state]: [string, number]) => !FINISHED_JOB_STATES.has(state))
-			.map(([jobId]: [string, number]) => jobId)
-			.toSorted();
-		const jobId: string | undefined = live.at(-1);
-		return jobId === undefined ? undefined : { jobId, jobSetId: sandboxId, queue };
+	async findJob(sandboxId: SandboxId, queue: string): Promise<JobLookup> {
+		// oxlint-disable no-await-in-loop -- each look waits out the lag of the one before
+		for (let attempt: number = 1; ; attempt++) {
+			const listed: JobLookup | undefined = newestJob(
+				await this.jobStates(sandboxId, queue, AbortSignal.timeout(SEARCH_READ_TIMEOUT_MS)),
+				(state: number): boolean => FINISHED_JOB_STATES.has(state),
+				sandboxId,
+				queue,
+			);
+			if (listed !== undefined) return listed;
+			const seen: JobLookup | undefined = newestJob(
+				await this.lastEvents(sandboxId, queue),
+				(finished: boolean): boolean => finished,
+				sandboxId,
+				queue,
+			);
+			if (seen !== undefined) return seen;
+			if (attempt === JOB_SEARCH_ATTEMPTS) return { found: 'nothing' };
+			await sleep(this.retryDelayMs);
+		}
+		// oxlint-enable no-await-in-loop
+	}
+
+	/**
+	 * Every job in a sandbox's job set, each with whether its last event ended
+	 * it, read from the event stream without watching, so the response ends at
+	 * the last message there is. An empty set answers with no messages.
+	 */
+	private async lastEvents(sandboxId: SandboxId, queue: string): Promise<Record<string, boolean>> {
+		const request: JobSetRequest = { queue, id: sandboxId, watch: false, errorIfMissing: false };
+		const path: string = `/v1/job-set/${encodeURIComponent(queue)}/${encodeURIComponent(sandboxId)}`;
+		const response: Response = await this.post(
+			path,
+			request,
+			AbortSignal.timeout(SEARCH_READ_TIMEOUT_MS),
+		);
+		if (response.body === null) throw new Error(`Armada returned no event stream for ${path}`);
+
+		const ended: Record<string, boolean> = {};
+		for await (const value of readNdjson(response.body)) {
+			const line: EventStreamLine = asObject(value, 'an event stream line');
+			if (line.error !== undefined) {
+				throw new Error(`Armada event stream failed: ${line.error.message ?? 'unknown error'}`);
+			}
+			for (const [kind, event] of Object.entries(line.result?.message ?? {}) as [
+				string,
+				unknown,
+			][]) {
+				if (typeof event !== 'object' || event === null) continue;
+				if (!('jobId' in event) || typeof event.jobId !== 'string') continue;
+				// An ended job stays ended, whatever event trails its end.
+				ended[event.jobId] = ended[event.jobId] === true || endsJob(kind, event);
+			}
+		}
+		return ended;
 	}
 
 	/**
@@ -377,8 +645,8 @@ export class ArmadaClient {
 	 * old `Running` before the end, so this is what keeps a waiter from going on
 	 * to an agent that is long gone.
 	 *
-	 * A job the server does not list yet is not finished: like {@link findJob},
-	 * this reads what Lookout's ingester has written, which lags a fresh submit.
+	 * A job the server does not list yet is not finished: this reads what
+	 * Lookout's ingester has written, which lags a fresh submit.
 	 * Rejects when the server has not answered within `timeoutMs`.
 	 */
 	async isFinished(
@@ -524,8 +792,9 @@ export class ArmadaClient {
 		if (!response.ok) {
 			// The gateway puts the useful part in the body, not the status text.
 			const detail: string = (await response.text()).trim();
-			throw new Error(
+			throw new ArmadaHttpError(
 				`Armada ${path} failed (${response.status}): ${detail === '' ? response.statusText : detail}`,
+				response.status,
 			);
 		}
 		return response;

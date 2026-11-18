@@ -86,18 +86,39 @@ editor claim until the session's authorization runs out or an admin discards it,
 edits are lost either way. `create` cannot stand in: its lazy submission would put a fresh
 pod under the capture, an empty workspace saved over the user's work. So `connectExisting`
 is the same sandbox with the submit replaced by a lookup, `GetJobStatusUsingExternalJobUri`
-by the sandbox id in the queue the sandbox resolves to. No job, or only a finished one,
+by the sandbox id in the queue the sandbox resolves to. A finished job, or no job at all,
 fails `ready()` and with it every read and command, so the capture fails, `destroy` cancels
 the set, and marimohub releases the session. The states arrive as enum numbers whatever the
 spec says (the gateway marshals with `encoding/json`), which is why the contract check holds
-`apiJobState` to its order. The server answers from the database Lookout's ingester fills, a
-second or so behind a submit, which a sandbox started long before never notices.
+`apiJobState` to its order.
 
-marimohub hands a library adapter no `NotFoundError` (its factory context carries only
-`preconditionFailed`), so a vanished sandbox reads as a failure rather than as "gone". The
-capture path does not mind. The idle check before a reclaim does: it reads a failed probe as
-"kernel unreachable" and keeps the session, the same outcome as before this method existed.
-A `notFound` in the factory context upstream would close that.
+The server answers that lookup from the database Lookout's ingester fills, so a job is
+missing from it for as long as the ingester is behind, which can be the whole life of a
+session when the ingester is stalled. Missing must not read as gone: marimohub takes "gone"
+as nothing left to capture, marks the sandbox reclaimed and drops the unsaved edits, with
+the pod still running. So an empty answer is checked against the job set's event stream,
+read without watching, which a separate ingester fills within a moment of a submit; the job
+is live unless its last events ended it. Only when both have nothing, three looks a second
+apart, is there no job. A retryable error instead of that answer would lock the notebook
+again whenever nothing will ever turn up: a sandbox whose submit never got through, or one
+whose finished job Lookout has pruned (it prunes only finished jobs, so never a live one). A
+search Armada cannot answer at all fails as an ordinary error, which marimohub keeps the
+session for and retries. Each read of the search gives up after 30 seconds, since a gateway
+that accepts the connection and stalls would otherwise hold it for undici's 5 minutes.
+
+One case is accepted rather than handled. With a queue map, the queue searched comes from
+the owner map when neither this process nor Lookout has seen the job. After a restart, with
+Lookout behind, a job submitted before the map moved its owner (or an attach that names no
+owner) is searched for in the wrong queue, found in neither place, and reported gone. It
+needs all three at once, so instead of searching every queue the adapter logs a warning that
+names the queues it did not search, the one trace of edits lost that way.
+
+A vanished sandbox fails with marimohub's own `NotFoundError`, which marimohub hands a
+library adapter as `errors.notFound` from 0.7.1 (marimo-team/marimohub#696), so its lifecycle
+reads it as "gone" and releases the session. Any other error reads as a failure: the idle
+check before a reclaim takes a failed probe for "kernel unreachable" and keeps the session,
+which locks the notebook until an admin reclaims it. So the adapter refuses to load on a
+marimohub without `errors.notFound`, rather than keep a stand-in error for older releases.
 
 **`activeDeadlineSeconds` is always set.** Armada assigns a default deadline to any pod
 that does not set one, and the shipped default is 72 hours, 336 for GPU jobs

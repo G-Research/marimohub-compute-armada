@@ -32,6 +32,23 @@ describe('QueueDirectory', () => {
 		expect(new QueueDirectory(readConfig(baseEnv), undefined).all).toEqual(['marimohub']);
 	});
 
+	it('tells a queue taken from the owner map apart from one where a job was seen', async () => {
+		const queues: QueueDirectory = new QueueDirectory(mapped, async (id: string) =>
+			id === 'sb-listed' ? 'team-b' : undefined,
+		);
+		await queues.resolve('sb-listed', { projectId: 'proj-a' });
+		await queues.resolve('sb-new', { projectId: 'proj-a' });
+		expect(queues.guessed('sb-listed')).toBe(false);
+		expect(queues.guessed('sb-new')).toBe(true);
+		// A submit puts a job where the guess said, so the queue is known from then on.
+		queues.remember('sb-new', 'team-a');
+		expect(queues.guessed('sb-new')).toBe(false);
+		// Without a map there is nothing to guess between.
+		const single: QueueDirectory = new QueueDirectory(readConfig(baseEnv), undefined);
+		await single.resolve('sb-any', undefined);
+		expect(single.guessed('sb-any')).toBe(false);
+	});
+
 	it('maps an owner by user first, then project, then the default', () => {
 		const queues: QueueDirectory = new QueueDirectory(mapped, undefined);
 		expect(queues.forOwner({ projectId: 'proj-b', userId: 'user-a' })).toBe('team-a');

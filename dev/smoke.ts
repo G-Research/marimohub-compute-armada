@@ -84,6 +84,9 @@ async function sleep(ms: number): Promise<void> {
 // The sandbox opens the channel; keep a hand on it for the protocol requests
 // below, which the sandbox interface does not expose directly.
 let agent: AgentChannel | undefined;
+/** Stands in for marimohub's `errors.notFound`, which a gone sandbox is reported with. */
+const notFound: (message: string) => Error = (message: string): Error => new Error(message);
+
 const sandbox: ArmadaSandbox = new ArmadaSandbox(
 	sandboxId,
 	config,
@@ -95,6 +98,7 @@ const sandbox: ArmadaSandbox = new ArmadaSandbox(
 	},
 	queues,
 	new Map(),
+	notFound,
 	owner === undefined ? undefined : { owner },
 );
 
@@ -189,7 +193,7 @@ const surfaceAgain: string = (await sandbox.exposePort(8443, { hostname: 'ignore
 console.log(`  kernel  ${kernelUrl}`);
 console.log(`  surface ${surfaceUrl}`);
 check(
-	new ArmadaCompute(config).capabilities.multiPort &&
+	new ArmadaCompute(config, notFound).capabilities.multiPort &&
 		surfaceUrl !== kernelUrl &&
 		surfaceAgain === surfaceUrl,
 	"multiPort: the surface port has its own stable address next to the kernel's",
@@ -257,7 +261,7 @@ if (process.argv.includes('--keep')) {
 		(await armada.findQueue(sandboxId)) === queue,
 		`Lookout names queue "${queue}" for the job set, by the installation's mark`,
 	);
-	const fresh: ArmadaCompute = new ArmadaCompute(config);
+	const fresh: ArmadaCompute = new ArmadaCompute(config, notFound);
 	if (fresh.listActive === undefined) throw new Error('unreachable: Lookout was checked above');
 	const before: ActiveSandbox[] = await fresh.listActive();
 	check(

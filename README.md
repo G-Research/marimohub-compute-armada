@@ -59,6 +59,7 @@ in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `ARMADA_RUN_AS_GROUP`                | no       | Pod `securityContext.runAsGroup`, a gid               |
 | `ARMADA_FS_GROUP`                    | no       | Pod `securityContext.fsGroup`; owns the agent volume  |
 | `ARMADA_COMMAND_MAX_SECONDS`         | no       | Backstop for one exec (default `21600`, `0` off)      |
+| `ARMADA_START_TIMEOUT_SECONDS`       | no       | Wait for a job to start running (default `300`)       |
 | `ARMADA_EXPOSE`                      | no       | `nodeport` (default) or `ingress`, for both ports     |
 | `ARMADA_INGRESS_TLS`                 | no       | `true` (default) or `false`; ingress only             |
 | `ARMADA_INGRESS_CERT_NAME`           | no       | TLS secret name prefix (default `<namespace>-`)       |
@@ -153,20 +154,34 @@ Lookout by job set for a sandbox it has never seen, since marimohub addresses sa
 id alone on several paths. A queue map therefore requires `ARMADA_LOOKOUT_URL`, and a
 call Lookout cannot answer fails rather than guesses; marimohub retries it.
 
-The browser gives a starting session `MARIMOHUB_SANDBOX_STARTUP_TIMEOUT_SECONDS`
-(default 120) plus 30 seconds, and that clock includes the time the job waits in its
-Armada queue. On a busy cluster, raise it so users see their kernel arrive, not a
-timeout. The adapter waits at most 5 minutes for the job to start running, so a
-value above 270 gains nothing.
+Two clocks bound a session start. `ARMADA_START_TIMEOUT_SECONDS` (default 300) is the
+adapter's: how long it waits for the job to start running, which covers the time in the
+Armada queue, scheduling, the image pull and the agent's init container. marimohub's
+`MARIMOHUB_SANDBOX_STARTUP_TIMEOUT_SECONDS` (default 120) starts only once the pod
+answers, and covers installing the notebook's dependencies and starting marimo. On a busy
+cluster, raise `ARMADA_START_TIMEOUT_SECONDS` to allow more time for server-side placement.
+A start that runs out of it fails with the last event the job reported, which tells a job
+still in its queue from one whose pod will not start.
 
-Compute profiles (`MARIMOHUB_COMPUTE_PROFILES`, marimohub 0.4.13 onwards) let editors
+marimohub adds three limits of its own. The browser tab that initiated the start can still
+time out after 150 seconds while the server continues waiting: marimohub 0.7.1 fixes that
+limit in the browser, it covers marimohub's own startup as well as the queue wait, and no
+setting changes it. A browser tab that picks
+up a session that is already starting (a reload, a second tab) gives up after
+`MARIMOHUB_SANDBOX_STARTUP_TIMEOUT_SECONDS` plus 30 seconds from when it began watching,
+so keep that at least as long as a typical queue wait. And marimohub marks a session that
+is still starting after 15 minutes as failed, so keep `ARMADA_START_TIMEOUT_SECONDS` plus
+`MARIMOHUB_SANDBOX_STARTUP_TIMEOUT_SECONDS` and about 90 seconds of adapter waits (the
+ingress address and the agent's first answer) below that.
+
+Compute profiles (`MARIMOHUB_COMPUTE_PROFILES`) let editors
 pick hardware per notebook: when creating it, later through "Change compute profile", or
 for one edit session. The adapter tells marimohub it applies them, and a profile's CPU
 and memory become the kernel container's requests and limits, which Armada requires to
 be equal. So a kernel that outgrows its profile's memory is OOM-killed, and every session
 is charged its full profile against the queue's fair share, idle or not. Offer a short
 list of sizes rather than one large default. Users can only pick when
-`MARIMOHUB_COMPUTE_PROFILE_OVERRIDE=editors`. From marimohub 0.5.0,
+`MARIMOHUB_COMPUTE_PROFILE_OVERRIDE=editors`.
 `MARIMOHUB_COMPUTE_APP_PROFILES` gives apps their own list, in the same syntax; without
 it, apps use the editing list.
 
@@ -354,7 +369,7 @@ binary at it. The agent image is still needed, since it runs in the cluster.
 sudo install -D dist/index.js /etc/marimohub/compute.mjs
 
 # The binary, at the release the Dockerfile names, checked against its published hash.
-V=0.4.13
+V=0.7.1
 curl -fsSLO "https://github.com/marimo-team/marimohub/releases/download/v$V/marimohub-linux-x64"
 curl -fsSLO "https://github.com/marimo-team/marimohub/releases/download/v$V/marimohub-linux-x64.sha256"
 sha256sum -c marimohub-linux-x64.sha256
@@ -405,8 +420,9 @@ export ARMADA_AGENT_IMAGE=marimohub-kernel-agent:local
 [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md), which also covers the case where
 `kind load` trips over a multi-platform image.
 
-Verified against `ghcr.io/marimo-team/marimohub:0.4.2`, the release the adapter interface
-is transcribed from; everything added since 0.3.12 is optional, so that release loads it too.
+Needs marimohub 0.7.1 or later, and is built and tested against the release in the
+`Dockerfile`. An older marimohub gives library adapters no `errors.notFound`, which the
+adapter reports a lost pod with, so the adapter refuses to load there.
 
 ## Documentation
 
