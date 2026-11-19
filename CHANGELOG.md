@@ -9,6 +9,8 @@ heading merged to main is released: see
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-19
+
 ### Added
 
 - `ARMADA_POD_TEMPLATE_FILE` adds a partial Pod manifest to every kernel pod: volumes of
