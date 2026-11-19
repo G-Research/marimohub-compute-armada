@@ -53,6 +53,8 @@ export interface ReservedNames {
 	mountPath: string;
 	/** The variable the agent reads its token hash from. */
 	env: string;
+	/** The kernel container's name in the pod the adapter builds. */
+	container: string;
 }
 
 const SETTING = 'ARMADA_POD_TEMPLATE_FILE';
@@ -208,11 +210,58 @@ function readVolume(value: unknown, path: string, reserved: ReservedNames): V1Vo
 	const sources: string[] = Object.keys(volume).filter((key: string) => key !== 'name');
 	if (sources.length !== 1) fail(path, 'must have exactly one volume source');
 	const [source = ''] = sources;
-	const body: Json = object(volume[source], `${path}.${source}`);
+	const body: Json = object(
+		retarget(object(volume[source], `${path}.${source}`), `${path}.${source}`, reserved),
+		`${path}.${source}`,
+	);
 	return { name: volumeName, [source]: body };
 }
 
-function readValueFrom(value: unknown, path: string): NonNullable<V1EnvVar['valueFrom']> {
+/**
+ * The kernel container, as a `resourceFieldRef.containerName` names it. The
+ * kubelet looks the name up exactly, and a template written for marimohub's
+ * Kubernetes backend names it `marimo`, so either name becomes the adapter's.
+ * No other container is the template's to point at.
+ */
+function kernelContainer(value: unknown, path: string, reserved: ReservedNames): string {
+	if (typeof value !== 'string' || !KERNEL_CONTAINER_NAMES.has(value)) {
+		fail(path, `must be ${[...KERNEL_CONTAINER_NAMES].join(' or ')}, the kernel container`);
+	}
+	return reserved.container;
+}
+
+/**
+ * A volume source, with every `resourceFieldRef.containerName` in it pointed at
+ * the kernel container: `downwardAPI` items, and those of a `projected` volume.
+ * Nothing else in the source is touched.
+ */
+function retarget(value: unknown, path: string, reserved: ReservedNames): unknown {
+	if (Array.isArray(value)) {
+		return value.map((item: unknown, i: number): unknown =>
+			retarget(item, `${path}[${String(i)}]`, reserved),
+		);
+	}
+	if (!isObject(value)) return value;
+	const copy: Json = {};
+	for (const [key, child] of Object.entries(value)) {
+		const at: string = `${path}.${key}`;
+		if (key === 'resourceFieldRef' && isObject(child) && child.containerName !== undefined) {
+			copy[key] = {
+				...child,
+				containerName: kernelContainer(child.containerName, `${at}.containerName`, reserved),
+			};
+		} else {
+			copy[key] = retarget(child, at, reserved);
+		}
+	}
+	return copy;
+}
+
+function readValueFrom(
+	value: unknown,
+	path: string,
+	reserved: ReservedNames,
+): NonNullable<V1EnvVar['valueFrom']> {
 	const from: Json = object(value, path);
 	const kinds: string[] = Object.keys(from);
 	if (kinds.length !== 1) fail(path, 'must have exactly one source');
@@ -237,10 +286,10 @@ function readValueFrom(value: unknown, path: string): NonNullable<V1EnvVar['valu
 		case 'resourceFieldRef': {
 			const ref: Json = object(from[kind], at);
 			only(ref, ['resource', 'containerName', 'divisor'], at);
-			const containerName: string | undefined = optionalString(
-				ref.containerName,
-				`${at}.containerName`,
-			);
+			const containerName: string | undefined =
+				ref.containerName === undefined
+					? undefined
+					: kernelContainer(ref.containerName, `${at}.containerName`, reserved);
 			const divisor: string | undefined = optionalString(ref.divisor, `${at}.divisor`);
 			return {
 				resourceFieldRef: {
@@ -270,7 +319,10 @@ function readEnv(value: unknown, path: string, reserved: ReservedNames): V1EnvVa
 		fail(`${path}.value`, 'must be a string; quote numbers and booleans');
 	}
 	if (env.valueFrom !== undefined) {
-		return { name: envName, valueFrom: readValueFrom(env.valueFrom, `${path}.valueFrom`) };
+		return {
+			name: envName,
+			valueFrom: readValueFrom(env.valueFrom, `${path}.valueFrom`, reserved),
+		};
 	}
 	return { name: envName, ...(env.value === undefined ? {} : { value: env.value }) };
 }

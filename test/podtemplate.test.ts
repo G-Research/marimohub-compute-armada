@@ -191,6 +191,92 @@ spec:
 		]);
 	});
 
+	it('points a resourceFieldRef at the kernel container under either name', () => {
+		const spec: V1PodSpec = specWith(`
+spec:
+  containers:
+    - name: marimo
+      env:
+        - name: CPU_LIMIT
+          valueFrom:
+            resourceFieldRef: {containerName: marimo, resource: limits.cpu, divisor: 1m}
+        - name: MEMORY_LIMIT
+          valueFrom:
+            resourceFieldRef: {containerName: kernel, resource: limits.memory}
+        - name: CPU_REQUEST
+          valueFrom:
+            resourceFieldRef: {resource: requests.cpu}
+`);
+		// The kubelet looks the name up exactly, and the container is `kernel`.
+		expect(kernel(spec)?.name).toBe('kernel');
+		expect(kernel(spec)?.env?.slice(1)).toEqual([
+			{
+				name: 'CPU_LIMIT',
+				valueFrom: {
+					resourceFieldRef: { resource: 'limits.cpu', containerName: 'kernel', divisor: '1m' },
+				},
+			},
+			{
+				name: 'MEMORY_LIMIT',
+				valueFrom: { resourceFieldRef: { resource: 'limits.memory', containerName: 'kernel' } },
+			},
+			{ name: 'CPU_REQUEST', valueFrom: { resourceFieldRef: { resource: 'requests.cpu' } } },
+		]);
+	});
+
+	it('points the resourceFieldRefs in downwardAPI and projected volumes at the kernel container', () => {
+		const spec: V1PodSpec = specWith(`
+spec:
+  volumes:
+    - name: limits
+      downwardAPI:
+        items:
+          - path: cpu
+            resourceFieldRef: {containerName: marimo, resource: limits.cpu}
+          - path: labels
+            fieldRef: {fieldPath: metadata.labels}
+    - name: combined
+      projected:
+        sources:
+          - downwardAPI:
+              items:
+                - path: memory
+                  resourceFieldRef: {containerName: marimo, resource: limits.memory, divisor: 1Mi}
+          - secret: {name: kernel-krb5-ccache}
+`);
+		expect(spec.volumes?.[1]).toEqual({
+			name: 'limits',
+			downwardAPI: {
+				items: [
+					{ path: 'cpu', resourceFieldRef: { containerName: 'kernel', resource: 'limits.cpu' } },
+					{ path: 'labels', fieldRef: { fieldPath: 'metadata.labels' } },
+				],
+			},
+		});
+		expect(spec.volumes?.[2]).toEqual({
+			name: 'combined',
+			projected: {
+				sources: [
+					{
+						downwardAPI: {
+							items: [
+								{
+									path: 'memory',
+									resourceFieldRef: {
+										containerName: 'kernel',
+										resource: 'limits.memory',
+										divisor: '1Mi',
+									},
+								},
+							],
+						},
+					},
+					{ secret: { name: 'kernel-krb5-ccache' } },
+				],
+			},
+		});
+	});
+
 	describe('refuses at startup, naming the setting and the field', () => {
 		const cases: [string, string, string][] = [
 			[
@@ -246,6 +332,16 @@ spec:
 				'spec.containers[0].resources',
 			],
 			['an init container', 'spec: {initContainers: []}', 'spec.initContainers'],
+			[
+				'an env resourceFieldRef to a container other than the kernel',
+				'spec: {containers: [{name: kernel, env: [{name: A, valueFrom: {resourceFieldRef: {containerName: agent-install, resource: limits.cpu}}}]}]}',
+				'spec.containers[0].env[0].valueFrom.resourceFieldRef.containerName must be kernel or marimo',
+			],
+			[
+				'a volume resourceFieldRef to a container other than the kernel',
+				'spec: {volumes: [{name: a, downwardAPI: {items: [{path: cpu, resourceFieldRef: {containerName: sidecar, resource: limits.cpu}}]}}]}',
+				'spec.volumes[0].downwardAPI.items[0].resourceFieldRef.containerName must be kernel or marimo',
+			],
 			['the restart policy', 'spec: {restartPolicy: Never}', 'spec.restartPolicy'],
 			['the deadline', 'spec: {activeDeadlineSeconds: 1}', 'spec.activeDeadlineSeconds'],
 			[

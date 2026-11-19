@@ -19,7 +19,9 @@ heading merged to main is released: see
   `serviceAccountName`, `automountServiceAccountToken` and `enableServiceLinks`. Kernels can
   now mount network shares with a credential from a Secret in the job namespace, and run
   without the namespace's service-account token, or under a service account of their own.
-  The file uses the format of marimohub's `MARIMOHUB_COMPUTE_KUBERNETES_POD_TEMPLATE_FILE`.
+  The file uses the format of marimohub's `MARIMOHUB_COMPUTE_KUBERNETES_POD_TEMPLATE_FILE`,
+  where the kernel container is named `marimo`: that name is accepted for the container
+  and in a `resourceFieldRef.containerName`, which is submitted as `kernel`.
   Startup fails, naming the field, when the template touches a part of the pod the adapter
   owns, a field another variable sets, or a field it does not support. Without the setting,
   the pod spec is unchanged. The template is part of the submission and so public in

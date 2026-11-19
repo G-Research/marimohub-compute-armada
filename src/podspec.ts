@@ -42,6 +42,7 @@ export const RESERVED_NAMES: ReservedNames = {
 	volume: AGENT_VOLUME,
 	mountPath: AGENT_DIR,
 	env: AGENT_TOKEN_HASH_ENV,
+	container: KERNEL_CONTAINER,
 };
 
 /** What the pod spec carries for the agent: never the token, only its hash. */

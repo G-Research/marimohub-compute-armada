@@ -336,6 +336,11 @@ as it uses only these fields:
 | `spec.automountServiceAccountToken` | `false` keeps the API token out of the pod                   |
 | `spec.enableServiceLinks`           | `false` keeps the namespace's Service variables out          |
 
+A `resourceFieldRef` that names a container, in `env` or in a `downwardAPI` or `projected`
+volume, must name the kernel container, as `kernel` or `marimo`. Either name is submitted
+as `kernel`, the container's name in the pod, because the kubelet looks the name up
+exactly. Any other name stops startup.
+
 [`examples/kernel-pod.yaml`](../examples/kernel-pod.yaml) is a complete template: network
 shares through a CSI driver, a Kerberos configuration and credential cache from Secrets,
 and a service account of the kernels' own.
