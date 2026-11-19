@@ -1,6 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { SANDBOX_MARK } from './armada.js';
 import type { ArmadaAuth } from './auth.js';
+import { RESERVED_NAMES } from './podspec.js';
+import { loadPodTemplateFile } from './podtemplate.js';
+import type { PodTemplate } from './podtemplate.js';
 import type { AdapterFactoryContext } from './types.js';
 
 /**
@@ -121,9 +124,17 @@ export interface ArmadaConfig {
 	podLabels: Record<string, string>;
 	podAnnotations: Record<string, string>;
 	/**
-	 * Hard cap on one session, submitted as `activeDeadlineSeconds`. Armada gives
-	 * any pod without one the server default, 72 hours as shipped, so a kernel must
-	 * always carry its own.
+	 * What `ARMADA_POD_TEMPLATE_FILE` adds to every kernel pod: volumes, the
+	 * kernel container's environment and mounts, and its service account
+	 * settings (`podtemplate.ts`). Unset, the pod is exactly what it was before
+	 * the setting existed.
+	 */
+	podTemplate?: PodTemplate | undefined;
+	/**
+	 * Hard cap on one pod, submitted as `activeDeadlineSeconds`: an orphan
+	 * backstop behind marimohub's own session lifetime, never the lifetime itself
+	 * (`readLifetime`). Armada gives any pod without one the server default, 72
+	 * hours as shipped, so a kernel must always carry its own.
 	 */
 	maxLifetimeSeconds: number;
 	/**
@@ -180,6 +191,16 @@ function required(env: Record<string, string | undefined>, name: string): string
 	return value;
 }
 
+/**
+ * A name that may be left unset, but not set empty: an empty namespace or
+ * priority class would be submitted as is, and fail every session.
+ */
+function optionalName(env: Record<string, string | undefined>, name: string): string | undefined {
+	const value: string | undefined = env[name];
+	if (value !== undefined && !value.trim()) throw new Error(`${name} is empty`);
+	return value;
+}
+
 /** As `required`, but rejects anything that is not an http(s) URL. */
 function requiredUrl(env: Record<string, string | undefined>, name: string): string {
 	const value: string = required(env, name);
@@ -218,7 +239,8 @@ function optionalSeconds(
 ): number {
 	const raw: string | undefined = env[name];
 	if (raw === undefined) return fallback;
-	const value: number = Number(raw);
+	// Number('') is 0, which would silently turn ARMADA_COMMAND_MAX_SECONDS off.
+	const value: number = raw.trim() === '' ? Number.NaN : Number(raw);
 	if (!Number.isInteger(value) || value < least) {
 		throw new Error(`${name} must be a whole number of seconds, got: ${raw}`);
 	}
@@ -366,10 +388,11 @@ function readStringMap(
 	try {
 		parsed = JSON.parse(raw);
 	} catch {
-		throw new Error(`${name} must be a JSON object, got: ${raw}`);
+		// Never the text itself: these maps are where a credential gets pasted.
+		throw new Error(`${name} must be a JSON object, and is not valid JSON`);
 	}
 	if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-		throw new Error(`${name} must be a JSON object, got: ${raw}`);
+		throw new Error(`${name} must be a JSON object, like {"key": "value"}`);
 	}
 	const map: Record<string, string> = {};
 	for (const [key, value] of Object.entries(parsed)) {
@@ -436,10 +459,11 @@ function readGpuNodeSelectors(
 	try {
 		parsed = JSON.parse(raw);
 	} catch {
-		throw new Error(`${name} must be a JSON object, got: ${raw}`);
+		// Never the text itself: these maps are where a credential gets pasted.
+		throw new Error(`${name} must be a JSON object, and is not valid JSON`);
 	}
 	if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-		throw new Error(`${name} must be a JSON object, got: ${raw}`);
+		throw new Error(`${name} must be a JSON object, like {"key": "value"}`);
 	}
 	const selectors: Record<string, Record<string, string>> = {};
 	for (const [type, selector] of Object.entries(parsed)) {
@@ -518,6 +542,14 @@ function readPodMetadata(
 	return map;
 }
 
+/** Set but empty is refused: it would silently submit pods without the template. */
+function readPodTemplate(env: Record<string, string | undefined>): PodTemplate | undefined {
+	const path: string | undefined = env.ARMADA_POD_TEMPLATE_FILE;
+	if (path === undefined) return undefined;
+	if (!path.trim()) throw new Error('ARMADA_POD_TEMPLATE_FILE is empty');
+	return loadPodTemplateFile(path, RESERVED_NAMES);
+}
+
 /**
  * The variables marimohub reads compute profiles from: the editing list, and
  * (0.5.0 onwards) a separate list for apps. Both use the same syntax.
@@ -546,6 +578,38 @@ function profileGpuTypes(profiles: string | undefined): string[] {
 
 /** A day, when neither marimohub nor the environment says otherwise. */
 const DEFAULT_MAX_LIFETIME_SECONDS = 24 * 60 * 60;
+
+/**
+ * The pod's hard deadline, transcribed from marimohub's `resolveLifetimeBackstop`
+ * (`packages/config/src/compute.ts`), which its CoreWeave, E2B and W&B backends use.
+ *
+ * marimohub's session lifetime is soft: at the deadline its lifecycle sweep moves
+ * it 30 minutes on while editors are connected, and otherwise saves the notebook
+ * and then tears the session down. A pod deadline equal to it would kill a session
+ * marimohub just extended, and race the save of one it is ending. So the pod gets
+ * twice the session lifetime unless `ARMADA_KERNEL_MAX_LIFETIME_SECONDS` says
+ * otherwise, and a value below the session lifetime is refused: it can only kill
+ * sessions before marimohub saves them. marimohub always hands a library adapter
+ * a session lifetime (its default is 4 hours); the fallback is for running without
+ * marimohub, as the smoke test does.
+ */
+function readLifetime(
+	env: Record<string, string | undefined>,
+	sessionSeconds: number | undefined,
+): number {
+	const name: string = 'ARMADA_KERNEL_MAX_LIFETIME_SECONDS';
+	const session: number | undefined =
+		sessionSeconds === undefined || sessionSeconds <= 0 ? undefined : Math.ceil(sessionSeconds);
+	if (env[name] === undefined)
+		return session === undefined ? DEFAULT_MAX_LIFETIME_SECONDS : 2 * session;
+	const explicit: number = optionalSeconds(env, name, DEFAULT_MAX_LIFETIME_SECONDS);
+	if (session !== undefined && explicit < session) {
+		throw new Error(
+			`${name} (${String(explicit)}) must be at least marimohub's session lifetime, MARIMOHUB_SESSION_MAX_LIFETIME_SECONDS (${String(session)}): a pod deadline below it kills sessions before marimohub saves them. Leave it unset for twice the session lifetime.`,
+		);
+	}
+	return explicit;
+}
 
 /**
  * Far past anything marimohub's own commands do, since a backstop that competes
@@ -583,8 +647,8 @@ export function readConfig(
 		queue: required(env, 'ARMADA_QUEUE'),
 		queueByUser: readStringMap(env, 'ARMADA_QUEUE_BY_USER'),
 		queueByProject: readStringMap(env, 'ARMADA_QUEUE_BY_PROJECT'),
-		namespace: env.ARMADA_NAMESPACE ?? 'default',
-		priorityClassName: env.ARMADA_PRIORITY_CLASS,
+		namespace: optionalName(env, 'ARMADA_NAMESPACE') ?? 'default',
+		priorityClassName: optionalName(env, 'ARMADA_PRIORITY_CLASS'),
 		image,
 		sandboxHostname: env.MARIMOHUB_COMPUTE_SANDBOX_HOSTNAME,
 		port: optionalPort(env, 'ARMADA_KERNEL_PORT', 2718),
@@ -599,10 +663,9 @@ export function readConfig(
 		gpuNodeSelectors: readGpuNodeSelectors(env),
 		podLabels: readPodMetadata(env, 'ARMADA_POD_LABELS', 'label'),
 		podAnnotations: readPodMetadata(env, 'ARMADA_POD_ANNOTATIONS', 'annotation'),
+		podTemplate: readPodTemplate(env),
 		lookoutUrl: optionalUrl(env, 'ARMADA_LOOKOUT_URL'),
-		maxLifetimeSeconds:
-			compute?.sessionMaxLifetimeSeconds ??
-			optionalSeconds(env, 'ARMADA_KERNEL_MAX_LIFETIME_SECONDS', DEFAULT_MAX_LIFETIME_SECONDS),
+		maxLifetimeSeconds: readLifetime(env, compute?.sessionMaxLifetimeSeconds),
 		commandMaxSeconds: optionalSeconds(
 			env,
 			'ARMADA_COMMAND_MAX_SECONDS',

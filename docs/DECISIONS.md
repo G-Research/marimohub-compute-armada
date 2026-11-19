@@ -123,8 +123,19 @@ marimohub without `errors.notFound`, rather than keep a stand-in error for older
 **`activeDeadlineSeconds` is always set.** Armada assigns a default deadline to any pod
 that does not set one, and the shipped default is 72 hours, 336 for GPU jobs
 (`config/server/config.yaml:65`, `:67`). A kernel that inherits an operator's default is
-killed mid-session with no signal the adapter controls, so it always sets one, from
-marimohub's `sessionMaxLifetimeSeconds` when present and a configured default otherwise.
+killed mid-session with no signal the adapter controls, so it always sets one.
+
+**The deadline is a backstop at twice the session lifetime.** marimohub always hands a
+library adapter `sessionMaxLifetimeSeconds` (`packages/config/src/library.ts:366`), but that
+lifetime is soft: at the deadline the lifecycle sweep extends a session with connected
+editors by 30 minutes, and saves then tears down one without
+(`packages/core/src/services/runtime/sessionLifecycle.ts:278`). A pod deadline equal to it
+killed sessions marimohub had just extended, and raced the save of the ones it was ending.
+So the deadline is transcribed from marimohub's `resolveLifetimeBackstop`
+(`packages/config/src/compute.ts:170`), which its CoreWeave, E2B and W&B backends use: twice
+the session lifetime, or `ARMADA_KERNEL_MAX_LIFETIME_SECONDS`, which may not be below the
+session lifetime. A session edited past the backstop is still killed without a save, as on
+those backends.
 
 **Retries are off, with `failFast`.** A retried job keeps its job id, gets a new run and
 reuses the same pod name, possibly on another cluster (`docs/retry_policies.md`). For a
@@ -330,10 +341,25 @@ and nothing withdraws it once submitted. A credential in it has leaked to everyo
 Lookout access. The usual way that happens is an option that copies a configured value
 into the pod's environment, followed by someone configuring a credential through it. So
 the adapter treats every value it submits as public: the agent token appears only as a
-hash (above), registry credentials only as secret names, and no option sets pod
-environment from configuration. Adding such an option needs a decision here first.
+hash (above), and registry credentials only as secret names.
 Credentials marimohub hands a session travel through the agent, at command time, and the
-README lists everything a submission carries so an operator can be briefed on it.
+configuration reference (`docs/CONFIGURATION.md`) lists everything a submission carries so an operator can be briefed on it.
+
+**The pod template sets pod environment, and is public like the rest.** A kernel that
+reads network shares needs the share mounted and a variable that points at its credential
+(`KRB5CCNAME` into a mounted credential cache), and nothing else can set a variable before
+the kernel starts. So `ARMADA_POD_TEMPLATE_FILE` takes `env` with literal values, which
+reverses the earlier "no option sets pod environment" rule. It does not weaken the
+guarantee: the values that variable is for are paths and names, every credential the
+template touches is a reference (a Secret volume, `secretKeyRef`, `envFrom.secretRef`),
+and the configuration reference says plainly that a literal `value` is public. Forbidding literal values
+would only push `KRB5CCNAME` into a ConfigMap, which is no more private and is one more
+object to deploy. The format is marimohub's own Kubernetes pod template, so a deployment
+moving between backends keeps one file; the adapter accepts a small part of it (volumes,
+the kernel container's `env`, `envFrom` and `volumeMounts`, the service account fields)
+and refuses the rest by path at startup, the parts it owns first. Its errors name the
+field, never the value, as marimohub's do, because the value may be the credential
+someone pasted.
 
 **Configured values are checked for shape, not content.** Every configured value in the
 submission is copied in as written, the free-form `ARMADA_POD_LABELS`,

@@ -22,6 +22,8 @@
  */
 import type { V1PodSecurityContext, V1PodSpec } from '@kubernetes/client-node';
 import type { ArmadaConfig } from './config.js';
+import { templateSpecFields } from './podtemplate.js';
+import type { PodTemplate, ReservedNames } from './podtemplate.js';
 import type { ComputeResources, CreateSandboxOptions } from './types.js';
 
 /** Name of the kernel container in the pod. Also the prefix of its service port. */
@@ -30,10 +32,17 @@ export const KERNEL_CONTAINER = 'kernel';
 /** Where the kernel container finds the agent: a volume the init container fills. */
 export const AGENT_DIR = '/mh-agent';
 export const AGENT_PATH = `${AGENT_DIR}/agent`;
-const AGENT_VOLUME = 'mh-agent';
+export const AGENT_VOLUME = 'mh-agent';
 
 /** The agent reads the hex SHA-256 of its bearer token from this variable. */
 export const AGENT_TOKEN_HASH_ENV = 'MH_AGENT_TOKEN_SHA256';
+
+/** The adapter's own names in the pod, which `ARMADA_POD_TEMPLATE_FILE` may not take. */
+export const RESERVED_NAMES: ReservedNames = {
+	volume: AGENT_VOLUME,
+	mountPath: AGENT_DIR,
+	env: AGENT_TOKEN_HASH_ENV,
+};
 
 /** What the pod spec carries for the agent: never the token, only its hash. */
 export interface AgentSpec {
@@ -134,6 +143,9 @@ export function buildPodSpec(
 		options?.resources,
 	);
 	const context: V1PodSecurityContext | undefined = securityContext(config);
+	// The deployment's additions (`ARMADA_POD_TEMPLATE_FILE`) go after the
+	// adapter's own entries; `readConfig` has refused any that would collide.
+	const template: PodTemplate | undefined = config.podTemplate;
 
 	return {
 		restartPolicy: 'Never',
@@ -154,7 +166,8 @@ export function buildPodSpec(
 					})),
 				}),
 		...(context === undefined ? {} : { securityContext: context }),
-		volumes: [{ name: AGENT_VOLUME, emptyDir: {} }],
+		...templateSpecFields(template),
+		volumes: [{ name: AGENT_VOLUME, emptyDir: {} }, ...(template?.volumes ?? [])],
 		initContainers: [
 			{
 				name: 'agent-install',
@@ -172,7 +185,12 @@ export function buildPodSpec(
 				// The agent is PID 1: it idles until marimohub sends a command,
 				// and it reaps what a detached kernel leaves behind.
 				command: [AGENT_PATH, '--port', String(config.agentPort)],
-				env: [{ name: AGENT_TOKEN_HASH_ENV, value: agent.tokenSha256 }],
+				env: [{ name: AGENT_TOKEN_HASH_ENV, value: agent.tokenSha256 }, ...(template?.env ?? [])],
+				// Kubernetes lets `env` win over `envFrom`, so a referenced Secret or
+				// ConfigMap cannot replace the agent's token hash.
+				...(template === undefined || template.envFrom.length === 0
+					? {}
+					: { envFrom: template.envFrom }),
 				// The kernel, the agent, then each surface marimohub may start
 				// (`config.surfacePorts`): all of them earn an address this way.
 				ports: [config.port, config.agentPort, ...config.surfacePorts].map(
@@ -182,7 +200,10 @@ export function buildPodSpec(
 					}),
 				),
 				resources: { requests: resources, limits: resources },
-				volumeMounts: [{ name: AGENT_VOLUME, mountPath: AGENT_DIR }],
+				volumeMounts: [
+					{ name: AGENT_VOLUME, mountPath: AGENT_DIR },
+					...(template?.volumeMounts ?? []),
+				],
 			},
 		],
 	};
