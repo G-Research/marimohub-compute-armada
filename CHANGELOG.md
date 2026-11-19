@@ -22,11 +22,13 @@ heading merged to main is released: see
   owns, a field another variable sets, or a field it does not support. Without the setting,
   the pod spec is unchanged. The template is part of the submission and so public in
   Lookout, like the rest of the pod spec: it must name Secrets, never hold credentials.
+  ([#30](https://github.com/G-Research/marimohub-compute-armada/pull/30))
 - The npm package ships the configuration reference, `docs/CONFIGURATION.md`: every
   variable the adapter reads with its default and checks, setups to start from, and what
   a job submission shows everyone in Lookout. It also ships `CHANGELOG.md` and
   `examples/kernel-pod.yaml`, a pod template for network shares with a Kerberos credential
   cache. The README links to it in place of its own configuration section.
+  ([#30](https://github.com/G-Research/marimohub-compute-armada/pull/30))
 
 ### Changed
 
@@ -34,6 +36,7 @@ heading merged to main is released: see
   session lifetime always took its place. Check any value you set: below
   `MARIMOHUB_SESSION_MAX_LIFETIME_SECONDS` it now stops startup, and above it, it now sets
   the pod deadline. Unset, the deadline is twice the session lifetime.
+  ([#30](https://github.com/G-Research/marimohub-compute-armada/pull/30))
 
 ### Fixed
 
@@ -44,15 +47,19 @@ heading merged to main is released: see
   backends. `ARMADA_KERNEL_MAX_LIFETIME_SECONDS` sets it instead, and now applies under
   marimohub too: before, marimohub's session lifetime always took its place. A value below
   the session lifetime stops startup. The variable is now documented.
+  ([#30](https://github.com/G-Research/marimohub-compute-armada/pull/30))
 - `ARMADA_COMMAND_MAX_SECONDS` set but empty turned the exec backstop off, as if it were
   `0`. An empty or blank value of any seconds setting now stops startup, as other empty
   settings already did.
+  ([#30](https://github.com/G-Research/marimohub-compute-armada/pull/30))
 - `ARMADA_NAMESPACE` or `ARMADA_PRIORITY_CLASS` set but empty was submitted as is, and every
   session failed. Either one set but empty now stops startup.
+  ([#30](https://github.com/G-Research/marimohub-compute-armada/pull/30))
 - A malformed `ARMADA_POD_ANNOTATIONS`, `ARMADA_POD_LABELS`, `ARMADA_INGRESS_ANNOTATIONS`,
   `ARMADA_QUEUE_BY_*` or `ARMADA_GPU_NODE_SELECTORS` was repeated in full in the startup
   error, where a credential pasted into it would reach marimohub's logs. The error now names
   the variable only.
+  ([#30](https://github.com/G-Research/marimohub-compute-armada/pull/30))
 
 ## [0.3.0] - 2026-11-18
 
