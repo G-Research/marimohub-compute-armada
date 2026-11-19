@@ -54,8 +54,9 @@ describe('podspec', () => {
 	it('never inherits Armada default deadline', () => {
 		expect(buildPodSpec(config, agent).activeDeadlineSeconds).toBe(config.maxLifetimeSeconds);
 
+		// Twice marimohub's session lifetime, which marimohub extends while editors are on.
 		const lived: ArmadaConfig = readConfig(baseEnv, { sessionMaxLifetimeSeconds: 900 });
-		expect(buildPodSpec(lived, agent).activeDeadlineSeconds).toBe(900);
+		expect(buildPodSpec(lived, agent).activeDeadlineSeconds).toBe(1800);
 	});
 
 	it('runs the agent as PID 1 from the volume the init container filled', () => {

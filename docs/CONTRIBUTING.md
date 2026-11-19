@@ -247,7 +247,7 @@ the binary in the foreground with `MARIMOHUB_COMPUTE_LIBRARY` pointing at
 `dist/index.js`. The log is on the terminal and Ctrl-C stops it. Notebooks live in
 `dev/data/` and the binary unpacks itself under `~/.cache/marimohub-sea/`. The same
 variables apply, except `IMAGE` and `CONTAINER`; `DATA` moves the storage root, and
-since every variable in the environment reaches the process, anything the README lists
+since every variable in the environment reaches the process, anything `docs/CONFIGURATION.md` lists
 can simply be exported. It also offers three compute profiles (`small`, `medium` and
 `large`, up to 4 CPUs and 8Gi) that editors can pick per notebook; set
 `MARIMOHUB_COMPUTE_PROFILES` or `MARIMOHUB_COMPUTE_PROFILE_OVERRIDE` to change them.
@@ -418,10 +418,10 @@ one-time npm and GitHub setup.
   `docs/DECISIONS.md`.
 - **Nothing secret goes in the submission.** Lookout shows it to everyone, for good
   (`docs/DECISIONS.md`). A change that puts a new value into the job submission adds
-  it to the README's "What Armada shows everyone" table; one that would let a configured
+  it to the "What Armada shows everyone" table in `docs/CONFIGURATION.md`; one that would let a configured
   value reach the pod's environment needs a decision first.
 - **Keep the docs current.** `docs/ARCHITECTURE.md` when the shape changes, this
-  file when the dev loop changes, the README's configuration table when a variable
-  is added.
+  file when the dev loop changes, `docs/CONFIGURATION.md` when a variable is added
+  or changes (`test/docs.test.ts` fails on a variable it does not list).
 - **Branch and pull request, squash-merged.** Commit messages are imperative
   summaries of one batch of work.

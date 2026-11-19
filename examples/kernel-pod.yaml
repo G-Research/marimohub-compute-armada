@@ -1,0 +1,79 @@
+# A pod template for ARMADA_POD_TEMPLATE_FILE (docs/CONFIGURATION.md).
+#
+# Gives every kernel read-only network shares through a CSI driver, authenticated with a
+# Kerberos credential cache, and runs kernels under a service account of their own with
+# no Kubernetes API token in the pod.
+#
+# A CSI driver (Container Storage Interface) is a storage plugin a cluster administrator
+# installs on the worker nodes. A pod names the driver in a `csi` volume, and the driver
+# mounts the storage it serves, here network file shares, into the pod. Every worker
+# cluster Armada can place a kernel on needs the same driver. List the drivers a cluster
+# has with `kubectl get csidrivers`.
+#
+# Before using it, create in ARMADA_NAMESPACE:
+#   - the service account named in serviceAccountName;
+#   - a Secret with your krb5.conf under the key krb5.conf;
+#   - a Secret with the credential cache under the key ccache, renewed by whatever renews
+#     tickets today.
+# Then replace the names below with yours.
+#
+# This whole file is part of every Armada job, which Lookout shows to everyone with access.
+# It names Secrets and paths; it must never hold a credential.
+apiVersion: v1
+kind: Pod
+spec:
+  # Kernels run user code: keep the namespace's token out, and give them their own identity.
+  serviceAccountName: marimohub-kernel
+  automountServiceAccountToken: false
+  containers:
+    # `marimo`, as marimohub's Kubernetes backend names it, or `kernel`: both mean the kernel
+    # container.
+    - name: marimo
+      env:
+        # Paths, not secrets: a literal value is copied into the job as written.
+        - name: KRB5CCNAME
+          value: FILE:/var/run/krb5/ccache
+        - name: KRB5_CONFIG
+          value: /etc/krb5/krb5.conf
+      volumeMounts:
+        - name: shares
+          mountPath: /mnt/shares
+          readOnly: true
+          # The CSI driver mounts each share after the pod starts; this makes them visible.
+          mountPropagation: HostToContainer
+        - name: krb5-config
+          mountPath: /etc/krb5/krb5.conf
+          subPath: krb5.conf
+          readOnly: true
+        # No subPath here: Kubernetes updates a Secret volume when the Secret changes, but
+        # never a subPath mount of one, and the credential cache is renewed.
+        - name: krb5-ccache
+          mountPath: /var/run/krb5
+          readOnly: true
+  volumes:
+    - name: shares
+      csi:
+        # The driver's name, as `kubectl get csidrivers` lists it.
+        driver: <your-csi-driver>
+        readOnly: true
+        # Settings the driver defines, such as which shares to mount. They are strings,
+        # and public in Lookout like the rest of this file. The driver's documentation
+        # lists them; leave this out if it needs none.
+        # volumeAttributes:
+        #   shares: research
+        #
+        # Who authenticates to the shares depends on the driver:
+        #   - In the kernel: the driver mounts the shares, and each access uses the
+        #     credential cache that KRB5CCNAME above points at. This file is written for
+        #     that case.
+        #   - In the driver: it needs the credential when it mounts. Name the Secret here.
+        #     Kubernetes hands it to the driver on the node, never to the kernel.
+        # nodePublishSecretRef:
+        #   name: kernel-krb5-ccache
+    - name: krb5-config
+      secret:
+        secretName: kernel-krb5-config
+        defaultMode: 0444
+    - name: krb5-ccache
+      secret:
+        secretName: kernel-krb5-ccache

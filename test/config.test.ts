@@ -80,10 +80,10 @@ describe('ARMADA_EXPOSE', () => {
 	it('rejects annotations that are not a JSON object of strings', () => {
 		const ingress: Record<string, string> = { ...baseEnv, ARMADA_EXPOSE: 'ingress' };
 		expect(() => readConfig({ ...ingress, ARMADA_INGRESS_ANNOTATIONS: 'nginx' })).toThrow(
-			'ARMADA_INGRESS_ANNOTATIONS must be a JSON object, got: nginx',
+			'ARMADA_INGRESS_ANNOTATIONS must be a JSON object, and is not valid JSON',
 		);
 		expect(() => readConfig({ ...ingress, ARMADA_INGRESS_ANNOTATIONS: '["a"]' })).toThrow(
-			'ARMADA_INGRESS_ANNOTATIONS must be a JSON object, got: ["a"]',
+			'ARMADA_INGRESS_ANNOTATIONS must be a JSON object, like',
 		);
 		expect(() => readConfig({ ...ingress, ARMADA_INGRESS_ANNOTATIONS: '{"a":1}' })).toThrow(
 			'ARMADA_INGRESS_ANNOTATIONS: a must be a non-empty string',
@@ -392,5 +392,115 @@ describe('ARMADA_GPU_NODE_SELECTORS', () => {
 		expect(() =>
 			readConfig({ ...baseEnv, MARIMOHUB_COMPUTE_PROFILES: 'gpu:cpu=8;gpu=H100' }),
 		).not.toThrow();
+	});
+});
+
+describe('ARMADA_KERNEL_MAX_LIFETIME_SECONDS', () => {
+	it('is twice the session lifetime marimohub hands over, so an extended session lives on', () => {
+		expect(readConfig(baseEnv, { sessionMaxLifetimeSeconds: 14_400 }).maxLifetimeSeconds).toBe(
+			28_800,
+		);
+	});
+
+	it('is a day without marimohub, as in the smoke test', () => {
+		expect(readConfig(baseEnv).maxLifetimeSeconds).toBe(86_400);
+	});
+
+	it('replaces the default when set', () => {
+		const env: Record<string, string> = {
+			...baseEnv,
+			ARMADA_KERNEL_MAX_LIFETIME_SECONDS: '43200',
+		};
+		expect(readConfig(env, { sessionMaxLifetimeSeconds: 14_400 }).maxLifetimeSeconds).toBe(43_200);
+		expect(readConfig(env).maxLifetimeSeconds).toBe(43_200);
+	});
+
+	it('may equal the session lifetime', () => {
+		const env: Record<string, string> = { ...baseEnv, ARMADA_KERNEL_MAX_LIFETIME_SECONDS: '14400' };
+		expect(readConfig(env, { sessionMaxLifetimeSeconds: 14_400 }).maxLifetimeSeconds).toBe(14_400);
+	});
+
+	it('refuses a cap below the session lifetime, which would kill sessions before they are saved', () => {
+		const env: Record<string, string> = { ...baseEnv, ARMADA_KERNEL_MAX_LIFETIME_SECONDS: '3600' };
+		expect(() => readConfig(env, { sessionMaxLifetimeSeconds: 14_400 })).toThrow(
+			'ARMADA_KERNEL_MAX_LIFETIME_SECONDS (3600) must be at least',
+		);
+	});
+
+	it('refuses a value that is not whole seconds', () => {
+		expect(() =>
+			readConfig(
+				{ ...baseEnv, ARMADA_KERNEL_MAX_LIFETIME_SECONDS: '1.5h' },
+				{
+					sessionMaxLifetimeSeconds: 60,
+				},
+			),
+		).toThrow('ARMADA_KERNEL_MAX_LIFETIME_SECONDS must be a whole number of seconds');
+	});
+});
+
+describe('the seconds settings', () => {
+	const names: string[] = [
+		'ARMADA_COMMAND_MAX_SECONDS',
+		'ARMADA_START_TIMEOUT_SECONDS',
+		'ARMADA_KERNEL_MAX_LIFETIME_SECONDS',
+	];
+	for (const name of names) {
+		it(`refuses ${name} set but empty, rather than reading it as 0`, () => {
+			for (const blank of ['', '  ']) {
+				expect(() => readConfig({ ...baseEnv, [name]: blank })).toThrow(
+					`${name} must be a whole number of seconds`,
+				);
+			}
+		});
+	}
+
+	it('still takes 0 for ARMADA_COMMAND_MAX_SECONDS, which turns the backstop off', () => {
+		expect(readConfig({ ...baseEnv, ARMADA_COMMAND_MAX_SECONDS: '0' }).commandMaxSeconds).toBe(0);
+	});
+});
+
+describe('JSON settings', () => {
+	const names: string[] = [
+		'ARMADA_POD_ANNOTATIONS',
+		'ARMADA_POD_LABELS',
+		'ARMADA_INGRESS_ANNOTATIONS',
+		'ARMADA_QUEUE_BY_USER',
+		'ARMADA_QUEUE_BY_PROJECT',
+		'ARMADA_GPU_NODE_SELECTORS',
+	];
+	for (const name of names) {
+		it(`never repeats ${name} in the error, since a credential may be pasted into it`, () => {
+			const env: Record<string, string> = {
+				...baseEnv,
+				...(name === 'ARMADA_INGRESS_ANNOTATIONS' ? { ARMADA_EXPOSE: 'ingress' } : {}),
+			};
+			for (const raw of ['{"x":"hunter2"', '["hunter2"]', '"hunter2"']) {
+				let message: string = '';
+				try {
+					readConfig({ ...env, [name]: raw });
+				} catch (error: unknown) {
+					message = String(error);
+				}
+				expect(message).toContain(`${name} must be a JSON object`);
+				expect(message).not.toContain('hunter2');
+			}
+		});
+	}
+});
+
+describe('ARMADA_NAMESPACE and ARMADA_PRIORITY_CLASS', () => {
+	it('refuse an empty value, which would be submitted as is', () => {
+		for (const name of ['ARMADA_NAMESPACE', 'ARMADA_PRIORITY_CLASS']) {
+			for (const blank of ['', ' ']) {
+				expect(() => readConfig({ ...baseEnv, [name]: blank })).toThrow(`${name} is empty`);
+			}
+		}
+	});
+
+	it('keep their defaults when unset', () => {
+		const config: ArmadaConfig = readConfig(baseEnv);
+		expect(config.namespace).toBe('default');
+		expect(config.priorityClassName).toBeUndefined();
 	});
 });

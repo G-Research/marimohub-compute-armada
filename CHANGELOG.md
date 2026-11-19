@@ -4,9 +4,66 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A new version
-heading merged to main is released: see [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md#releasing).
+heading merged to main is released: see
+[docs/CONTRIBUTING.md](https://github.com/G-Research/marimohub-compute-armada/blob/main/docs/CONTRIBUTING.md#releasing).
 
 ## [Unreleased]
+
+## [0.4.0] - 2026-11-19
+
+### Added
+
+- `ARMADA_POD_TEMPLATE_FILE` adds a partial Pod manifest to every kernel pod: volumes of
+  any source (CSI, Secret, ConfigMap), the kernel container's `env`, `envFrom` and
+  `volumeMounts` (with `subPath`, `readOnly` and `mountPropagation`), and
+  `serviceAccountName`, `automountServiceAccountToken` and `enableServiceLinks`. Kernels can
+  now mount network shares with a credential from a Secret in the job namespace, and run
+  without the namespace's service-account token, or under a service account of their own.
+  The file uses the format of marimohub's `MARIMOHUB_COMPUTE_KUBERNETES_POD_TEMPLATE_FILE`,
+  where the kernel container is named `marimo`: that name is accepted for the container
+  and in a `resourceFieldRef.containerName`, which is submitted as `kernel`.
+  Startup fails, naming the field, when the template touches a part of the pod the adapter
+  owns, a field another variable sets, or a field it does not support. Without the setting,
+  the pod spec is unchanged. The template is part of the submission and so public in
+  Lookout, like the rest of the pod spec: it must name Secrets, never hold credentials.
+  ([#30](https://github.com/G-Research/marimohub-compute-armada/pull/30))
+- The npm package ships the configuration reference, `docs/CONFIGURATION.md`: every
+  variable the adapter reads with its default and checks, setups to start from, and what
+  a job submission shows everyone in Lookout. It also ships `CHANGELOG.md` and
+  `examples/kernel-pod.yaml`, a pod template for network shares with a Kerberos credential
+  cache. The README links to it in place of its own configuration section.
+  ([#30](https://github.com/G-Research/marimohub-compute-armada/pull/30))
+
+### Changed
+
+- `ARMADA_KERNEL_MAX_LIFETIME_SECONDS` now applies under marimohub. Before, marimohub's
+  session lifetime always took its place. Check any value you set: below
+  `MARIMOHUB_SESSION_MAX_LIFETIME_SECONDS` it now stops startup, and above it, it now sets
+  the pod deadline. Unset, the deadline is twice the session lifetime.
+  ([#30](https://github.com/G-Research/marimohub-compute-armada/pull/30))
+
+### Fixed
+
+- Kubernetes killed a kernel pod at marimohub's session lifetime (4 hours by default) even
+  when marimohub had extended the session because editors were still connected, and could
+  kill an idle session before marimohub saved it. The pod's `activeDeadlineSeconds` is now a
+  backstop at twice the session lifetime, as on marimohub's own CoreWeave, E2B and W&B
+  backends. `ARMADA_KERNEL_MAX_LIFETIME_SECONDS` sets it instead, and now applies under
+  marimohub too: before, marimohub's session lifetime always took its place. A value below
+  the session lifetime stops startup. The variable is now documented.
+  ([#30](https://github.com/G-Research/marimohub-compute-armada/pull/30))
+- `ARMADA_COMMAND_MAX_SECONDS` set but empty turned the exec backstop off, as if it were
+  `0`. An empty or blank value of any seconds setting now stops startup, as other empty
+  settings already did.
+  ([#30](https://github.com/G-Research/marimohub-compute-armada/pull/30))
+- `ARMADA_NAMESPACE` or `ARMADA_PRIORITY_CLASS` set but empty was submitted as is, and every
+  session failed. Either one set but empty now stops startup.
+  ([#30](https://github.com/G-Research/marimohub-compute-armada/pull/30))
+- A malformed `ARMADA_POD_ANNOTATIONS`, `ARMADA_POD_LABELS`, `ARMADA_INGRESS_ANNOTATIONS`,
+  `ARMADA_QUEUE_BY_*` or `ARMADA_GPU_NODE_SELECTORS` was repeated in full in the startup
+  error, where a credential pasted into it would reach marimohub's logs. The error now names
+  the variable only.
+  ([#30](https://github.com/G-Research/marimohub-compute-armada/pull/30))
 
 ## [0.3.0] - 2026-11-18
 
