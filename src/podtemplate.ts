@@ -155,10 +155,8 @@ function unique(values: string[], path: string, what: string): void {
 	for (const [i, value] of values.entries()) {
 		const first: number | undefined = seen.get(value);
 		if (first !== undefined) {
-			fail(
-				`${path}[${String(first)}]`,
-				`and ${path}[${String(i)}] have the same ${what}: ${value}`,
-			);
+			// The indices, not the value: whatever the file holds stays out of errors.
+			fail(`${path}[${String(first)}]`, `and ${path}[${String(i)}] have the same ${what}`);
 		}
 		seen.set(value, i);
 	}
@@ -328,7 +326,7 @@ function readMount(
 		fail(`${path}.name`, `is ${reserved.volume}, the adapter's own volume for the agent`);
 	}
 	if (!volumes.includes(volumeName)) {
-		fail(`${path}.name`, `names ${volumeName}, which spec.volumes does not define`);
+		fail(`${path}.name`, 'names a volume that spec.volumes does not define');
 	}
 	const mountPath: string = string(mount.mountPath, `${path}.mountPath`);
 	if (!mountPath.startsWith('/')) fail(`${path}.mountPath`, 'must be an absolute path');

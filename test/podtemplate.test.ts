@@ -272,7 +272,7 @@ spec:
 			[
 				'two mounts at paths that resolve to one place',
 				'spec: {volumes: [{name: a, emptyDir: {}}], containers: [{name: kernel, volumeMounts: [{name: a, mountPath: /x}, {name: a, mountPath: //y/../x}]}]}',
-				'spec.containers[0].volumeMounts[0] and spec.containers[0].volumeMounts[1] have the same mount target: /x',
+				'spec.containers[0].volumeMounts[0] and spec.containers[0].volumeMounts[1] have the same mount target',
 			],
 			[
 				'an unknown mount propagation',
@@ -354,6 +354,35 @@ spec:
 		}
 		expect(message).toContain('spec.containers[0].env[0]');
 		expect(message).not.toContain(secret);
+	});
+
+	it('never repeats a name, path or other value from the file in a field error', () => {
+		const secret: string = 'hunter2-do-not-print';
+		const templates: string[] = [
+			// A mount of a volume the template does not define.
+			`spec: {containers: [{name: kernel, volumeMounts: [{name: ${secret}, mountPath: /x}]}]}`,
+			// Two volumes with one name.
+			`spec: {volumes: [{name: a, secret: {secretName: ${secret}}}, {name: a, emptyDir: {}}]}`,
+			// Two mounts at one path.
+			`spec: {volumes: [{name: a, emptyDir: {}}], containers: [{name: kernel, volumeMounts: [{name: a, mountPath: /${secret}}, {name: a, mountPath: /${secret}/}]}]}`,
+			// Two variables with one name.
+			`spec: {containers: [{name: kernel, env: [{name: ${secret}, value: x}, {name: ${secret}, value: y}]}]}`,
+			// A bad container name.
+			`spec: {containers: [{name: ${secret}}]}`,
+			// A bad volume name and a bad service account.
+			`spec: {volumes: [{name: ${secret.toUpperCase()}, emptyDir: {}}]}`,
+			`spec: {serviceAccountName: ${secret.toUpperCase()}}`,
+		];
+		for (const template of templates) {
+			let message: string = '';
+			try {
+				configWith(template);
+			} catch (error: unknown) {
+				message = String(error);
+			}
+			expect(message).toContain('ARMADA_POD_TEMPLATE_FILE: spec.');
+			expect(message.toLowerCase()).not.toContain(secret);
+		}
 	});
 
 	it('refuses a file that is not one valid document, by line', () => {
