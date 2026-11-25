@@ -9,6 +9,23 @@ heading merged to main is released: see
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-25
+
+### Added
+
+- On marimohub 0.7.2 and later, the editor's startup screen says where the kernel's Armada
+  job is while it waits to run: submitted, waiting in the queue, scheduled, pulling the
+  image, running, a preempted pod, and back in the queue after a failed attempt Armada
+  retries. The text names no queue, cluster, node or pod. An older marimohub shows its own
+  message, as before.
+  ([#31](https://github.com/G-Research/marimohub-compute-armada/pull/31))
+
+### Changed
+
+- The Docker image builds on marimohub 0.7.2, and the dev loop runs the matching kernel
+  image. The adapter still loads on marimohub 0.7.1.
+  ([#31](https://github.com/G-Research/marimohub-compute-armada/pull/31))
+
 ## [0.4.0] - 2026-11-19
 
 ### Added

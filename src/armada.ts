@@ -361,17 +361,24 @@ export class ArmadaClient {
 	 * The wait is `ARMADA_START_TIMEOUT_SECONDS` unless the caller passes one.
 	 * Running out of it names the last event the job reported, which tells a job
 	 * still in its queue from one whose pod will not start.
+	 *
+	 * `onStage` hears each event kind that says where the job is (`queued`,
+	 * `leased`, `pending`, `running` and so on), as it arrives, replayed ones
+	 * included.
 	 */
 	async waitForRunning(
 		job: SubmittedJob,
 		timeoutMs: number = this.config.startTimeoutSeconds * 1000,
+		onStage?: (stage: string) => void,
 	): Promise<PodLocation> {
 		const signal: AbortSignal = AbortSignal.timeout(timeoutMs);
 		// The kind of the last event about the job that says where it is.
 		let stage: string | undefined;
 		try {
 			return await this.followUntilRunning(job, signal, (kind: string) => {
-				if (!STAGE_NEUTRAL_EVENTS.has(kind)) stage = kind;
+				if (STAGE_NEUTRAL_EVENTS.has(kind)) return;
+				stage = kind;
+				onStage?.(kind);
 			});
 		} catch (error) {
 			if (signal.aborted) {
@@ -424,6 +431,19 @@ export class ArmadaClient {
 					const message: EventMessage | undefined = line.result?.message;
 					if (message === undefined) continue;
 
+					// An end is thrown before the observer hears of it, so a caller
+					// never reports a final failure as a retry.
+					const failed: JobFailedEvent | undefined = message.failed;
+					if (failed !== undefined && failed.jobId === job.jobId && failed.retryable !== true) {
+						throw new Error(
+							`Armada job ${job.jobId} failed: ${failed.reason ?? 'no reason given'}`,
+						);
+					}
+
+					if (message.cancelled !== undefined && message.cancelled.jobId === job.jobId) {
+						throw new Error(`Armada job ${job.jobId} was cancelled before it started`);
+					}
+
 					const kind: string | undefined = eventKind(message, job.jobId);
 					if (kind !== undefined) onEvent(kind);
 
@@ -435,17 +455,6 @@ export class ArmadaClient {
 							podNamespace: running.podNamespace ?? this.config.namespace,
 							...(running.nodeName === undefined ? {} : { nodeName: running.nodeName }),
 						};
-					}
-
-					const failed: JobFailedEvent | undefined = message.failed;
-					if (failed !== undefined && failed.jobId === job.jobId && failed.retryable !== true) {
-						throw new Error(
-							`Armada job ${job.jobId} failed: ${failed.reason ?? 'no reason given'}`,
-						);
-					}
-
-					if (message.cancelled !== undefined && message.cancelled.jobId === job.jobId) {
-						throw new Error(`Armada job ${job.jobId} was cancelled before it started`);
 					}
 				}
 			} catch (error) {

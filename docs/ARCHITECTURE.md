@@ -147,7 +147,8 @@ sequenceDiagram
   H->>A: create sandbox, ready()
   A->>A: derive token from the sandbox id, hash it into the pod spec
   A->>R: submit job: two ports, init container, volume
-  R-->>A: event: running
+  R-->>A: events: queued, leased, pending, running
+  A-->>H: startup progress for each (marimohub 0.7.2 and later)
   R-->>A: event: address for 2718, address for 8718
   A->>G: GET /healthz until it answers
   H->>A: write notebook files
@@ -164,6 +165,11 @@ sequenceDiagram
   A->>G: GET /files/bounded: bytes within a budget and a deadline (GET /files up to v0.4.10)
   A->>R: cancel job
 ```
+
+On marimohub 0.7.2 and later, the editor's startup screen shows where the job is while it
+waits: submitted, in the queue, scheduled, pulling the image, running. The text names no
+queue, cluster, node or pod, since every editor of the notebook reads it. An app start
+shows none of it: marimohub sends app viewers only "Starting app".
 
 While the user works, the Armada API and the agent are idle. Only the kernel port
 carries traffic.
