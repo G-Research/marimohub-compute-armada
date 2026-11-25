@@ -118,7 +118,8 @@ const AGENT_READY_TIMEOUT_MS = 30_000;
 /**
  * What the editor's startup display says while a job waits to run, by the
  * Armada event kind that says where it is. Public text: it names no queue,
- * cluster, node or pod. A kind not listed (one that arrives once the job has
+ * cluster, node or pod. A preemption usually ends the job, so its text promises
+ * no retry: a `queued` that follows says so if one comes. A kind not listed (one that arrives once the job has
  * run, or one a later Armada adds) changes nothing on screen.
  */
 const STAGE_DETAILS: ReadonlyMap<string, string> = new Map([
@@ -130,7 +131,7 @@ const STAGE_DETAILS: ReadonlyMap<string, string> = new Map([
 	['failed', 'The last attempt failed, back in the Armada queue for a retry'],
 	['leaseReturned', 'Back in the Armada queue after the pod could not start'],
 	['leaseExpired', 'Back in the Armada queue after the pod could not start'],
-	['preempted', 'Preempted, back in the Armada queue'],
+	['preempted', 'The kernel pod was preempted'],
 ]);
 
 /**

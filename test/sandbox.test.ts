@@ -334,7 +334,7 @@ describe('startup progress', () => {
 		}
 	});
 
-	it('says a preempted job is back in its queue', async () => {
+	it('reports a preemption without promising a retry, and the queue only if the job returns to it', async () => {
 		const reported: (string | undefined)[] = [];
 		const { sandbox } = stubSandbox(ok, {
 			stages: ['queued', 'leased', 'preempted', 'queued', 'running'],
@@ -346,7 +346,7 @@ describe('startup progress', () => {
 
 		expect(reported.slice(2, 5)).toEqual([
 			'Scheduled on a cluster, creating the kernel pod',
-			'Preempted, back in the Armada queue',
+			'The kernel pod was preempted',
 			'Waiting in the Armada queue',
 		]);
 	});
