@@ -116,6 +116,24 @@ const WRITE_CONCURRENCY = 8;
 const AGENT_READY_TIMEOUT_MS = 30_000;
 
 /**
+ * What the editor's startup display says while a job waits to run, by the
+ * Armada event kind that says where it is. Public text: it names no queue,
+ * cluster, node or pod. A kind not listed (one that arrives once the job has
+ * run, or one a later Armada adds) changes nothing on screen.
+ */
+const STAGE_DETAILS: ReadonlyMap<string, string> = new Map([
+	['submitted', 'Waiting in the Armada queue'],
+	['queued', 'Waiting in the Armada queue'],
+	['leased', 'Scheduled on a cluster, creating the kernel pod'],
+	['pending', 'Pulling the kernel image and starting the pod'],
+	['running', 'Kernel pod running, connecting to it'],
+	['failed', 'The last attempt failed, back in the Armada queue for a retry'],
+	['leaseReturned', 'Back in the Armada queue after the pod could not start'],
+	['leaseExpired', 'Back in the Armada queue after the pod could not start'],
+	['preempted', 'Preempted, back in the Armada queue'],
+]);
+
+/**
  * `isPortReady` is one look, not a wait: a zero timeout makes the agent probe
  * once and answer, the probe itself bounded to the 2s marimohub's local
  * adapter allows (`agent/process.go`).
@@ -217,6 +235,9 @@ export class ArmadaSandbox implements SandboxInstance {
 	private env: Record<string, string> = {};
 	private envDefaults: Record<string, string> = {};
 
+	/** The last startup detail reported, so consecutive events that share a text report it once. */
+	private lastProgress?: string;
+
 	constructor(
 		private readonly id: SandboxId,
 		private readonly config: ArmadaConfig,
@@ -295,7 +316,10 @@ export class ArmadaSandbox implements SandboxInstance {
 				`Sandbox ${this.id} is gone: its Armada job ${this.job.jobId} has finished, and a finished job is never started again`,
 			);
 		}
-		this.pod = await this.armada.waitForRunning(this.job);
+		this.pod = await this.armada.waitForRunning(this.job, undefined, (stage: string): void => {
+			const detail: string | undefined = STAGE_DETAILS.get(stage);
+			if (detail !== undefined) this.progress(detail);
+		});
 		// The agent's address comes from the same event as the kernel's.
 		const url: string = await this.armada.portUrl(this.job, this.config.agentPort);
 		const channel: ControlChannel = this.openChannel({ url, token: this.token, pod: this.pod });
@@ -304,7 +328,23 @@ export class ArmadaSandbox implements SandboxInstance {
 		this.placements.set(this.id, { job: this.job, pod: this.pod, channel });
 	}
 
+	/**
+	 * Tell marimohub's startup display where the job is. Only a change is
+	 * reported: several event kinds share one text, and the stream can repeat a kind.
+	 * The hook is best effort, so a throwing one never fails the start.
+	 */
+	private progress(detail: string): void {
+		if (detail === this.lastProgress) return;
+		this.lastProgress = detail;
+		try {
+			this.options?.onProgress?.({ phase: 'allocating', detail });
+		} catch {
+			// Progress is for show; the start goes on without it.
+		}
+	}
+
 	private async submit(): Promise<SubmittedJob> {
+		this.progress('Submitting the kernel job to Armada');
 		const tokenSha256: string = createHash('sha256').update(this.token).digest('hex');
 		const job: SubmittedJob = await this.armada.submit(
 			this.id,

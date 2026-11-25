@@ -7,11 +7,12 @@
 # MARIMOHUB_COMPUTE_IMAGE says otherwise. marimohub publishes this image from its
 # main branch with no per-release tag (`latest` and the marimo-version tag are
 # overwritten), so it is pinned by digest to the build that matches the
-# marimohub release in the Dockerfile. 0.7.1: marimo 0.25.2 and the 0.7.1
-# notebook bridge, built 2026-11-17 from marimohub main at 6bef558e8, the last
-# image build before the v0.7.1 tag.
+# marimohub release in the Dockerfile. 0.7.2: marimo 0.25.2 and the 0.7.2
+# notebook bridge, built 2026-11-23 from marimohub main at f32484c37, the last
+# image build before the v0.7.2 tag (images/marimo-sandbox is unchanged between
+# the two).
 # Bump it together with the Dockerfile.
-SANDBOX_IMAGE=ghcr.io/marimo-team/marimo-sandbox:py3.13-marimo0.25.2@sha256:f72bfaa857701ac2d7154cc5e3dbd265b12cf04e08bfd9761b1d594d7015c8a0
+SANDBOX_IMAGE=ghcr.io/marimo-team/marimo-sandbox:py3.13-marimo0.25.2@sha256:f8ce228fc02bb8d85c38d13e8dfe978f53c7baed5783c5d8aaef46cc45aaaa76
 
 # Build the kernel agent image for the worker node's architecture and import it
 # into the node's containerd. The agent runs on the node, so it is built for the

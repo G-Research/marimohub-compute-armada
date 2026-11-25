@@ -5,7 +5,8 @@
  * `packages/core/src/ports/sandbox.ts` and `ports/externalAdapter.ts` at
  * marimohub v0.4.2 (d58bb8a, 2026-09-12; both files are unchanged since `main`
  * 2495463, the earlier transcription point), plus members added since, up to
- * marimohub 0.7.1, which the adapter needs (`errors.notFound`). Branded ids
+ * marimohub 0.7.2. The adapter needs 0.7.1 (`errors.notFound`); 0.7.2 adds
+ * `onProgress`, which it uses when present. Branded ids
  * (`ProjectId`, `UserId`, `Millis`) are plain `string` and `number` here.
  * `BoundedReadOptions` and `readFileBounded` come from `main` f4e5ef8
  * (2026-09-23): from that commit on, marimohub captures nothing from a
@@ -196,7 +197,29 @@ export interface SandboxOwner {
 	userId?: string;
 }
 
+/**
+ * The startup phases marimohub's editor shows. The provisioner reports each on
+ * entry; an adapter adds detail within one, and this one reports only during
+ * `allocating`, the wait for its job to run and its agent to answer.
+ */
+export type SandboxStartupPhase = 'allocating' | 'workspace' | 'starting';
+
+export interface SandboxStartupProgress {
+	phase: SandboxStartupPhase;
+	/**
+	 * Shown to the notebook's editors: no credentials, infrastructure
+	 * identifiers or raw logs, and at most 240 characters.
+	 */
+	detail?: string;
+}
+
 export interface CreateSandboxOptions {
+	/**
+	 * Startup updates for the editor's progress display. Synchronous and best
+	 * effort. From marimohub 0.7.2 (marimo-team/marimohub#699); an older
+	 * marimohub never sets it.
+	 */
+	onProgress?: (progress: SandboxStartupProgress) => void;
 	reuse?: boolean;
 	image?: string;
 	resources?: ComputeResources;

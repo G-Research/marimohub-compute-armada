@@ -140,7 +140,7 @@ binary at it. The agent image is still needed, since it runs in the cluster.
 sudo install -D dist/index.js /etc/marimohub/compute.mjs
 
 # The binary, at the release the Dockerfile names, checked against its published hash.
-V=0.7.1
+V=0.7.2
 curl -fsSLO "https://github.com/marimo-team/marimohub/releases/download/v$V/marimohub-linux-x64"
 curl -fsSLO "https://github.com/marimo-team/marimohub/releases/download/v$V/marimohub-linux-x64.sha256"
 sha256sum -c marimohub-linux-x64.sha256

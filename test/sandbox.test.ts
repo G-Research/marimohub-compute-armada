@@ -26,6 +26,7 @@ import type {
 	ListFilesResult,
 	ReadFileResult,
 	SandboxOwner,
+	SandboxStartupProgress,
 	SandboxProcess,
 } from '../src/types.js';
 
@@ -136,6 +137,10 @@ function stubSandbox(
 		lookup?: JobLookup | 'unanswerable';
 		/** Whether the server reports the submitted (or deduped) job as finished. */
 		finished?: boolean | 'unanswerable';
+		/** The event kinds the wait for Running hears, in order. */
+		stages?: string[];
+		/** marimohub's startup progress hook. */
+		onProgress?: (progress: SandboxStartupProgress) => void;
 	} = {},
 ): Recorded & { sandbox: ArmadaSandbox } {
 	const settings: ArmadaConfig = readConfig({ ...baseEnv, ...options.env });
@@ -178,8 +183,13 @@ function stubSandbox(
 			if (options.finished === 'unanswerable') throw new Error('Armada returned 503');
 			return options.finished ?? false;
 		},
-		waitForRunning: async () => {
+		waitForRunning: async (
+			_job: SubmittedJob,
+			_timeoutMs?: number,
+			onStage?: (stage: string) => void,
+		) => {
 			recorded.runningWaits++;
+			for (const stage of options.stages ?? []) onStage?.(stage);
 			return pod;
 		},
 		portUrl: async (_job: unknown, port: number) => `http://172.18.0.3:${String(30000 + port)}`,
@@ -257,7 +267,12 @@ function stubSandbox(
 			options.queues ?? new QueueDirectory(settings, undefined),
 			options.placements ?? new Map(),
 			(message: string): Error => new NotFoundError(message),
-			options.owner === undefined ? undefined : { owner: options.owner },
+			options.owner === undefined && options.onProgress === undefined
+				? undefined
+				: {
+						...(options.owner === undefined ? {} : { owner: options.owner }),
+						...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+					},
 			options.attachOnly ?? false,
 		),
 		// A getter, so a count taken after the calls sees them; the spread copies values.
@@ -291,6 +306,76 @@ describe('the agent token', () => {
 		expect(agentToken(secret, 'sandbox-1')).not.toBe(
 			agentToken('another-secret-of-at-least-32-chars', 'sandbox-1'),
 		);
+	});
+});
+
+describe('startup progress', () => {
+	it('tells the editor where the job is while it waits, once per change and naming no infrastructure', async () => {
+		const reported: SandboxStartupProgress[] = [];
+		const { sandbox } = stubSandbox(ok, {
+			// `submitted` and `queued` share a text, a repeated kind adds nothing, and
+			// `ingressInfo` says nothing about the stage.
+			stages: ['submitted', 'queued', 'queued', 'leased', 'pending', 'ingressInfo', 'running'],
+			onProgress: (progress: SandboxStartupProgress): void => {
+				reported.push(progress);
+			},
+		});
+		await sandbox.ready();
+
+		expect(reported).toEqual([
+			{ phase: 'allocating', detail: 'Submitting the kernel job to Armada' },
+			{ phase: 'allocating', detail: 'Waiting in the Armada queue' },
+			{ phase: 'allocating', detail: 'Scheduled on a cluster, creating the kernel pod' },
+			{ phase: 'allocating', detail: 'Pulling the kernel image and starting the pod' },
+			{ phase: 'allocating', detail: 'Kernel pod running, connecting to it' },
+		]);
+		for (const { detail } of reported) {
+			expect(detail).not.toMatch(/marimohub|job-1|set-1|sandbox-1|172\.18/);
+		}
+	});
+
+	it('says a preempted job is back in its queue', async () => {
+		const reported: (string | undefined)[] = [];
+		const { sandbox } = stubSandbox(ok, {
+			stages: ['queued', 'leased', 'preempted', 'queued', 'running'],
+			onProgress: (progress: SandboxStartupProgress): void => {
+				reported.push(progress.detail);
+			},
+		});
+		await sandbox.ready();
+
+		expect(reported.slice(2, 5)).toEqual([
+			'Scheduled on a cluster, creating the kernel pod',
+			'Preempted, back in the Armada queue',
+			'Waiting in the Armada queue',
+		]);
+	});
+
+	it('starts the sandbox when the hook throws', async () => {
+		const { sandbox, endpoints } = stubSandbox(ok, {
+			stages: ['queued', 'running'],
+			onProgress: (): void => {
+				throw new Error('display gone');
+			},
+		});
+		await sandbox.ready();
+
+		expect(endpoints).toHaveLength(1);
+	});
+
+	it('reports nothing for a sandbox another instance already reached', async () => {
+		const placements: Placements = new Map();
+		await stubSandbox(ok, { placements }).sandbox.ready();
+		const reported: SandboxStartupProgress[] = [];
+		const { sandbox } = stubSandbox(ok, {
+			placements,
+			onProgress: (progress: SandboxStartupProgress): void => {
+				reported.push(progress);
+			},
+		});
+		await sandbox.ready();
+
+		expect(reported).toEqual([]);
 	});
 });
 

@@ -322,6 +322,63 @@ describe('waitForRunning', () => {
 		});
 	});
 
+	it('passes each stage event to the caller, leaving out the stage-neutral ones', async () => {
+		stubFetch(
+			eventStream(
+				{ result: { id: '1', message: { queued: { jobId: 'job-1' } } } },
+				{ result: { id: '2', message: { reprioritized: { jobId: 'job-1' } } } },
+				{ result: { id: '3', message: { leased: { jobId: 'job-2' } } } },
+				{ result: { id: '4', message: { pending: { jobId: 'job-1' } } } },
+				{ result: { id: '5', message: { running: { jobId: 'job-1' } } } },
+			),
+		);
+		const stages: string[] = [];
+
+		await new ArmadaClient(config).waitForRunning(job, undefined, (stage: string): void => {
+			stages.push(stage);
+		});
+
+		expect(stages).toEqual(['queued', 'pending', 'running']);
+	});
+
+	it('throws a final failure without passing it on as a stage', async () => {
+		stubFetch(
+			eventStream(
+				{ result: { id: '1', message: { queued: { jobId: 'job-1' } } } },
+				{ result: { id: '2', message: { failed: { jobId: 'job-1', reason: 'bad spec' } } } },
+			),
+		);
+		const stages: string[] = [];
+
+		const outcome: Promise<string> = rejection(
+			new ArmadaClient(config).waitForRunning(job, undefined, (stage: string): void => {
+				stages.push(stage);
+			}),
+		);
+
+		expect(await outcome).toContain('bad spec');
+		expect(stages).toEqual(['queued']);
+	});
+
+	it('throws a cancellation without passing it on as a stage', async () => {
+		stubFetch(
+			eventStream(
+				{ result: { id: '1', message: { queued: { jobId: 'job-1' } } } },
+				{ result: { id: '2', message: { cancelled: { jobId: 'job-1' } } } },
+			),
+		);
+		const stages: string[] = [];
+
+		const outcome: Promise<string> = rejection(
+			new ArmadaClient(config).waitForRunning(job, undefined, (stage: string): void => {
+				stages.push(stage);
+			}),
+		);
+
+		expect(await outcome).toContain('was cancelled before it started');
+		expect(stages).toEqual(['queued']);
+	});
+
 	it('fails immediately on a terminal failure rather than waiting out the timeout', async () => {
 		stubFetch(
 			eventStream({
